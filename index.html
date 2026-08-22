@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Servicio a la mesa</title>
+    <link rel="preconnect" href="https://unpkg.com">
+    <link rel="stylesheet" href="style.css?v=20260820-7">
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  </head>
+  <body data-page="client">
+    <main class="client-app">
+      <section class="client-hero">
+        <nav class="topbar">
+          <div class="brand-lockup">
+            <span class="js-brand-logo"></span>
+            <div>
+              <strong class="js-business-name">Restaurante</strong>
+              <span class="js-business-subtitle">Servicio a la mesa</span>
+            </div>
+          </div>
+          <a class="admin-link" href="admin.html" aria-label="Administrador">
+            <i data-lucide="shield-check"></i>
+          </a>
+        </nav>
+
+        <div class="hero-copy">
+          <span class="eyebrow">Mesa conectada</span>
+          <h1 class="js-business-name">Tu restaurante</h1>
+          <p>Ordena, pide tu cuenta o llama al mesero desde tu mesa.</p>
+        </div>
+      </section>
+
+      <section class="client-panel sticky-actions" id="tablePicker"></section>
+
+      <section class="quick-actions" aria-label="Solicitudes">
+        <button class="request-btn" type="button" data-request="waiter">
+          <i data-lucide="bell-ring"></i>
+          <span>Mesero</span>
+        </button>
+        <button class="request-btn" type="button" data-request="bill">
+          <i data-lucide="receipt-text"></i>
+          <span>Ver cuenta</span>
+        </button>
+        <button class="request-btn" type="button" data-request="other">
+          <i data-lucide="message-circle-question"></i>
+          <span>Ayuda</span>
+        </button>
+      </section>
+
+      <section class="client-section">
+        <div class="assistant-panel">
+          <div class="assistant-head">
+          <div>
+            <span class="eyebrow">Agente de bar</span>
+              <h2><span class="assistant-live-dot" aria-hidden="true"></span>Pide por chat</h2>
+            </div>
+            <i data-lucide="bot"></i>
+          </div>
+          <div class="assistant-chat" id="assistantChat"></div>
+          <div class="assistant-suggestions" id="assistantSuggestions"></div>
+          <form class="assistant-form" id="assistantForm">
+            <input name="message" type="text" autocomplete="off" placeholder="Ej: Quiero una canasta de cerveza">
+            <button class="primary" type="submit" aria-label="Enviar mensaje"><i data-lucide="send"></i></button>
+          </form>
+        </div>
+      </section>
+
+      <section class="client-section" id="billChat" hidden></section>
+    </main>
+
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="app.js?v=20260820-10"></script>
+  </body>
+</html>

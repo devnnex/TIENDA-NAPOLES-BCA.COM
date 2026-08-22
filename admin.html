@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Admin - Servicio a la mesa</title>
+    <link rel="preconnect" href="https://unpkg.com">
+    <link rel="stylesheet" href="style.css?v=20260822-1">
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  </head>
+  <body data-page="admin">
+    <audio id="alarmAudio" src="sound/alarm.mp3" preload="auto"></audio>
+
+    <section class="admin-login" id="adminLogin">
+      <form class="admin-login-card" id="loginForm">
+        <i data-lucide="shield-check"></i>
+        <span class="eyebrow">Acceso operativo</span>
+        <h1>Iniciar sesion</h1>
+        <p>Ingresa con tu usuario y PIN personal.</p>
+        <label>Usuario<input name="username" type="text" autocomplete="username" required></label>
+        <label>PIN<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required></label>
+        <button class="primary" type="submit"><i data-lucide="log-in"></i> Entrar</button>
+        <small id="loginError" role="alert"></small>
+      </form>
+    </section>
+
+    <aside class="admin-sidebar">
+      <div class="brand-lockup">
+        <span class="js-brand-logo"></span>
+        <div>
+          <strong class="js-business-name">Restaurante</strong>
+          <span>Panel operativo</span>
+        </div>
+      </div>
+      <nav>
+        <a href="#dashboard"><i data-lucide="layout-dashboard"></i> Inicio</a>
+        <a href="#service"><i data-lucide="scan-line"></i> Atender mesa</a>
+        <a href="#brand" data-admin-only><i data-lucide="paintbrush"></i> Marca</a>
+        <a href="#menu" data-admin-only><i data-lucide="layout-grid"></i> Mesas</a>
+        <a href="#accounts"><i data-lucide="receipt-text"></i> Cuentas</a>
+        <a href="#users" data-admin-only><i data-lucide="users"></i> Usuarios</a>
+      </nav>
+      <div class="operator-box">
+        <strong id="currentUserName">Sin sesion</strong>
+        <span id="currentUserRole">Usuario</span>
+        <button class="ghost small" id="logoutButton" type="button"><i data-lucide="log-out"></i> Salir</button>
+      </div>
+      <div class="sound-box">
+        <button class="ghost" id="enableSound" type="button"><i data-lucide="volume-2"></i> Activar alarma</button>
+        <span id="soundHint">Toca aqui para permitir el sonido de las alertas.</span>
+      </div>
+    </aside>
+
+    <main class="admin-app">
+      <header class="admin-header" id="dashboard" data-admin-section="dashboard">
+        <div>
+          <span class="eyebrow">Centro de mando</span>
+          <h1 class="js-business-name">Restaurante</h1>
+          <p class="js-business-subtitle">Gestiona solicitudes, mesas, menu y cuentas.</p>
+          <span class="live-status" id="realtimeStatus"><i data-lucide="wifi"></i> Conectando en vivo</span>
+        </div>
+        <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
+      </header>
+
+      <section class="metrics-grid" data-admin-section="dashboard">
+        <article class="metric-card"><span>Mesas</span><strong id="metricTables">0</strong></article>
+        <article class="metric-card urgent"><span>Llamados</span><strong id="metricAlerts">0</strong></article>
+        <article class="metric-card"><span>Cuentas</span><strong id="metricOpen">0</strong></article>
+        <article class="metric-card"><span>Abierto</span><strong id="metricSales">$0</strong></article>
+      </section>
+
+      <section class="admin-grid" data-admin-section="dashboard">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <span class="eyebrow">Alarma</span>
+              <h2>Solicitudes activas</h2>
+            </div>
+            <label class="alert-filter">
+              <span>Filtrar</span>
+              <select id="alertFilter" aria-label="Filtrar solicitudes">
+                <option value="all">Todas</option>
+                <option value="waiter">Mesero</option>
+                <option value="bill">Cuenta</option>
+                <option value="other">Ayuda</option>
+                <option value="chat">Chat / pedido</option>
+              </select>
+            </label>
+          </div>
+          <div class="alerts-panel" id="alertsPanel"></div>
+        </div>
+
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <span class="eyebrow">Salon</span>
+              <h2>Estado de mesas</h2>
+            </div>
+          </div>
+          <div class="tables-grid" id="tablesGrid"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="brand" data-admin-section="brand" data-admin-only>
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Personalizacion</span>
+            <h2>Marca del negocio</h2>
+          </div>
+        </div>
+        <form class="form-grid" id="businessForm">
+          <label>Nombre<input name="business_name" type="text" placeholder="Oscar's Parrilla"></label>
+          <label>Subtitulo<input name="subtitle" type="text" placeholder="Parrilla, bebidas y servicio rapido"></label>
+          <label>Color<input name="accent_color" type="color" value="#f05a28"></label>
+          <label>Moneda<input name="currency" type="text" value="COP" readonly aria-readonly="true"></label>
+          <input name="logo_url" type="hidden">
+          <label class="upload-field" data-upload-box="logo_url">
+            <input type="file" accept="image/*" data-upload="logo_url">
+            <span><i data-lucide="image-up"></i> Logo</span>
+            <small data-upload-status="logo_url">Seleccionar imagen</small>
+          </label>
+          <input name="cover_url" type="hidden">
+          <label class="upload-field" data-upload-box="cover_url">
+            <input type="file" accept="image/*" data-upload="cover_url">
+            <span><i data-lucide="image-up"></i> Portada</span>
+            <small data-upload-status="cover_url">Seleccionar imagen</small>
+          </label>
+          <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar marca</button>
+        </form>
+      </section>
+
+      <section class="admin-grid menu-workbench" id="menu" data-admin-section="menu" data-admin-only>
+        <div class="panel menu-tool-card">
+          <div class="section-head">
+            <div>
+              <span class="eyebrow">Mesas</span>
+              <h2>QR y salon</h2>
+            </div>
+            <span class="tool-chip"><i data-lucide="qr-code"></i> QR seguro</span>
+          </div>
+          <form class="compact-form menu-form" id="tableForm">
+            <input type="hidden" name="table_id">
+            <label>Numero<input name="table_number" type="number" min="1" placeholder="1"></label>
+            <label>Nombre<input name="table_name" type="text" placeholder="Terraza 1"></label>
+            <div class="generated-qr-card wide">
+              <div class="qr-preview" id="qrPreview"></div>
+              <div>
+                <strong>QR generado por el sistema</strong>
+                <span id="qrPreviewLink">Define el numero de mesa para generar el enlace exacto.</span>
+              </div>
+            </div>
+            <label class="check"><input name="is_active" type="checkbox" checked> Activa</label>
+            <button class="primary" type="submit"><i data-lucide="save"></i> Guardar mesa</button>
+          </form>
+          <div class="qr-batch-panel" id="qrBatchPanel">
+            <div class="qr-batch-copy">
+              <span class="eyebrow">Impresion profesional</span>
+              <strong>QR identificados de 6 x 6 cm</strong>
+              <small>Selecciona las mesas y descarga un PDF listo para imprimir y recortar.</small>
+            </div>
+            <div class="qr-batch-actions">
+              <span class="qr-selection-count" id="qrSelectionCount" aria-live="polite">0 seleccionadas</span>
+              <button class="ghost small" id="selectAllTableQrs" type="button">Seleccionar todas</button>
+              <button class="ghost small" id="clearTableQrs" type="button">Limpiar</button>
+              <button class="primary" id="downloadSelectedQrs" type="button" disabled>
+                <i data-lucide="file-down"></i> Descargar PDF
+              </button>
+            </div>
+          </div>
+          <div class="manager-list" id="tableManagerList"></div>
+        </div>
+
+        <!--
+        <div class="panel menu-tool-card">
+          <div class="section-head">
+            <div>
+              <span class="eyebrow">Categorias</span>
+              <h2>Organizacion</h2>
+            </div>
+            <span class="tool-chip"><i data-lucide="tags"></i> Grupos</span>
+          </div>
+          <form class="compact-form menu-form" id="categoryForm">
+            <input type="hidden" name="category_id">
+            <label>Nombre<input name="category_name" placeholder="Hamburguesas"></label>
+            <label>Orden<input name="category_sort" type="number" value="0"></label>
+            <label class="check"><input name="category_active" type="checkbox" checked> Visible</label>
+            <button class="primary" type="submit"><i data-lucide="save"></i> Guardar categoria</button>
+          </form>
+          <div class="manager-list" id="categoryList"></div>
+        </div>
+        -->
+      </section>
+
+      <!--
+      <section class="panel menu-products-panel" data-admin-section="menu">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Productos</span>
+            <h2>Menu elegante</h2>
+          </div>
+          <span class="tool-chip"><i data-lucide="chef-hat"></i> Carta</span>
+        </div>
+        <form class="form-grid menu-product-form" id="itemForm">
+          <input type="hidden" name="item_id">
+          <label>Categoria<select name="category_id" class="js-category-select"></select></label>
+          <label>Nueva categoria<input name="new_category" placeholder="Crear si no existe"></label>
+          <label>Producto<input name="item_name" placeholder="Hamburguesa artesanal"></label>
+          <label>Precio<input name="price" type="number" min="0" step="100" placeholder="25000"></label>
+          <label>Imagen URL<input name="image_url" placeholder="https://..."></label>
+          <label>Orden<input name="sort_order" type="number" value="0"></label>
+          <label class="wide">Descripcion<textarea name="description" rows="3" placeholder="Ingredientes, tamano, notas"></textarea></label>
+          <label class="check"><input name="is_available" type="checkbox" checked> Disponible</label>
+          <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar producto</button>
+        </form>
+        <div class="manager-list" id="itemList"></div>
+      </section>
+      -->
+
+      <section class="panel" id="accounts" data-admin-section="accounts">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Contabilidad</span>
+            <h2>Cuentas abiertas</h2>
+          </div>
+        </div>
+        <div class="accounts-panel" id="accountsPanel"></div>
+      </section>
+
+      <section class="panel" id="service" data-admin-section="service">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Operacion de mesero</span>
+            <h2>Seleccionar y atender mesa</h2>
+          </div>
+        </div>
+        <form class="service-table-picker" id="waiterTableForm">
+          <label for="waiterTableSearch">Seleccionar mesa</label>
+          <div class="smart-table-combobox" id="waiterTableCombobox">
+            <span class="smart-table-search">
+              <i data-lucide="search"></i>
+              <input id="waiterTableSearch" type="search" inputmode="search" autocomplete="off" placeholder="Buscar mesa" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="waiterTableOptions">
+            </span>
+            <div class="smart-table-options" id="waiterTableOptions" role="listbox" aria-label="Mesas disponibles" hidden></div>
+          </div>
+          <small class="table-search-status" id="waiterTableSearchStatus" aria-live="polite">Cargando mesas...</small>
+          <p><i data-lucide="mouse-pointer-click"></i> Toca una mesa o escribe su numero y presiona Enter para agregar el consumo.</p>
+        </form>
+      </section>
+
+      <section class="panel" id="users" data-admin-section="users" data-admin-only>
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Equipo</span>
+            <h2>Usuarios y meseros</h2>
+          </div>
+        </div>
+        <form class="form-grid" id="userForm">
+          <input type="hidden" name="user_id">
+          <label>Nombre completo<input name="full_name" type="text" required></label>
+          <label>Usuario<input name="username" type="text" autocomplete="off" required></label>
+          <label>PIN<input name="pin" type="password" inputmode="numeric" minlength="4" maxlength="12" pattern="[0-9]{4,12}" autocomplete="new-password" placeholder="Dejar vacio para conservar"></label>
+          <label>Rol<select name="role"><option value="waiter">Mesero</option><option value="admin">Administrador</option></select></label>
+          <label class="check"><input name="is_active" type="checkbox" checked> Activo</label>
+          <button class="primary form-submit" type="submit"><i data-lucide="user-plus"></i> Guardar usuario</button>
+        </form>
+        <div class="manager-list" id="usersList"></div>
+      </section>
+    </main>
+
+    <dialog class="modal" id="consumptionDialog">
+      <form class="modal-card" id="consumptionForm">
+        <input type="hidden" name="session_id">
+        <input type="hidden" name="session_item_id">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Consumo</span>
+            <h2>Agregar a la cuenta</h2>
+          </div>
+          <button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <label>Producto<select name="menu_item_id" id="consumptionItem"></select></label>
+        <label>Nombre<input name="item_name" type="text" placeholder="Producto personalizado"></label>
+        <label>Quien paga<input name="payer_name" type="text" placeholder="Nombre del responsable de la cuenta"></label>
+        <div class="modal-grid">
+          <label>Cantidad<input name="quantity" type="number" min="1" value="1"></label>
+          <label>Precio<input name="unit_price" type="number" min="0" step="100" value="0"></label>
+        </div>
+        <label>Nota<textarea name="notes" rows="2" placeholder="Sin cebolla, termino medio, etc."></textarea></label>
+        <div class="modal-actions">
+          <button class="ghost" type="button" data-close-dialog>Cancelar</button>
+          <button class="primary" type="submit"><i data-lucide="plus"></i> Agregar</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="app.js?v=20260822-2"></script>
+  </body>
+</html>
