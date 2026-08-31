@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="style.css?v=20260820-7">
+    <link rel="stylesheet" href="style.css?v=20260831-song-9">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="client">
@@ -42,9 +42,9 @@
           <i data-lucide="receipt-text"></i>
           <span>Ver cuenta</span>
         </button>
-        <button class="request-btn" type="button" data-request="other">
-          <i data-lucide="message-circle-question"></i>
-          <span>Ayuda</span>
+        <button class="request-btn" type="button" data-song-request>
+          <i data-lucide="music-2"></i>
+          <span>Pedir canción</span>
         </button>
       </section>
 
@@ -52,15 +52,15 @@
         <div class="assistant-panel">
           <div class="assistant-head">
           <div>
-            <span class="eyebrow">Agente de bar</span>
-              <h2><span class="assistant-live-dot" aria-hidden="true"></span>Pide por chat</h2>
+            <span class="eyebrow" id="assistantEyebrow">Agente de bar</span>
+              <h2 id="assistantTitle"><span class="assistant-live-dot" aria-hidden="true"></span>Pide por chat</h2>
             </div>
-            <i data-lucide="bot"></i>
+            <span class="assistant-mode-icon" id="assistantModeIcon"><i data-lucide="bot"></i></span>
           </div>
           <div class="assistant-chat" id="assistantChat"></div>
           <div class="assistant-suggestions" id="assistantSuggestions"></div>
           <form class="assistant-form" id="assistantForm">
-            <input name="message" type="text" autocomplete="off" placeholder="Ej: Quiero una canasta de cerveza">
+            <input id="assistantInput" name="message" type="text" autocomplete="off" placeholder="Ej: Quiero una canasta de cerveza">
             <button class="primary" type="submit" aria-label="Enviar mensaje"><i data-lucide="send"></i></button>
           </form>
         </div>
@@ -70,6 +70,6 @@
     </main>
 
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="app.js?v=20260820-10"></script>
+    <script src="app.js?v=20260831-song-13"></script>
   </body>
 </html>

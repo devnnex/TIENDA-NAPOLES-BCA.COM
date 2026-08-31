@@ -5,6 +5,11 @@ const SUPABASE_CONFIG = {
   anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml6dmNia3dndGNpdW9hbXB1bmJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc0MzEzMzIsImV4cCI6MjEwMzAwNzMzMn0.cA7GCGeA-140TginBpEHPULKJrEDkpt3ixAMuAwzoPY"
 };
 
+const APPS_SCRIPT_CONFIG = {
+  // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
+  webAppUrl: "https://script.google.com/macros/s/AKfycbxsjx-MMAXu_IyVoEGibbC9gaPPSB9fLT6Uk73FLg_oluXNcgB2JGtbVo0sx4SM3nX3wg/exec"
+};
+
 const SupabaseDb = (() => {
   let authToken = "";
   let clientTableAccess = { table_id: "", code: "" };
@@ -56,7 +61,7 @@ const App = (() => {
   const REQUEST_LABELS = {
     waiter: "Llamar mesero",
     bill: "Ver cuenta",
-    other: "Necesito ayuda"
+    other: "Canción solicitada"
   };
 
   const REQUEST_ICONS = {
@@ -66,6 +71,9 @@ const App = (() => {
   };
 
   const DEFAULT_CURRENCY = "COP";
+  const INVENTORY_STORAGE_KEY = "tienda_napoles_inventory_v1";
+  const INVOICE_STORAGE_KEY = "tienda_napoles_invoices_v1";
+  const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const REQUEST_IMAGES = {
     waiter: "images/mesero.png",
     bill: "images/check.png"
@@ -240,6 +248,19 @@ const App = (() => {
     authToken: "",
     currentUser: null,
     users: [],
+    inventoryMeta: {},
+    invoiceHistory: [],
+    inventorySearch: "",
+    inventoryStatusFilter: "all",
+    incomeReport: null,
+    incomeLoading: false,
+    incomeRequestId: 0,
+    incomeRangePreset: "today",
+    incomeSearchTimer: null,
+    productPickerMatches: [],
+    activePaymentTotal: 0,
+    appsScriptOutboxBusy: false,
+    appsScriptOutboxTimer: null,
     alertFilter: "all",
     optimisticRequestStates: new Map(),
     optimisticSessionStates: new Map(),
@@ -248,6 +269,12 @@ const App = (() => {
     soundPriming: false,
     mousePrimeAttempted: false,
     lastAlertSignature: "",
+    lastRequestBadgeCount: 0,
+    announcedRequestIds: new Set(),
+    alertAnnouncementQueue: [],
+    alertAnnouncementBusy: false,
+    alarmToneFinish: null,
+    speechFinish: null,
     alertRenderSignature: null,
     accountsRenderSignature: null,
     adminSnapshotSignature: "",
@@ -263,6 +290,7 @@ const App = (() => {
     selectedTableQrIds: new Set(),
     tableRenderSignature: "",
     assistantMessages: [],
+    assistantMode: "bar",
     tableLocked: false,
     qrLocked: false,
     clientChannel: null,
@@ -292,6 +320,45 @@ const App = (() => {
       currency: DEFAULT_CURRENCY,
       maximumFractionDigits: 0
     }).format(Number(value || 0));
+
+  const currencyInputNumber = (fieldOrValue) => {
+    if (typeof fieldOrValue === "number") return Number.isFinite(fieldOrValue) ? Math.max(0, Math.round(fieldOrValue)) : 0;
+    const raw = typeof fieldOrValue === "object" && fieldOrValue !== null ? fieldOrValue.value : fieldOrValue;
+    const digits = String(raw ?? "").replace(/\D/g, "").slice(0, 15);
+    return digits ? Number(digits) : 0;
+  };
+
+  const formattedCurrencyInput = (value, { allowEmpty = false } = {}) => {
+    const raw = typeof value === "object" && value !== null ? value.value : value;
+    const normalizedRaw = typeof raw === "number" ? String(Math.max(0, Math.round(raw))) : String(raw ?? "");
+    const digits = normalizedRaw.replace(/\D/g, "").slice(0, 15);
+    if (!digits) return allowEmpty ? "" : "$0";
+    return `$${Number(digits).toLocaleString("es-CO", { maximumFractionDigits: 0 })}`;
+  };
+
+  const setCurrencyInputValue = (input, value) => {
+    if (!input) return;
+    input.value = formattedCurrencyInput(value);
+    input.dataset.rawValue = String(currencyInputNumber(value));
+  };
+
+  const bindCurrencyInputs = (root = document) => {
+    $$('[data-currency-input]', root).forEach((input) => {
+      if (input.dataset.currencyBound === "true") return;
+      input.dataset.currencyBound = "true";
+      setCurrencyInputValue(input, input.value);
+      input.addEventListener("input", () => {
+        input.value = formattedCurrencyInput(input.value, { allowEmpty: true });
+        input.dataset.rawValue = String(currencyInputNumber(input));
+        const end = input.value.length;
+        input.setSelectionRange?.(end, end);
+      });
+      input.addEventListener("focus", () => {
+        window.setTimeout(() => input.select(), 0);
+      });
+      input.addEventListener("blur", () => setCurrencyInputValue(input, input.value));
+    });
+  };
 
   const toast = (message, type = "ok", key = `${type}:${message}`) => {
     const now = Date.now();
@@ -399,6 +466,7 @@ const App = (() => {
     state.tables = tables || [];
     state.categories = categories || [];
     state.items = items || [];
+    loadInventoryStore();
   };
 
   const emptyState = (title, text, iconName = "sparkles") => `
@@ -484,7 +552,7 @@ const App = (() => {
   };
 
   const showAdminSection = (section = "dashboard") => {
-    if (state.currentUser?.role === "waiter" && ["brand", "menu", "users"].includes(section)) section = "service";
+    if (state.currentUser?.role === "waiter" && ["brand", "menu", "inventory", "income", "users"].includes(section)) section = "service";
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -501,6 +569,12 @@ const App = (() => {
     if (section === "menu") {
       renderTableManager();
       renderTableFormQr();
+    }
+    if (section === "inventory") renderInventory();
+    if (section === "income") {
+      initializeIncomeFilters();
+      renderIncomeReport();
+      void loadIncomeReport();
     }
     if (section === "users") renderUsers();
     refreshIcons();
@@ -673,6 +747,7 @@ const App = (() => {
       state.tables = data.tables || [];
       state.categories = data.categories || [];
       state.items = data.items || [];
+      loadInventoryStore();
       document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
       return true;
     };
@@ -1221,6 +1296,374 @@ const App = (() => {
       "'": "&#039;"
     }[char]));
 
+  const readLocalJson = (key, fallback) => {
+    try {
+      const value = JSON.parse(localStorage.getItem(key) || "null");
+      return value ?? fallback;
+    } catch (error) {
+      return fallback;
+    }
+  };
+
+  const productAcronym = (name = "") => normalizeText(name)
+    .split(" ")
+    .filter(Boolean)
+    .map((word) => word[0])
+    .join("")
+    .toUpperCase();
+
+  const loadInventoryStore = () => {
+    const stored = readLocalJson(INVENTORY_STORAGE_KEY, {});
+    state.inventoryMeta = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+    const invoices = readLocalJson(INVOICE_STORAGE_KEY, []);
+    state.invoiceHistory = Array.isArray(invoices) ? invoices : [];
+  };
+
+  const persistInventoryStore = () => {
+    try {
+      localStorage.setItem(INVENTORY_STORAGE_KEY, JSON.stringify(state.inventoryMeta));
+    } catch (error) {
+      toast("No se pudo guardar el inventario en este dispositivo.", "error", "inventory-storage-failed");
+    }
+  };
+
+  const persistInvoiceHistory = () => {
+    try {
+      localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(state.invoiceHistory.slice(-1000)));
+    } catch (error) {
+      toast("La venta se cerro, pero no se pudo guardar el historial local.", "error", "invoice-storage-failed");
+    }
+  };
+
+  const inventoryFor = (item) => {
+    const meta = state.inventoryMeta[item?.id] || {};
+    return {
+      code: String(meta.code || productAcronym(item?.name)).toUpperCase(),
+      costPrice: Math.max(0, Number(meta.costPrice || 0)),
+      stock: Math.max(0, Number(meta.stock || 0)),
+      minStock: Math.max(0, Number(meta.minStock ?? 5)),
+      unit: meta.unit || "unidad",
+      updatedAt: meta.updatedAt || ""
+    };
+  };
+
+  const inventoryStatus = (item) => {
+    const inventory = inventoryFor(item);
+    if (inventory.stock <= 0) return "out";
+    if (inventory.stock <= inventory.minStock) return "low";
+    return "ok";
+  };
+
+  const productSearchScore = (item, rawQuery = "") => {
+    const query = normalizeText(rawQuery).replace(/\s+/g, "");
+    if (!query) return Number(item.sort_order || 0);
+    const name = normalizeText(item.name || "");
+    const compactName = name.replace(/\s+/g, "");
+    const words = name.split(" ").filter(Boolean);
+    const code = normalizeText(inventoryFor(item).code).replace(/\s+/g, "");
+    const acronym = normalizeText(productAcronym(item.name)).replace(/\s+/g, "");
+    if (query === code || query === acronym) return 0;
+    if (compactName === query) return 1;
+    if (code.startsWith(query) || acronym.startsWith(query)) return 5;
+    if (words.some((word) => word.startsWith(query))) return 10;
+    if (compactName.startsWith(query)) return 15;
+    if (compactName.includes(query) || code.includes(query)) return 25;
+    const initialsMatch = query.split("").every((letter, index) => acronym[index] === letter);
+    return initialsMatch ? 30 : Number.POSITIVE_INFINITY;
+  };
+
+  const matchingProducts = (query = "", { includeUnavailable = false } = {}) => state.items
+    .filter((item) => includeUnavailable || item.is_available !== false)
+    .map((item) => ({ item, score: productSearchScore(item, query) }))
+    .filter((entry) => Number.isFinite(entry.score))
+    .sort((left, right) => left.score - right.score || String(left.item.name).localeCompare(String(right.item.name), "es"))
+    .map((entry) => entry.item);
+
+  const paymentMethodLabel = (method) => ({
+    cash: "Efectivo",
+    transfer: "Transferencia",
+    breb: "Bre-B",
+    mixed: "Pago mixto"
+  }[method] || "Pago");
+
+  const getAppsScriptUrl = () => String(APPS_SCRIPT_CONFIG.webAppUrl || "").trim();
+
+  const isAppsScriptConfigured = () => /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:[?#].*)?$/i.test(getAppsScriptUrl());
+
+  const setInventorySyncStatus = (message, tone = "local", iconName = "hard-drive") => {
+    const badge = $("#inventorySyncStatus");
+    if (!badge) return;
+    badge.className = `inventory-sync-status is-${tone}`;
+    badge.innerHTML = `${icon(iconName, 15)} ${escapeHTML(message)}`;
+    refreshIcons();
+  };
+
+  const readAppsScriptOutbox = () => {
+    const stored = readLocalJson(APPS_SCRIPT_OUTBOX_KEY, []);
+    return Array.isArray(stored) ? stored : [];
+  };
+
+  const writeAppsScriptOutbox = (jobs) => {
+    try { localStorage.setItem(APPS_SCRIPT_OUTBOX_KEY, JSON.stringify(jobs.slice(-2000))); } catch (error) { /* Cache operativa. */ }
+  };
+
+  const initRemoteStorage = () => {
+    if (!isAppsScriptConfigured()) {
+      setInventorySyncStatus("Configura el respaldo remoto", "local", "hard-drive");
+      return false;
+    }
+    setInventorySyncStatus("Conectando respaldo remoto", "pending", "refresh-cw");
+    void bootstrapRemoteStorage();
+    return true;
+  };
+
+  const appsScriptRequest = async (action, payload = {}, timeoutMs = 25000) => {
+    if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no esta configurado.");
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(getAppsScriptUrl(), {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({
+          action,
+          authToken: state.authToken,
+          origin: location.origin,
+          payload
+        }),
+        redirect: "follow",
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error(`El respaldo remoto respondio con estado ${response.status}.`);
+      const text = await response.text();
+      let result;
+      try { result = JSON.parse(text); } catch (error) {
+        throw new Error("El respaldo remoto necesita publicar la version nueva de Code.gs.");
+      }
+      return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error("Tiempo de espera agotado en el respaldo remoto.");
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const inventoryPayload = (item) => {
+    const inventory = inventoryFor(item);
+    return {
+      productId: item.id,
+      code: inventory.code,
+      name: item.name || "",
+      category: item.menu_categories?.name || "",
+      unit: inventory.unit,
+      costPrice: inventory.costPrice,
+      salePrice: Number(item.price || 0),
+      stock: inventory.stock,
+      minStock: inventory.minStock,
+      isAvailable: item.is_available !== false,
+      updatedAt: inventory.updatedAt || new Date().toISOString()
+    };
+  };
+
+  const applyRemoteInventoryItems = (items = []) => {
+    if (!Array.isArray(items)) return;
+    items.forEach((remote) => {
+      const item = state.items.find((entry) => entry.id === remote.productId);
+      if (!item) return;
+      state.inventoryMeta[item.id] = {
+        code: String(remote.code || productAcronym(item.name)).toUpperCase(),
+        costPrice: Math.max(0, Number(remote.costPrice || 0)),
+        stock: Math.max(0, Number(remote.stock || 0)),
+        minStock: Math.max(0, Number(remote.minStock || 0)),
+        unit: remote.unit || "unidad",
+        updatedAt: remote.updatedAt || new Date().toISOString(),
+        version: Number(remote.version || 0)
+      };
+      if (Number.isFinite(Number(remote.salePrice))) item.price = Math.max(0, Number(remote.salePrice));
+      if (typeof remote.isAvailable === "boolean") item.is_available = remote.isAvailable;
+    });
+    persistInventoryStore();
+    persistBootstrapCache();
+    renderInventory();
+    renderMenuManager();
+  };
+
+  const enqueueAppsScriptJob = (action, payload, dedupeKey = uid()) => {
+    const jobs = readAppsScriptOutbox();
+    const job = {
+      id: uid(),
+      action,
+      payload,
+      dedupeKey,
+      attempts: 0,
+      createdAt: new Date().toISOString()
+    };
+    const existingIndex = jobs.findIndex((entry) => entry.dedupeKey === dedupeKey);
+    if (existingIndex >= 0 && action === "upsert_inventory") jobs[existingIndex] = job;
+    else if (existingIndex < 0) jobs.push(job);
+    writeAppsScriptOutbox(jobs);
+    if (isAppsScriptConfigured()) void flushAppsScriptOutbox();
+    else setInventorySyncStatus(`${jobs.length} cambio${jobs.length === 1 ? "" : "s"} en cola local`, "local", "hard-drive");
+  };
+
+  const scheduleAppsScriptRetry = () => {
+    clearTimeout(state.appsScriptOutboxTimer);
+    state.appsScriptOutboxTimer = window.setTimeout(flushAppsScriptOutbox, 30000);
+  };
+
+  const flushAppsScriptOutbox = async () => {
+    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured() || !navigator.onLine) return false;
+    state.appsScriptOutboxBusy = true;
+    try {
+      let jobs = readAppsScriptOutbox();
+      while (jobs.length) {
+        const job = jobs[0];
+        setInventorySyncStatus(`Sincronizando ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}`, "pending", "refresh-cw");
+        const result = await appsScriptRequest(job.action, job.payload);
+        const queuedAfterRequest = readAppsScriptOutbox();
+        const pendingAfterCurrent = queuedAfterRequest.filter((entry) => entry.id !== job.id);
+        const pendingProductIds = new Set(pendingAfterCurrent.map((entry) =>
+          entry.action === "upsert_inventory"
+            ? entry.payload?.item?.productId
+            : entry.action === "adjust_inventory"
+              ? entry.payload?.adjustment?.productId
+              : ""
+        ).filter(Boolean));
+        const applyFreshRemoteInventory = () => {
+          const remoteItems = job.action === "upsert_inventory" && result?.item
+            ? [result.item]
+            : result?.items || (result?.item ? [result.item] : []);
+          const freshItems = remoteItems.filter((item) => !pendingProductIds.has(item.productId));
+          if (freshItems.length) applyRemoteInventoryItems(freshItems);
+        };
+        if (!result?.ok) {
+          const legacyInventoryService = job.action === "adjust_inventory"
+            && /accion no permitida:\s*adjust_inventory/i.test(normalizeText(result?.error || ""));
+          if (result?.retryable === false || legacyInventoryService) {
+            if (result.item) applyFreshRemoteInventory();
+            jobs = pendingAfterCurrent;
+            writeAppsScriptOutbox(jobs);
+            toast(
+              legacyInventoryService
+                ? "El inventario se conciliara al cerrar la mesa. Publica la actualizacion 2.2.0 para sincronizar cada consumo de inmediato."
+                : (result.error || "No se pudo aplicar un movimiento de inventario."),
+              "error",
+              legacyInventoryService ? "inventory-service-update-required" : `inventory-job-rejected:${job.id}`
+            );
+            continue;
+          }
+          const currentIndex = queuedAfterRequest.findIndex((entry) => entry.id === job.id);
+          if (currentIndex < 0) {
+            jobs = queuedAfterRequest;
+            continue;
+          }
+          job.attempts = Number(job.attempts || 0) + 1;
+          job.lastError = result?.error || "El respaldo remoto no respondio";
+          job.lastAttemptAt = new Date().toISOString();
+          jobs = queuedAfterRequest;
+          jobs[currentIndex] = job;
+          writeAppsScriptOutbox(jobs);
+          setInventorySyncStatus(`${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}; reintento automatico`, "error", "cloud-off");
+          scheduleAppsScriptRetry();
+          return false;
+        }
+        applyFreshRemoteInventory();
+        jobs = pendingAfterCurrent;
+        writeAppsScriptOutbox(jobs);
+      }
+      setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
+      return true;
+    } catch (error) {
+      setInventorySyncStatus("Sin conexion; cambios protegidos localmente", "error", "cloud-off");
+      scheduleAppsScriptRetry();
+      return false;
+    } finally {
+      state.appsScriptOutboxBusy = false;
+    }
+  };
+
+  const bootstrapRemoteStorage = async () => {
+    if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    if (state.currentUser.role !== "admin") {
+      void syncInventoryWithAppsScript();
+      void flushAppsScriptOutbox();
+      return true;
+    }
+    setInventorySyncStatus("Preparando respaldo remoto", "pending", "refresh-cw");
+    try {
+      const result = await appsScriptRequest("bootstrap", {
+        supabaseUrl: SUPABASE_CONFIG.url,
+        supabaseAnonKey: SUPABASE_CONFIG.anonKey
+      });
+      if (!result?.ok) throw new Error(result?.error || "No fue posible inicializar el respaldo remoto.");
+      setInventorySyncStatus("Respaldo remoto listo", "synced", "cloud-check");
+      await syncInventoryWithAppsScript();
+      await flushAppsScriptOutbox();
+      return true;
+    } catch (error) {
+      setInventorySyncStatus("Respaldo pendiente de configuracion", "error", "cloud-off");
+      toast(String(error?.message || "No fue posible preparar el respaldo remoto."), "error", "remote-bootstrap-failed");
+      return false;
+    }
+  };
+
+  const syncInventoryWithAppsScript = async () => {
+    if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    try {
+      const result = await appsScriptRequest("get_inventory");
+      if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
+      if (Array.isArray(result.items) && result.items.length) {
+        applyRemoteInventoryItems(result.items);
+      } else {
+        const localItems = state.items
+          .filter((item) => Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id))
+          .map(inventoryPayload);
+        if (localItems.length) enqueueAppsScriptJob("sync_inventory", { items: localItems }, "inventory:initial-sync");
+      }
+      setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
+      return true;
+    } catch (error) {
+      setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
+      return false;
+    }
+  };
+
+  const queueInventoryUpsert = (item) => {
+    if (!item) return;
+    enqueueAppsScriptJob("upsert_inventory", { item: inventoryPayload(item) }, `inventory:${item.id}`);
+  };
+
+  const applyConsumptionInventoryDelta = (item, delta, context = {}) => {
+    const change = Number(delta || 0);
+    if (!item || !change || !Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id)) return null;
+    const current = inventoryFor(item);
+    const nextStock = current.stock + change;
+    if (nextStock < 0) return null;
+    state.inventoryMeta[item.id] = {
+      ...current,
+      stock: nextStock,
+      updatedAt: new Date().toISOString()
+    };
+    persistInventoryStore();
+    const eventId = context.eventId || `consumption-stock:${uid()}`;
+    enqueueAppsScriptJob("adjust_inventory", {
+      adjustment: {
+        eventId,
+        productId: item.id,
+        code: current.code,
+        name: item.name || "Producto",
+        delta: change,
+        sessionId: context.sessionId || "",
+        reference: context.reference || "",
+        reversesEventId: context.reversesEventId || "",
+        occurredAt: new Date().toISOString()
+      }
+    }, `inventory-adjust:${eventId}`);
+    if (state.activeAdminSection === "inventory") renderInventory();
+    return { item, delta: change, eventId };
+  };
+
   const includesAny = (normalized, phrases = []) =>
     phrases.some((phrase) => normalized.includes(normalizeText(phrase)));
 
@@ -1300,19 +1743,50 @@ const App = (() => {
     const chat = $("#assistantChat");
     const suggestions = $("#assistantSuggestions");
     if (!chat || !suggestions) return;
+    const songMode = state.assistantMode === "song";
+    const eyebrow = $("#assistantEyebrow");
+    const title = $("#assistantTitle");
+    const modeIcon = $("#assistantModeIcon");
+    const input = $("#assistantInput");
+    if (eyebrow) eyebrow.textContent = songMode ? "Música para tu mesa" : "Agente de bar";
+    if (title) title.innerHTML = `<span class="assistant-live-dot" aria-hidden="true"></span>${songMode ? "Pide una canción" : "Pide por chat"}`;
+    if (modeIcon) modeIcon.innerHTML = icon(songMode ? "music-2" : "bot", 24);
+    if (input) input.placeholder = songMode
+      ? "Nombre exacto de la canción y artista"
+      : "Ej: Quiero una canasta de cerveza";
     const messages = state.assistantMessages.length
       ? state.assistantMessages
-      : [{ role: "bot", text: "Hola, soy tu agente de bar. Dime qué deseas pedir y enviaré la solicitud al mesero para que confirme contigo los detalles." }];
+      : [{
+          role: "bot",
+          text: songMode
+            ? "Escribe el nombre exacto de la canción y, si lo conoces, también el artista. Enviaremos tu solicitud al equipo."
+            : "Hola, soy tu agente de bar. Dime qué deseas pedir y enviaré la solicitud al mesero para que confirme contigo los detalles."
+        }];
     chat.innerHTML = messages
       .map((message) => `<div class="assistant-message ${message.role}">${escapeHTML(message.text)}</div>`)
       .join("");
     chat.scrollTop = chat.scrollHeight;
-    const productSuggestions = assistantOptions().slice(0, 2).map((item) => `Quiero ${item.name}`);
-    const suggestionTexts = [...productSuggestions, "Ver mi cuenta", "Llamar al mesero"].slice(0, 3);
-    suggestions.innerHTML = suggestionTexts
-      .map((text) => `<button type="button" class="chip" data-assistant-suggest="${escapeHTML(text)}">${escapeHTML(text)}</button>`)
-      .join("");
+    if (songMode) {
+      suggestions.innerHTML = `<span class="assistant-song-hint">${icon("music", 16)} Ejemplo: Nombre de la canción — Artista</span>`;
+    } else {
+      const productSuggestions = assistantOptions().slice(0, 2).map((item) => `Quiero ${item.name}`);
+      const suggestionTexts = [...productSuggestions, "Ver mi cuenta", "Llamar al mesero"].slice(0, 3);
+      suggestions.innerHTML = suggestionTexts
+        .map((text) => `<button type="button" class="chip" data-assistant-suggest="${escapeHTML(text)}">${escapeHTML(text)}</button>`)
+        .join("");
+    }
     refreshIcons();
+  };
+
+  const activateSongRequestMode = () => {
+    state.assistantMode = "song";
+    state.assistantMessages = [{
+      role: "bot",
+      text: "Escribe el nombre exacto de la canción y el artista para solicitarla."
+    }];
+    renderAssistant();
+    $(".assistant-panel")?.scrollIntoView({ block: "center", behavior: "auto" });
+    window.requestAnimationFrame(() => $("#assistantInput")?.focus({ preventScroll: true }));
   };
 
   const prettyDateTime = (value) => new Date(value || Date.now()).toLocaleString("es-CO", {
@@ -1544,6 +2018,21 @@ const App = (() => {
     void createServiceNotification("other", `${tableLabel(state.currentTable)} solicita atención: ${polishGuestText(text)}`);
   };
 
+  const handleSongRequest = async (message) => {
+    const song = String(message || "").trim().replace(/\s+/g, " ").slice(0, 180);
+    if (!song) return;
+    assistantSay("user", song);
+    if (!state.currentTable) {
+      assistantSay("bot", "Primero selecciona tu mesa para poder enviar la canción.");
+      return;
+    }
+    const request = await createServiceNotification(
+      "other",
+      `${tableLabel(state.currentTable)} solicita la canción: ${song}`
+    );
+    if (request) assistantSay("bot", `Listo. La canción “${song}” fue solicitada al equipo.`);
+  };
+
   const addItemToSession = async (itemId) => {
     if (!state.currentTable) {
       toast("Selecciona tu mesa primero.", "error");
@@ -1649,6 +2138,7 @@ const App = (() => {
       const category = event.target.closest("[data-category]");
       const add = event.target.closest("[data-add-item]");
       const request = event.target.closest("[data-request]");
+      const songRequest = event.target.closest("[data-song-request]");
       const thanks = event.target.closest("[data-thank-bill]");
       const closeBill = event.target.closest("[data-close-bill]");
       const change = event.target.closest("[data-action='change-table']");
@@ -1660,6 +2150,7 @@ const App = (() => {
       }
       if (add) await addItemToSession(add.dataset.addItem);
       if (request) await createRequest(request.dataset.request);
+      if (songRequest) activateSongRequestMode();
       if (thanks) thankBill(thanks.dataset.thankBill);
       if (closeBill) closeCurrentBill();
       if (suggestion) await handleAssistantMessage(suggestion.dataset.assistantSuggest);
@@ -1712,7 +2203,8 @@ const App = (() => {
       const input = event.currentTarget.message;
       const message = input.value;
       input.value = "";
-      await handleAssistantMessage(message);
+      if (state.assistantMode === "song") await handleSongRequest(message);
+      else await handleAssistantMessage(message);
     });
   };
 
@@ -1818,8 +2310,13 @@ const App = (() => {
     return Array.from(merged.values());
   };
 
-  const requestKind = (request) =>
-    request.request_type === "other" && String(request.message || "").trim() ? "chat" : request.request_type;
+  const isSongRequest = (request) => request.request_type === "other"
+    && normalizeText(request.message || "").includes("solicita la cancion");
+
+  const requestKind = (request) => {
+    if (isSongRequest(request)) return "song";
+    return request.request_type === "other" && String(request.message || "").trim() ? "chat" : request.request_type;
+  };
 
   const activeRequests = () => state.requests.filter((request) => request.status === "pending");
 
@@ -1837,9 +2334,9 @@ const App = (() => {
     if (hint) {
       hint.textContent = state.soundEnabled
         ? (state.soundPrimed
-          ? "Alarma activa en este equipo."
+          ? "Alarma y avisos por voz activos en este equipo."
           : "Alarma guardada. Se reanuda con el proximo gesto en esta pantalla.")
-        : "Toca aqui para permitir el sonido de las alertas.";
+        : "Activa el sonido para escuchar la alarma y el motivo de cada solicitud.";
     }
     refreshIcons();
   };
@@ -1851,26 +2348,121 @@ const App = (() => {
     return audio;
   };
 
-  const playAlarm = async () => {
-    if (!state.soundEnabled || !activeRequests().length) return;
+  const requestTableName = (request) => tableLabel(
+    request.restaurant_tables || state.tables.find((table) => String(table.id) === String(request.table_id))
+  );
+
+  const requestVoiceText = (request) => {
+    const table = requestTableName(request);
+    const message = String(request.message || "").replace(/\s+/g, " ").trim().slice(0, 320);
+    if (request.request_type === "waiter") return `${table} solicita al mesero.`;
+    if (request.request_type === "bill") return `${table} solicita la cuenta.`;
+    if (!message) return `${table} necesita ayuda.`;
+    if (isSongRequest(request)) {
+      const song = message.includes(":") ? message.split(":").slice(1).join(":").trim() : message;
+      return `${table} solicita la canción ${song.replace(/[.!?]+$/, "")}.`;
+    }
+    const order = message.match(/solicita\s+atenci[oó]n\s+para\s+pedir\s+([\d.,]+)\s*x\s+(.+?)(?:\.\s*Mensaje\s+del\s+cliente:|$)/i);
+    const clientMessage = message.match(/Mensaje\s+del\s+cliente:\s*(.+)$/i);
+    if (order) {
+      const extra = clientMessage?.[1]?.trim();
+      return `${table} está pidiendo ${order[1]} unidades de ${order[2].trim()}.${extra ? ` El cliente dice: ${extra}.` : ""}`;
+    }
+    if (normalizeText(message).startsWith(normalizeText(table))) return `${message}.`;
+    return `${table} informa: ${message}.`;
+  };
+
+  const speakAlertRequests = (requests) => new Promise((resolve) => {
+    if (!("speechSynthesis" in window) || typeof window.SpeechSynthesisUtterance !== "function" || !requests.length) {
+      resolve();
+      return;
+    }
+    const speech = requests.map(requestVoiceText).join(" ").slice(0, 900);
+    const utterance = new SpeechSynthesisUtterance(speech);
+    const voices = window.speechSynthesis.getVoices();
+    utterance.voice = voices.find((voice) => /^es[-_]CO$/i.test(voice.lang))
+      || voices.find((voice) => /^es/i.test(voice.lang))
+      || null;
+    utterance.lang = utterance.voice?.lang || "es-CO";
+    utterance.rate = 0.94;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      state.speechFinish = null;
+      resolve();
+    };
+    state.speechFinish = finish;
+    utterance.onend = finish;
+    utterance.onerror = finish;
+    window.speechSynthesis.speak(utterance);
+    window.setTimeout(finish, Math.min(22000, Math.max(6000, speech.length * 85)));
+  });
+
+  const playAlarmToneOnce = () => new Promise((resolve) => {
     const audio = getAlarmAudio();
-    if (!audio) return;
+    if (!audio) {
+      resolve();
+      return;
+    }
     window.clearTimeout(state.alarmStopTimer);
-    audio.loop = true;
-    if (audio.paused) audio.currentTime = 0;
-    await audio.play().catch(() => {
+    audio.pause();
+    audio.loop = false;
+    audio.currentTime = 0;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      audio.removeEventListener("ended", finish);
+      audio.pause();
+      audio.currentTime = 0;
+      state.alarmToneFinish = null;
+      resolve();
+    };
+    state.alarmToneFinish = finish;
+    audio.addEventListener("ended", finish, { once: true });
+    state.alarmStopTimer = window.setTimeout(finish, 5500);
+    audio.play().catch(() => {
       state.soundPrimed = false;
       updateAlarmButton();
+      finish();
     });
-    state.alarmStopTimer = window.setTimeout(() => {
-      audio.pause();
-      audio.loop = false;
-      audio.currentTime = 0;
-    }, 30000);
+  });
+
+  const drainAlertAnnouncements = async () => {
+    if (state.alertAnnouncementBusy || !state.soundEnabled) return;
+    state.alertAnnouncementBusy = true;
+    try {
+      while (state.alertAnnouncementQueue.length && state.soundEnabled) {
+        const activeIds = new Set(activeRequests().map((request) => request.id));
+        const batch = state.alertAnnouncementQueue.splice(0).filter((request) => activeIds.has(request.id));
+        if (!batch.length) continue;
+        await playAlarmToneOnce();
+        if (state.soundEnabled) await speakAlertRequests(batch);
+      }
+    } finally {
+      state.alertAnnouncementBusy = false;
+      if (state.alertAnnouncementQueue.length && state.soundEnabled) void drainAlertAnnouncements();
+    }
+  };
+
+  const playAlarm = (requests = activeRequests()) => {
+    if (!state.soundEnabled) return;
+    const unseen = requests.filter((request) => !state.announcedRequestIds.has(request.id));
+    if (!unseen.length) return;
+    unseen.forEach((request) => state.announcedRequestIds.add(request.id));
+    state.alertAnnouncementQueue.push(...unseen);
+    void drainAlertAnnouncements();
   };
 
   const stopAlarm = () => {
     window.clearTimeout(state.alarmStopTimer);
+    state.alertAnnouncementQueue = [];
+    state.alarmToneFinish?.();
+    state.speechFinish?.();
+    window.speechSynthesis?.cancel();
     const audio = getAlarmAudio();
     if (!audio) return;
     audio.pause();
@@ -1895,14 +2487,11 @@ const App = (() => {
       await audio.play();
       if (!silent) toast("Alarma activada.", "ok", "alarm-enabled");
 
-      if (!activeRequests().length) {
-        window.setTimeout(() => {
-          if (!activeRequests().length) {
-            audio.pause();
-            audio.currentTime = 0;
-          }
-        }, 1100);
-      }
+      window.setTimeout(() => {
+        audio.pause();
+        audio.currentTime = 0;
+        if (activeRequests().length) playAlarm(activeRequests());
+      }, activeRequests().length ? 450 : 1100);
     } catch (error) {
       state.soundEnabled = false;
       state.soundPrimed = false;
@@ -2001,6 +2590,22 @@ const App = (() => {
     return true;
   };
 
+  const updateNavRequestBadge = () => {
+    const badge = $("#navRequestBadge");
+    if (!badge) return;
+    const count = activeRequests().length;
+    badge.hidden = count === 0;
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.setAttribute("aria-label", `${count} solicitud${count === 1 ? "" : "es"} pendiente${count === 1 ? "" : "s"}`);
+    if (count > state.lastRequestBadgeCount) {
+      badge.classList.remove("is-inflating");
+      void badge.offsetWidth;
+      badge.classList.add("is-inflating");
+      window.setTimeout(() => badge.classList.remove("is-inflating"), 650);
+    }
+    state.lastRequestBadgeCount = count;
+  };
+
   const renderAdminShell = () => {
     renderBrand();
     const totals = {
@@ -2013,6 +2618,7 @@ const App = (() => {
     $("#metricAlerts").textContent = totals.alerts;
     $("#metricOpen").textContent = totals.open;
     $("#metricSales").textContent = money(totals.sales);
+    updateNavRequestBadge();
   };
 
   const integerMoney = (value) => Math.max(0, Math.round(Number(value || 0)));
@@ -2089,13 +2695,15 @@ const App = (() => {
               <article class="alert-card alert-${request.kind}" data-alert-card="${request.id}">
                 <div class="alert-icon">
                   ${
-                    REQUEST_IMAGES[request.request_type]
-                      ? `<img class="alert-image" src="${REQUEST_IMAGES[request.request_type]}" alt="">`
-                      : icon(REQUEST_ICONS[request.request_type] || "bell", 22)
+                    request.kind === "song"
+                      ? icon("music-2", 22)
+                      : REQUEST_IMAGES[request.request_type]
+                        ? `<img class="alert-image" src="${REQUEST_IMAGES[request.request_type]}" alt="">`
+                        : icon(REQUEST_ICONS[request.request_type] || "bell", 22)
                   }
                 </div>
                 <div>
-                  <span>${request.kind === "chat" ? "Chat / pedido" : (REQUEST_LABELS[request.request_type] || request.request_type)}</span>
+                  <span>${request.kind === "song" ? "Canción solicitada" : request.kind === "chat" ? "Chat / pedido" : (REQUEST_LABELS[request.request_type] || request.request_type)}</span>
                   <h3><mark class="alert-table-name">${escapeHTML(tableLabel(request.restaurant_tables))}</mark></h3>
                   ${request.message && !parseBillMessage(request.message) ? `<p>${escapeHTML(request.message)}</p>` : ""}
                   <p>${prettyDateTime(request.created_at)}</p>
@@ -2122,7 +2730,7 @@ const App = (() => {
     const signature = requestSignature();
     if (signature && signature !== state.lastAlertSignature) {
       state.lastAlertSignature = signature;
-      playAlarm();
+      playAlarm(activeRequests());
     }
     refreshIcons();
   };
@@ -2364,6 +2972,87 @@ const App = (() => {
     }
   };
 
+  const renderConsumptionProductOptions = (searchValue = "") => {
+    const options = $("#consumptionProductOptions");
+    const combobox = $("#consumptionProductCombobox");
+    const hint = $("#consumptionProductHint");
+    if (!options || !combobox) return;
+    const products = matchingProducts(searchValue).slice(0, 30);
+    state.productPickerMatches = products;
+    combobox.dataset.activeIndex = products.length === 1 ? "0" : "-1";
+    options.innerHTML = products.length
+      ? products.map((item, index) => {
+          const inventory = inventoryFor(item);
+          const tracked = Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id);
+          const out = tracked && inventory.stock <= 0;
+          return `<button type="button" class="product-combobox-option${products.length === 1 ? " is-selected" : ""}" role="option"
+            id="consumption-product-${index}" data-consumption-product="${escapeHTML(item.id)}" aria-selected="${products.length === 1}" ${out ? "disabled" : ""}>
+            <span class="product-option-code">${escapeHTML(inventory.code)}</span>
+            <span><strong>${escapeHTML(item.name)}</strong><small>${money(item.price)} · ${tracked ? `${inventory.stock.toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${escapeHTML(inventory.unit)}` : "Sin stock configurado"}</small></span>
+            <em class="${out ? "is-out" : ""}">${out ? "Agotado" : icon("check", 16)}</em>
+          </button>`;
+        }).join("")
+      : `<div class="product-combobox-empty">No hay coincidencias. Puedes escribir el nombre como consumo personalizado.</div>`;
+    if (hint) hint.textContent = products.length
+      ? `${products.length} producto${products.length === 1 ? "" : "s"}. Busca por nombre o iniciales, por ejemplo CN.`
+      : "Sin coincidencias: el nombre escrito puede guardarse como consumo personalizado.";
+    refreshIcons();
+  };
+
+  const showConsumptionProductOptions = () => {
+    const options = $("#consumptionProductOptions");
+    const combobox = $("#consumptionProductCombobox");
+    const input = $("#consumptionProductSearch");
+    if (!options || !combobox || !input) return;
+    options.hidden = false;
+    combobox.classList.add("is-open");
+    input.setAttribute("aria-expanded", "true");
+  };
+
+  const closeConsumptionProductOptions = () => {
+    const options = $("#consumptionProductOptions");
+    const combobox = $("#consumptionProductCombobox");
+    const input = $("#consumptionProductSearch");
+    if (!options || !combobox || !input) return;
+    options.hidden = true;
+    combobox.classList.remove("is-open");
+    input.setAttribute("aria-expanded", "false");
+  };
+
+  const selectConsumptionProduct = (id) => {
+    const item = state.items.find((entry) => entry.id === id);
+    const form = $("#consumptionForm");
+    const search = $("#consumptionProductSearch");
+    if (!item || !form || !search) return;
+    form.menu_item_id.value = item.id;
+    form.item_name.value = item.name || "";
+    setCurrencyInputValue(form.unit_price, Number(item.price || 0));
+    form.quantity.value = "";
+    search.value = `${inventoryFor(item).code} · ${item.name}`;
+    closeConsumptionProductOptions();
+    $("#consumptionProductHint") && ($("#consumptionProductHint").textContent = `${item.name} seleccionado · escribe la cantidad y presiona Enter.`);
+    window.requestAnimationFrame(() => {
+      form.quantity.focus({ preventScroll: true });
+    });
+  };
+
+  const setConsumptionProductActiveIndex = (requestedIndex) => {
+    const options = $("#consumptionProductOptions");
+    const input = $("#consumptionProductSearch");
+    const buttons = $$('[data-consumption-product]:not(:disabled)', options);
+    if (!buttons.length || !input) return null;
+    const index = (requestedIndex + buttons.length) % buttons.length;
+    buttons.forEach((button, buttonIndex) => {
+      const selected = buttonIndex === index;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-selected", String(selected));
+    });
+    $("#consumptionProductCombobox").dataset.activeIndex = String(index);
+    input.setAttribute("aria-activedescendant", buttons[index].id);
+    buttons[index].scrollIntoView({ block: "nearest" });
+    return buttons[index];
+  };
+
   const renderMenuManager = () => {
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
@@ -2373,16 +3062,7 @@ const App = (() => {
       `;
     });
 
-    const consumptionSelect = $("#consumptionItem");
-    if (consumptionSelect) {
-      consumptionSelect.innerHTML = `
-        <option value="">Producto personalizado</option>
-        ${state.items
-          .filter((item) => item.is_available)
-          .map((item) => `<option value="${escapeHTML(item.id)}">${escapeHTML(item.name)} - ${money(item.price)}</option>`)
-          .join("")}
-      `;
-    }
+    renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
 
     const categoryList = $("#categoryList");
     if (categoryList) {
@@ -2441,6 +3121,491 @@ const App = (() => {
         : emptyState("Sin productos", "Agrega platos, bebidas o servicios.", "chef-hat");
     }
     refreshIcons();
+  };
+
+  const inventorySummary = () => state.items.reduce((summary, item) => {
+    const inventory = inventoryFor(item);
+    summary.units += inventory.stock;
+    summary.costValue += inventory.stock * inventory.costPrice;
+    summary.saleValue += inventory.stock * Number(item.price || 0);
+    const status = inventoryStatus(item);
+    if (status === "low") summary.low += 1;
+    if (status === "out") summary.out += 1;
+    return summary;
+  }, { units: 0, costValue: 0, saleValue: 0, low: 0, out: 0 });
+
+  const renderInventoryLiveCalculation = () => {
+    const form = $("#inventoryForm");
+    const box = $("#inventoryLiveCalculation");
+    if (!form || !box) return;
+    const cost = currencyInputNumber(form.cost_price);
+    const sale = currencyInputNumber(form.sale_price);
+    const stock = Math.max(0, Number(form.stock.value || 0));
+    const profit = sale - cost;
+    const margin = sale > 0 ? (profit / sale) * 100 : 0;
+    box.innerHTML = `
+      <span><small>Utilidad por unidad</small><strong>${money(profit)}</strong></span>
+      <span><small>Margen estimado</small><strong>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}%</strong></span>
+      <span><small>Valor del inventario</small><strong>${money(cost * stock)}</strong></span>
+      <span><small>Venta potencial</small><strong>${money(sale * stock)}</strong></span>`;
+  };
+
+  const renderInventory = () => {
+    const metrics = $("#inventoryMetrics");
+    const list = $("#inventoryList");
+    if (!metrics || !list) return;
+    const summary = inventorySummary();
+    metrics.innerHTML = `
+      <article><span>${icon("package-check", 19)} Unidades</span><strong>${summary.units.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><small>Existencia total registrada</small></article>
+      <article><span>${icon("circle-dollar-sign", 19)} Inversion</span><strong>${money(summary.costValue)}</strong><small>Valor a costo</small></article>
+      <article><span>${icon("trending-up", 19)} Venta potencial</span><strong>${money(summary.saleValue)}</strong><small>Antes de gastos</small></article>
+      <article class="${summary.low || summary.out ? "inventory-alert-metric" : ""}"><span>${icon("triangle-alert", 19)} Alertas</span><strong>${summary.low + summary.out}</strong><small>${summary.out} agotados · ${summary.low} por reponer</small></article>`;
+
+    const query = state.inventorySearch;
+    const products = matchingProducts(query, { includeUnavailable: true })
+      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter);
+    list.innerHTML = products.length
+      ? products.map((item) => {
+          const inventory = inventoryFor(item);
+          const status = inventoryStatus(item);
+          const statusLabel = status === "out" ? "Agotado" : status === "low" ? "Stock bajo" : "Disponible";
+          const profit = Number(item.price || 0) - inventory.costPrice;
+          const margin = Number(item.price || 0) > 0 ? profit / Number(item.price) * 100 : 0;
+          return `
+            <article class="inventory-row inventory-${status}">
+              <div class="inventory-product-identity">
+                <span class="inventory-code">${escapeHTML(inventory.code)}</span>
+                <div><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.menu_categories?.name || "Sin categoria")} · ${escapeHTML(inventory.unit)}</small></div>
+              </div>
+              <div class="inventory-stock-block">
+                <small>Existencia</small>
+                <strong>${inventory.stock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong>
+                <span class="inventory-status">${statusLabel}</span>
+              </div>
+              <div class="inventory-numbers">
+                <span><small>Costo</small><strong>${money(inventory.costPrice)}</strong></span>
+                <span><small>Venta</small><strong>${money(item.price)}</strong></span>
+                <span class="inventory-profit"><small>Utilidad</small><strong>${money(profit)}</strong><em>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% margen</em></span>
+              </div>
+              <div class="inventory-row-actions">
+                <button class="ghost small" type="button" data-inventory-adjust="${escapeHTML(item.id)}" data-adjustment="-1" ${inventory.stock <= 0 ? "disabled" : ""}>−1</button>
+                <button class="ghost small" type="button" data-inventory-adjust="${escapeHTML(item.id)}" data-adjustment="1">+1</button>
+                <button class="icon-btn" type="button" data-edit-inventory="${escapeHTML(item.id)}" aria-label="Editar ${escapeHTML(item.name)}">${icon("pencil", 17)}</button>
+                <button class="icon-btn danger" type="button" data-delete-item="${escapeHTML(item.id)}" aria-label="Eliminar ${escapeHTML(item.name)}">${icon("trash-2", 17)}</button>
+              </div>
+            </article>`;
+        }).join("")
+      : emptyState("Sin coincidencias", query ? `No encontramos productos para “${escapeHTML(query)}”. Prueba el nombre o sus iniciales.` : "Agrega el primer producto al inventario.", "search-x");
+    renderInventoryLiveCalculation();
+    refreshIcons();
+  };
+
+  const resetInventoryForm = () => {
+    const form = $("#inventoryForm");
+    if (!form) return;
+    form.reset();
+    form.product_id.value = "";
+    form.stock.value = 0;
+    form.min_stock.value = 5;
+    form.unit.value = "unidad";
+    form.is_available.checked = true;
+    $("#inventoryFormTitle") && ($("#inventoryFormTitle").textContent = "Agregar producto");
+    renderInventoryLiveCalculation();
+  };
+
+  const editInventoryProduct = (id) => {
+    const item = state.items.find((entry) => entry.id === id);
+    const form = $("#inventoryForm");
+    if (!item || !form) return;
+    const inventory = inventoryFor(item);
+    form.product_id.value = item.id;
+    form.product_name.value = item.name || "";
+    form.product_code.value = inventory.code;
+    form.category_id.value = item.category_id || "";
+    form.new_category.value = "";
+    setCurrencyInputValue(form.cost_price, inventory.costPrice);
+    setCurrencyInputValue(form.sale_price, Number(item.price || 0));
+    form.stock.value = inventory.stock;
+    form.min_stock.value = inventory.minStock;
+    form.unit.value = inventory.unit;
+    form.is_available.checked = item.is_available !== false;
+    $("#inventoryFormTitle") && ($("#inventoryFormTitle").textContent = `Editar ${item.name}`);
+    renderInventoryLiveCalculation();
+    form.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const saveInventoryProduct = async (form) => {
+    const name = form.product_name.value.trim();
+    const costPrice = currencyInputNumber(form.cost_price);
+    const salePrice = currencyInputNumber(form.sale_price);
+    const stock = Number(form.stock.value || 0);
+    const minStock = Number(form.min_stock.value || 0);
+    if (!name || ![costPrice, salePrice, stock, minStock].every(Number.isFinite) || [costPrice, salePrice, stock, minStock].some((value) => value < 0)) {
+      toast("Revisa nombre, precios y existencias antes de guardar.", "error", "invalid-inventory-product");
+      return;
+    }
+    const id = form.product_id.value;
+    let categoryId = form.category_id.value;
+    const newCategory = form.new_category.value.trim();
+    if (!categoryId && newCategory) {
+      const category = await db(state.sb.from("menu_categories").insert({ name: newCategory, is_active: true }).select("*").single(), null);
+      if (!category) return;
+      state.categories = [...state.categories, category];
+      categoryId = category.id;
+    }
+    const payload = {
+      category_id: categoryId || null,
+      name,
+      price: salePrice,
+      description: state.items.find((item) => item.id === id)?.description || "",
+      image_url: state.items.find((item) => item.id === id)?.image_url || "",
+      is_available: form.is_available.checked,
+      sort_order: state.items.find((item) => item.id === id)?.sort_order || 0
+    };
+    const saved = await db(id
+      ? state.sb.from("menu_items").update(payload).eq("id", id).select("*").single()
+      : state.sb.from("menu_items").insert(payload).select("*").single(), null);
+    if (!saved) return;
+    const category = state.categories.find((entry) => entry.id === categoryId);
+    const hydrated = { ...saved, menu_categories: category ? { name: category.name } : null };
+    state.items = id
+      ? state.items.map((item) => item.id === id ? hydrated : item)
+      : [...state.items, hydrated];
+    state.inventoryMeta[saved.id] = {
+      code: (form.product_code.value.trim() || productAcronym(name)).toUpperCase(),
+      costPrice,
+      stock,
+      minStock,
+      unit: form.unit.value || "unidad",
+      updatedAt: new Date().toISOString()
+    };
+    persistInventoryStore();
+    persistBootstrapCache();
+    queueInventoryUpsert(hydrated);
+    resetInventoryForm();
+    renderMenuManager();
+    renderInventory();
+    toast(id ? "Producto e inventario actualizados." : "Producto agregado al inventario.");
+  };
+
+  const adjustInventory = (id, adjustment) => {
+    const item = state.items.find((entry) => entry.id === id);
+    if (!item) return;
+    const current = inventoryFor(item);
+    const nextStock = Math.max(0, current.stock + Number(adjustment || 0));
+    state.inventoryMeta[id] = {
+      ...current,
+      code: current.code,
+      stock: nextStock,
+      updatedAt: new Date().toISOString()
+    };
+    persistInventoryStore();
+    queueInventoryUpsert(item);
+    renderInventory();
+  };
+
+  const dateInputValue = (date) => {
+    const value = date instanceof Date ? date : new Date(date);
+    if (Number.isNaN(value.getTime())) return "";
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const day = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  };
+
+  const shiftedDate = (date, days) => {
+    const next = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12);
+    next.setDate(next.getDate() + days);
+    return next;
+  };
+
+  const incomeRangeDates = (preset = "today") => {
+    const today = new Date();
+    let from = today;
+    let to = today;
+    if (preset === "yesterday") from = to = shiftedDate(today, -1);
+    if (preset === "7days") from = shiftedDate(today, -6);
+    if (preset === "15days") from = shiftedDate(today, -14);
+    if (preset === "30days") from = shiftedDate(today, -29);
+    if (preset === "month") from = new Date(today.getFullYear(), today.getMonth(), 1, 12);
+    if (preset === "year") from = new Date(today.getFullYear(), 0, 1, 12);
+    return { dateFrom: dateInputValue(from), dateTo: dateInputValue(to) };
+  };
+
+  const markIncomeRangePreset = () => {
+    $$('[data-income-range]').forEach((button) => {
+      const active = button.dataset.incomeRange === state.incomeRangePreset;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+  };
+
+  const initializeIncomeFilters = () => {
+    const from = $("#incomeDateFrom");
+    const to = $("#incomeDateTo");
+    if (!from || !to) return;
+    if (!from.value || !to.value) {
+      const range = incomeRangeDates(state.incomeRangePreset);
+      from.value = range.dateFrom;
+      to.value = range.dateTo;
+    }
+    markIncomeRangePreset();
+  };
+
+  const setIncomeRange = (preset, refresh = true) => {
+    const range = incomeRangeDates(preset);
+    const from = $("#incomeDateFrom");
+    const to = $("#incomeDateTo");
+    if (!from || !to) return;
+    state.incomeRangePreset = preset;
+    from.value = range.dateFrom;
+    to.value = range.dateTo;
+    markIncomeRangePreset();
+    if (refresh) void loadIncomeReport();
+  };
+
+  const incomeFiltersFromForm = () => {
+    initializeIncomeFilters();
+    return {
+      dateFrom: $("#incomeDateFrom")?.value || dateInputValue(new Date()),
+      dateTo: $("#incomeDateTo")?.value || dateInputValue(new Date()),
+      paymentMethod: $("#incomePaymentMethod")?.value || "all",
+      query: $("#incomeSearch")?.value.trim() || "",
+      limit: 300
+    };
+  };
+
+  const incomePaymentLabel = (method) => ({
+    cash: "Efectivo",
+    transfer: "Transferencia",
+    breb: "Bre-B",
+    mixed: "Mixto"
+  }[method] || "Otro");
+
+  const incomeRecordDateKey = (value) => {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value || "").slice(0, 10) : dateInputValue(date);
+  };
+
+  const incomeTotalsFromRecords = (records = []) => {
+    const totals = records.reduce((summary, record) => {
+      summary.income += Number(record.total || 0);
+      summary.sales += 1;
+      summary.subtotal += Number(record.subtotal || 0);
+      summary.discount += Number(record.discount || 0);
+      summary.tax += Number(record.tax || 0);
+      summary.service += Number(record.service || 0);
+      summary.cost += Number(record.cost || 0);
+      summary.profit += Number(record.profit || 0);
+      (record.payments || []).forEach((payment) => {
+        const method = ["cash", "transfer", "breb"].includes(payment.method) ? payment.method : "other";
+        summary[method] += Number(payment.amount || 0);
+      });
+      return summary;
+    }, { income: 0, sales: 0, subtotal: 0, discount: 0, tax: 0, service: 0, cost: 0, profit: 0, cash: 0, transfer: 0, breb: 0, other: 0 });
+    totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
+    return totals;
+  };
+
+  const localIncomeRecords = (filters) => {
+    const query = normalizeText(filters.query || "");
+    return state.invoiceHistory.map((invoice) => {
+      const items = (invoice.items || []).map((line) => {
+        const quantity = Number(line.quantity || 0);
+        const unitPrice = Number(line.unit_price || 0);
+        const unitCost = Number(state.inventoryMeta[line.menu_item_id]?.costPrice || 0);
+        return { name: line.item_name || "Producto", quantity, unitPrice, total: quantity * unitPrice, cost: quantity * unitCost, profit: quantity * (unitPrice - unitCost) };
+      });
+      const cost = items.reduce((sum, item) => sum + item.cost, 0);
+      const total = Number(invoice.totals?.total || 0);
+      const payments = (invoice.payments || []).map((payment) => ({ method: payment.method, amount: Number(payment.amount || 0), reference: invoice.reference || "" }));
+      return {
+        saleId: invoice.id || invoice.sessionId,
+        invoice: invoice.number || "Factura",
+        sessionId: invoice.sessionId || "",
+        table: invoice.table || "Mesa",
+        date: invoice.createdAt || new Date().toISOString(),
+        payer: invoice.payerName || "",
+        waiter: invoice.waiterName || "",
+        subtotal: Number(invoice.totals?.subtotal || 0),
+        discount: Number(invoice.totals?.discount || 0),
+        tax: Number(invoice.totals?.tax || 0),
+        service: Number(invoice.totals?.serviceFee || 0),
+        total,
+        cost,
+        profit: total - cost,
+        reference: invoice.reference || "",
+        isMixed: invoice.paymentMethod === "mixed" || payments.length > 1,
+        payments,
+        items
+      };
+    }).filter((record) => {
+      const dateKey = incomeRecordDateKey(record.date);
+      if (dateKey < filters.dateFrom || dateKey > filters.dateTo) return false;
+      if (filters.paymentMethod === "mixed" && !record.isMixed) return false;
+      if (!["all", "mixed"].includes(filters.paymentMethod) && !record.payments.some((payment) => payment.method === filters.paymentMethod)) return false;
+      const haystack = normalizeText([record.invoice, record.table, record.payer, record.waiter, record.reference, record.items.map((item) => item.name).join(" ")].join(" "));
+      return !query || haystack.includes(query);
+    }).sort((left, right) => String(right.date).localeCompare(String(left.date)));
+  };
+
+  const localIncomeReport = (filters, error = "") => {
+    const records = localIncomeRecords(filters);
+    return {
+      filters,
+      totals: incomeTotalsFromRecords(records),
+      records,
+      recordKeys: records.map((record) => record.saleId),
+      totalRecords: records.length,
+      truncated: false,
+      localOnly: true,
+      error
+    };
+  };
+
+  const mergeIncomeReport = (remote, filters) => {
+    const remoteKeys = new Set(remote.recordKeys || (remote.records || []).map((record) => record.saleId));
+    const pending = localIncomeRecords(filters).filter((record) => !remoteKeys.has(record.saleId));
+    const pendingTotals = incomeTotalsFromRecords(pending);
+    const totals = { ...(remote.totals || {}) };
+    Object.keys(pendingTotals).forEach((key) => { totals[key] = Number(totals[key] || 0) + (key === "averageTicket" ? 0 : Number(pendingTotals[key] || 0)); });
+    totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
+    return {
+      ...remote,
+      filters,
+      totals,
+      records: [...pending, ...(remote.records || [])].sort((left, right) => String(right.date).localeCompare(String(left.date))),
+      totalRecords: Number(remote.totalRecords || 0) + pending.length,
+      pendingCount: pending.length,
+      localOnly: false
+    };
+  };
+
+  const setIncomeReportStatus = (message, tone = "ready", iconName = "badge-check") => {
+    const target = $("#incomeReportStatus");
+    if (!target) return;
+    target.className = `income-report-status is-${tone}`;
+    target.innerHTML = `${icon(iconName, 15)} ${escapeHTML(message)}`;
+    refreshIcons();
+  };
+
+  const formatIncomeDate = (value) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value || "Sin fecha");
+    return new Intl.DateTimeFormat("es-CO", { dateStyle: "medium", timeStyle: "short" }).format(date);
+  };
+
+  const renderIncomeReport = () => {
+    const kpis = $("#incomeKpis");
+    const payments = $("#incomePaymentBreakdown");
+    const recordsTarget = $("#incomeRecords");
+    const summaryTarget = $("#incomeFilterSummary");
+    if (!kpis || !payments || !recordsTarget) return;
+    const report = state.incomeReport;
+    if (!report) {
+      kpis.innerHTML = Array.from({ length: 6 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
+      payments.innerHTML = "";
+      recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
+      setIncomeReportStatus("Consultando ingresos", "loading", "loader-circle");
+      return;
+    }
+    const totals = report.totals || {};
+    const margin = Number(totals.income || 0) > 0 ? Number(totals.profit || 0) / Number(totals.income) * 100 : 0;
+    kpis.innerHTML = `
+      <article class="income-kpi is-primary"><span>${icon("circle-dollar-sign", 19)} Total facturado</span><strong>${money(totals.income)}</strong><small>Ticket promedio ${money(totals.averageTicket)}</small></article>
+      <article class="income-kpi is-profit"><span>${icon("trending-up", 19)} Utilidad estimada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% sobre ingresos</small></article>
+      <article class="income-kpi"><span>${icon("package-search", 19)} Costo vendido</span><strong>${money(totals.cost)}</strong><small>Costo registrado en inventario</small></article>`;
+    payments.innerHTML = [
+      ["cash", "banknote", "Efectivo"],
+      ["transfer", "landmark", "Transferencia"],
+      ["breb", "scan-line", "Bre-B"]
+    ].map(([key, iconName, label]) => `<article><span>${icon(iconName, 18)} ${label}</span><strong>${money(totals[key])}</strong><small>${Number(totals.income || 0) ? (Number(totals[key] || 0) / Number(totals.income) * 100).toLocaleString("es-CO", { maximumFractionDigits: 1 }) : "0"}% del total</small></article>`).join("");
+    const filters = report.filters || incomeFiltersFromForm();
+    if (summaryTarget) {
+      const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
+      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}`;
+    }
+    recordsTarget.innerHTML = report.records?.length
+      ? report.records.map((record) => {
+          const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
+          const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
+          return `<article class="income-record">
+            <div class="income-record-main">
+              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small></div>
+              <div><small>Mesa / responsable</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
+              <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
+              <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span>Utilidad ${money(record.profit)}</span></div>
+            </div>
+            <div class="income-payment-badges">${paymentBadges || "<span>Medio no registrado</span>"}</div>
+            <details>
+              <summary>${icon("list-collapse", 15)} Ver productos y desglose</summary>
+              <div class="income-record-detail">
+                <ul>${itemRows || "<li><span>Sin detalle de productos</span></li>"}</ul>
+                <dl><div><dt>Subtotal</dt><dd>${money(record.subtotal)}</dd></div><div><dt>Descuento</dt><dd>${money(record.discount)}</dd></div><div><dt>Impuestos</dt><dd>${money(record.tax)}</dd></div><div><dt>Servicio</dt><dd>${money(record.service)}</dd></div><div><dt>Costo</dt><dd>${money(record.cost)}</dd></div></dl>
+              </div>
+            </details>
+          </article>`;
+        }).join("")
+      : emptyState("Sin ingresos en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
+    const pendingText = report.pendingCount ? ` · ${report.pendingCount} pendiente${report.pendingCount === 1 ? "" : "s"} de respaldo` : "";
+    const limitedText = report.truncated ? " · mostrando los 300 más recientes" : "";
+    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+    refreshIcons();
+  };
+
+  const loadIncomeReport = async () => {
+    if (!$("#income") || state.currentUser?.role !== "admin") return false;
+    const filters = incomeFiltersFromForm();
+    if (filters.dateFrom > filters.dateTo) {
+      toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
+      return false;
+    }
+    const requestId = ++state.incomeRequestId;
+    state.incomeLoading = true;
+    setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
+    try {
+      if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
+      const result = await appsScriptRequest("get_income_report", { filters }, 40000);
+      if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
+      if (requestId !== state.incomeRequestId) return false;
+      state.incomeReport = mergeIncomeReport(result, filters);
+      renderIncomeReport();
+      return true;
+    } catch (error) {
+      if (requestId !== state.incomeRequestId) return false;
+      state.incomeReport = localIncomeReport(filters, String(error?.message || error));
+      renderIncomeReport();
+      setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
+      return false;
+    } finally {
+      if (requestId === state.incomeRequestId) state.incomeLoading = false;
+    }
+  };
+
+  const exportIncomeCsv = () => {
+    const records = state.incomeReport?.records || [];
+    if (!records.length) {
+      toast("No hay ingresos para exportar con estos filtros.", "error", "empty-income-export");
+      return;
+    }
+    const safeCsv = (value) => {
+      let text = String(value ?? "");
+      if (/^[=+\-@]/.test(text)) text = `'${text}`;
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+    const rows = [["Factura", "Fecha", "Mesa", "Responsable", "Mesero", "Medios de pago", "Subtotal", "Descuento", "Impuestos", "Servicio", "Costo", "Utilidad", "Total", "Referencia"]];
+    records.forEach((record) => rows.push([
+      record.invoice, record.date, record.table, record.payer, record.waiter,
+      (record.payments || []).map((payment) => `${incomePaymentLabel(payment.method)}: ${payment.amount}`).join(" + "),
+      record.subtotal, record.discount, record.tax, record.service, record.cost, record.profit, record.total, record.reference
+    ]));
+    const blob = new Blob(["\ufeff", rows.map((row) => row.map(safeCsv).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ingresos-${state.incomeReport.filters?.dateFrom || "inicio"}-${state.incomeReport.filters?.dateTo || "hoy"}.csv`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const renderGeneratedTableQrs = () => {
@@ -2508,7 +3673,8 @@ const App = (() => {
               year: "numeric"
             });
             return `
-              <article class="account-card invoice-ticket">
+              <article class="account-card invoice-ticket ${items.length ? "" : "is-empty"}">
+                ${items.length ? "" : `<button class="icon-btn danger empty-account-close" type="button" data-close-session="${session.id}" aria-label="Quitar cuenta vacia" title="Quitar cuenta vacia">${icon("x", 18)}</button>`}
                 <div class="invoice-total-block">
                   <span>Total actual</span>
                   <strong>${money(total)}</strong>
@@ -2554,6 +3720,7 @@ const App = (() => {
 
                 <div class="invoice-actions">
                   <button class="ghost small" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>
+                  <button class="ghost small" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>
                   ${
                     billRequest
                       ? `<button class="ghost small" data-send-bill="${billRequest.id}">${icon("send", 15)} ${
@@ -2561,7 +3728,7 @@ const App = (() => {
                         }</button>`
                       : ""
                   }
-                  <button class="primary small invoice-close" data-close-session="${session.id}">Cerrar ${icon("arrow-right", 15)}</button>
+                  <button class="primary small invoice-close" data-charge-session="${session.id}">Cobrar y facturar ${icon("arrow-right", 15)}</button>
                 </div>
               </article>
             `;
@@ -2579,6 +3746,8 @@ const App = (() => {
     renderTableManager();
     renderWaiterTableSelect();
     renderMenuManager();
+    renderInventory();
+    renderIncomeReport();
     renderAccounts();
   };
 
@@ -2737,7 +3906,7 @@ const App = (() => {
       category_id: categoryId || null,
       name: form.item_name.value.trim(),
       description: form.description.value.trim(),
-      price: Number(form.price.value || 0),
+      price: currencyInputNumber(form.price),
       image_url: form.image_url.value.trim(),
       is_available: form.is_available.checked,
       sort_order: Number(form.sort_order.value || 0)
@@ -2859,7 +4028,7 @@ const App = (() => {
 
   const closeSession = async (id) => {
     const session = state.sessions.find((entry) => entry.id === id);
-    if (!session) return;
+    if (!session) return null;
     const totals = sessionTotals(session);
     const originalSessions = state.sessions;
     const originalRequests = state.requests;
@@ -2867,30 +4036,222 @@ const App = (() => {
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
     state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
     renderAdminLive();
-    void (async () => {
-      const saved = await retryQuiet(
-        () => state.sb.from("table_sessions").update({
-          status: "closed",
-          closed_at: new Date().toISOString(),
-          subtotal: totals.subtotal,
-          discount: totals.discount,
-          tax: totals.tax,
-          service_fee: totals.serviceFee,
-          total: totals.total
-        }).eq("id", id).select("*").single(),
-        4
-      );
-      if (!saved) {
-        state.optimisticSessionStates.delete(id);
-        state.sessions = originalSessions;
-        state.requests = originalRequests;
-        renderAdmin();
-        toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
-        return;
-      }
-      state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
-      await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq("session_id", id), null);
-    })();
+    const saved = await retryQuiet(
+      () => state.sb.from("table_sessions").update({
+        status: "closed",
+        closed_at: new Date().toISOString(),
+        subtotal: totals.subtotal,
+        discount: totals.discount,
+        tax: totals.tax,
+        service_fee: totals.serviceFee,
+        total: totals.total
+      }).eq("id", id).select("*").single(),
+      4
+    );
+    if (!saved) {
+      state.optimisticSessionStates.delete(id);
+      state.sessions = originalSessions;
+      state.requests = originalRequests;
+      renderAdmin();
+      toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
+      return null;
+    }
+    state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
+    await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq("session_id", id), null);
+    return { session, saved, totals };
+  };
+
+  const thermalReceiptHtml = (session, invoice = null) => {
+    const totals = invoice?.totals || sessionTotals(session);
+    const items = (invoice?.items || session.session_items || []).filter((item) => item.status !== "cancelled");
+    const isPaid = Boolean(invoice);
+    const receiptNumber = invoice?.number || `PRE-${String(session.id).slice(0, 8).toUpperCase()}`;
+    const issuedAt = new Date(invoice?.createdAt || Date.now());
+    const payments = invoice?.payments || [];
+    return `<!doctype html>
+      <html lang="es"><head><meta charset="utf-8"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
+      <style>
+        @page { size: 80mm auto; margin: 3mm; }
+        * { box-sizing: border-box; }
+        body { width: 72mm; margin: 0 auto; color: #000; background: #fff; font: 12px/1.35 "Courier New", monospace; }
+        .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
+        .subtitle, .center { text-align: center; }
+        .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
+        .rule { margin: 2.5mm 0; border-top: 1px dashed #000; }
+        .meta, .totals { display: grid; grid-template-columns: 1fr auto; gap: 1mm 3mm; }
+        .items { display: grid; gap: 2mm; }
+        .item { display: grid; grid-template-columns: 1fr auto; gap: 2mm; }
+        .item small { display: block; }
+        .total { margin-top: 1.5mm; font-size: 16px; font-weight: 900; }
+        .paid { padding: 1.5mm; border: 2px solid #000; text-align: center; font-weight: 900; }
+        .footer { margin-top: 3mm; text-align: center; }
+        @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
+      </style></head><body>
+        <div class="logo">TIENDA NÁPOLES</div>
+        <div class="subtitle">${isPaid ? "FACTURA DE VENTA" : "PRE-CUENTA · NO ES FACTURA"}</div>
+        <div class="rule"></div>
+        <div class="meta">
+          <span>Documento:</span><strong>${escapeHTML(receiptNumber)}</strong>
+          <span>Mesa:</span><strong>${escapeHTML(tableLabel(session.restaurant_tables))}</strong>
+          <span>Fecha:</span><strong>${issuedAt.toLocaleDateString("es-CO")}</strong>
+          <span>Hora:</span><strong>${issuedAt.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}</strong>
+          <span>Responsable:</span><strong>${escapeHTML(session.payer_name || "Consumidor final")}</strong>
+          <span>Mesero:</span><strong>${escapeHTML(session.assigned_waiter?.full_name || state.currentUser?.full_name || "Equipo")}</strong>
+        </div>
+        <div class="rule"></div>
+        <div class="items">
+          ${items.map((item) => `<div class="item"><span>${Number(item.quantity || 0)} x ${escapeHTML(item.item_name)}<small>${money(item.unit_price)} c/u</small></span><strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong></div>`).join("") || "<div class=\"center\">Sin consumos</div>"}
+        </div>
+        <div class="rule"></div>
+        <div class="totals">
+          <span>Subtotal</span><strong>${money(totals.subtotal)}</strong>
+          ${totals.discount ? `<span>Descuento</span><strong>-${money(totals.discount)}</strong>` : ""}
+          ${totals.tax ? `<span>Impuestos</span><strong>${money(totals.tax)}</strong>` : ""}
+          ${totals.serviceFee ? `<span>Servicio</span><strong>${money(totals.serviceFee)}</strong>` : ""}
+          <span class="total">TOTAL</span><strong class="total">${money(totals.total)}</strong>
+        </div>
+        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
+        <div class="rule"></div>
+        <div class="footer">Gracias por su compra<br><strong>TIENDA NÁPOLES</strong></div>
+        <script>window.onload=function(){setTimeout(function(){window.print()},250)}<\/script>
+      </body></html>`;
+  };
+
+  const printThermalReceipt = (session, invoice = null, receiptWindow = null) => {
+    const popup = receiptWindow || window.open("", "_blank", "width=420,height=720");
+    if (!popup) {
+      toast("El navegador bloqueo la ventana de impresion. Habilita ventanas emergentes e intenta de nuevo.", "error", "receipt-popup-blocked");
+      return false;
+    }
+    popup.document.open();
+    popup.document.write(thermalReceiptHtml(session, invoice));
+    popup.document.close();
+    return true;
+  };
+
+  const updateMixedPayment = (changedField = "mixed_amount_one") => {
+    const form = $("#paymentForm");
+    const box = $("#paymentBalance");
+    if (!form || !box) return;
+    const total = integerMoney(state.activePaymentTotal);
+    const first = currencyInputNumber(form.mixed_amount_one);
+    const second = currencyInputNumber(form.mixed_amount_two);
+    if (changedField === "mixed_amount_one") setCurrencyInputValue(form.mixed_amount_two, Math.max(0, total - first));
+    if (changedField === "mixed_amount_two") setCurrencyInputValue(form.mixed_amount_one, Math.max(0, total - second));
+    const currentFirst = currencyInputNumber(form.mixed_amount_one);
+    const currentSecond = currencyInputNumber(form.mixed_amount_two);
+    const difference = total - currentFirst - currentSecond;
+    box.className = `payment-balance wide ${difference === 0 ? "is-balanced" : "is-unbalanced"}`;
+    box.innerHTML = difference === 0
+      ? `${icon("badge-check", 17)} Pago distribuido correctamente: ${money(total)}`
+      : `${icon("circle-alert", 17)} ${difference > 0 ? "Faltan" : "Sobran"} ${money(Math.abs(difference))}`;
+    refreshIcons();
+  };
+
+  const syncMixedMethods = (changedName) => {
+    const form = $("#paymentForm");
+    if (!form || form.mixed_method_one.value !== form.mixed_method_two.value) return;
+    const other = changedName === "mixed_method_one" ? form.mixed_method_two : form.mixed_method_one;
+    other.value = ["cash", "transfer", "breb"].find((method) => method !== form[changedName].value) || "cash";
+  };
+
+  const openPaymentDialog = (sessionId) => {
+    const session = state.sessions.find((entry) => entry.id === sessionId);
+    const dialog = $("#paymentDialog");
+    const form = $("#paymentForm");
+    if (!session || !dialog || !form) return;
+    const total = sessionTotal(session);
+    if (!(session.session_items || []).some((item) => item.status !== "cancelled")) {
+      toast("Agrega al menos un consumo antes de cobrar la mesa.", "error", `empty-payment:${sessionId}`);
+      return;
+    }
+    form.reset();
+    form.session_id.value = session.id;
+    form.payment_method.value = "cash";
+    form.mixed_method_one.value = "cash";
+    form.mixed_method_two.value = "transfer";
+    setCurrencyInputValue(form.mixed_amount_one, total);
+    setCurrencyInputValue(form.mixed_amount_two, 0);
+    state.activePaymentTotal = total;
+    $("#paymentTableLabel").textContent = tableLabel(session.restaurant_tables);
+    $("#paymentTotal").textContent = money(total);
+    $("#mixedPaymentFields").hidden = true;
+    updateMixedPayment("mixed_amount_one");
+    dialog.showModal();
+    refreshIcons();
+  };
+
+  const paymentFromForm = (form) => {
+    const method = form.payment_method.value;
+    const total = integerMoney(state.activePaymentTotal);
+    if (method !== "mixed") return { method, payments: [{ method, amount: total }] };
+    const firstMethod = form.mixed_method_one.value;
+    const secondMethod = form.mixed_method_two.value;
+    const firstAmount = currencyInputNumber(form.mixed_amount_one);
+    const secondAmount = currencyInputNumber(form.mixed_amount_two);
+    if (firstMethod === secondMethod || firstAmount <= 0 || secondAmount <= 0 || firstAmount + secondAmount !== total) return null;
+    return { method, payments: [{ method: firstMethod, amount: firstAmount }, { method: secondMethod, amount: secondAmount }] };
+  };
+
+  const applyInvoiceToInventory = (invoice) => {
+    if (state.invoiceHistory.some((entry) => entry.sessionId === invoice.sessionId)) return;
+    state.invoiceHistory.push(invoice);
+    persistInvoiceHistory();
+    state.incomeReport = null;
+    enqueueAppsScriptJob("record_sale", { invoice }, `sale:${invoice.sessionId}`);
+  };
+
+  const processPayment = async (form, submitter) => {
+    const session = state.sessions.find((entry) => entry.id === form.session_id.value);
+    if (!session) {
+      toast("La cuenta ya no esta abierta.", "error", "payment-session-missing");
+      return;
+    }
+    const payment = paymentFromForm(form);
+    if (!payment) {
+      toast("En pago mixto usa dos medios diferentes y distribuye exactamente el total.", "error", "invalid-mixed-payment");
+      return;
+    }
+    const shouldPrint = submitter?.value === "print";
+    const receiptWindow = shouldPrint ? window.open("", "_blank", "width=420,height=720") : null;
+    if (receiptWindow) receiptWindow.document.write("<p style='font-family:sans-serif'>Procesando pago...</p>");
+    const buttons = $$('button[type="submit"]', form);
+    buttons.forEach((button) => { button.disabled = true; });
+    const closed = await closeSession(session.id);
+    buttons.forEach((button) => { button.disabled = false; });
+    if (!closed) {
+      receiptWindow?.close();
+      return;
+    }
+    const createdAt = closed.saved.closed_at || new Date().toISOString();
+    const invoice = {
+      id: uid(),
+      number: `TN-${new Date(createdAt).toISOString().slice(0, 10).replace(/-/g, "")}-${String(session.id).slice(0, 6).toUpperCase()}`,
+      sessionId: session.id,
+      tableId: session.table_id,
+      table: tableLabel(session.restaurant_tables),
+      createdAt,
+      payerName: session.payer_name || "",
+      waiterName: session.assigned_waiter?.full_name || state.currentUser?.full_name || "",
+      paymentMethod: payment.method,
+      payments: payment.payments,
+      reference: form.payment_reference.value.trim(),
+      inventoryAdjustedOnConsumption: true,
+      totals: closed.totals,
+      items: (session.session_items || []).filter((item) => item.status !== "cancelled").map((item) => ({
+        id: item.id,
+        menu_item_id: item.menu_item_id || null,
+        item_name: item.item_name,
+        quantity: Number(item.quantity || 0),
+        unit_price: Number(item.unit_price || 0),
+        status: item.status
+      }))
+    };
+    applyInvoiceToInventory(invoice);
+    $("#paymentDialog")?.close();
+    if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
+    renderInventory();
+    toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
   };
 
   const openConsumptionDialog = (sessionId) => {
@@ -2902,10 +4263,17 @@ const App = (() => {
     form.session_item_id.value = "";
     const session = state.sessions.find((entry) => entry.id === sessionId);
     form.payer_name.value = session?.payer_name || "";
-    form.quantity.value = 1;
-    form.unit_price.value = 0;
+    form.quantity.value = "";
+    setCurrencyInputValue(form.unit_price, 0);
+    const productSearch = $("#consumptionProductSearch");
+    if (productSearch) productSearch.value = "";
+    const optionalFields = $("#consumptionOptionalFields");
+    if (optionalFields) optionalFields.open = false;
+    closeConsumptionProductOptions();
     dialog.showModal();
-    refreshIcons();
+    window.setTimeout(() => {
+      productSearch?.focus({ preventScroll: true });
+    }, 0);
   };
 
   const editConsumption = (sessionId, itemId) => {
@@ -2921,10 +4289,40 @@ const App = (() => {
     form.item_name.value = item.item_name || "";
     form.payer_name.value = session.payer_name || "";
     form.quantity.value = item.quantity || 1;
-    form.unit_price.value = item.unit_price || 0;
+    setCurrencyInputValue(form.unit_price, item.unit_price || 0);
     form.notes.value = item.notes || "";
+    const optionalFields = $("#consumptionOptionalFields");
+    if (optionalFields) optionalFields.open = true;
+    const product = state.items.find((entry) => entry.id === item.menu_item_id);
+    const productSearch = $("#consumptionProductSearch");
+    if (productSearch) productSearch.value = product ? `${inventoryFor(product).code} · ${product.name}` : "";
+    renderConsumptionProductOptions(product?.name || "");
+    closeConsumptionProductOptions();
     dialog.showModal();
     refreshIcons();
+  };
+
+  const showStockWarning = ({ item, current, change, remaining, minimum, insufficient = false }) => {
+    const dialog = $("#stockWarningDialog");
+    if (!dialog) return Promise.resolve(!insufficient);
+    const productName = item?.name || "Producto";
+    $("#stockWarningTitle").textContent = insufficient ? "Existencias insuficientes" : "Stock bajo";
+    $("#stockWarningMessage").textContent = insufficient
+      ? `${productName} necesita ${change} unidad${change === 1 ? "" : "es"} adicionales, pero solo quedan ${current}. No se agregara el consumo.`
+      : `${productName} quedara en ${remaining} unidad${remaining === 1 ? "" : "es"}, igual o por debajo del minimo configurado de ${minimum}.`;
+    $("#stockWarningCurrent").textContent = current.toLocaleString("es-CO", { maximumFractionDigits: 2 });
+    $("#stockWarningRequested").textContent = change.toLocaleString("es-CO", { maximumFractionDigits: 2 });
+    $("#stockWarningRemaining").textContent = Math.max(0, remaining).toLocaleString("es-CO", { maximumFractionDigits: 2 });
+    const cancel = $("#stockWarningCancel");
+    const confirm = $("#stockWarningConfirm");
+    cancel.textContent = insufficient ? "Entendido" : "Cancelar";
+    confirm.hidden = insufficient;
+    dialog.returnValue = "";
+    dialog.showModal();
+    refreshIcons();
+    return new Promise((resolve) => {
+      dialog.addEventListener("close", () => resolve(!insufficient && dialog.returnValue === "confirm"), { once: true });
+    });
   };
 
   const addManualConsumption = async (form) => {
@@ -2932,19 +4330,73 @@ const App = (() => {
     const session = state.sessions.find((entry) => entry.id === sessionId);
     const selectedItem = state.items.find((item) => item.id === form.menu_item_id.value);
     const name = form.item_name.value.trim() || selectedItem?.name;
-    const price = Number(form.unit_price.value || selectedItem?.price || 0);
-    const quantity = Number(form.quantity.value || 1);
+    const price = form.unit_price.value.trim() ? currencyInputNumber(form.unit_price) : Number(selectedItem?.price || 0);
+    const quantityText = String(form.quantity.value || "").trim();
+    const quantity = Number(quantityText);
     const itemId = form.session_item_id.value || "";
     const payerName = form.payer_name.value.trim();
+    const previousLine = itemId ? session?.session_items?.find((item) => item.id === itemId) : null;
+    const previousItem = state.items.find((item) => item.id === previousLine?.menu_item_id);
     if (!name) {
       toast("El consumo necesita nombre o producto.", "error");
       return;
     }
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100 || !Number.isFinite(price) || price < 0) {
+    if (!quantityText || !Number.isInteger(quantity) || quantity < 1 || quantity > 100 || !Number.isFinite(price) || price < 0) {
       toast("Revisa cantidad y precio antes de guardar.", "error", "invalid-consumption-values");
+      form.quantity.focus({ preventScroll: true });
       return;
     }
     if (!session) return;
+    const stockDeltaByProduct = new Map();
+    if (previousItem && Object.prototype.hasOwnProperty.call(state.inventoryMeta, previousItem.id)) {
+      stockDeltaByProduct.set(previousItem.id, Number(previousLine.quantity || 0));
+    }
+    if (selectedItem && Object.prototype.hasOwnProperty.call(state.inventoryMeta, selectedItem.id)) {
+      stockDeltaByProduct.set(selectedItem.id, Number(stockDeltaByProduct.get(selectedItem.id) || 0) - quantity);
+    }
+    const stockPlan = Array.from(stockDeltaByProduct.entries()).map(([productId, delta]) => ({
+      item: state.items.find((item) => item.id === productId),
+      delta
+    })).filter((entry) => entry.item && entry.delta !== 0);
+    const insufficient = stockPlan.find((entry) => inventoryFor(entry.item).stock + entry.delta < 0);
+    if (insufficient) {
+      const inventory = inventoryFor(insufficient.item);
+      await showStockWarning({
+        item: insufficient.item,
+        current: inventory.stock,
+        change: Math.abs(insufficient.delta),
+        remaining: inventory.stock + insufficient.delta,
+        minimum: inventory.minStock,
+        insufficient: true
+      });
+      form.quantity.focus({ preventScroll: true });
+      return;
+    }
+    const lowStock = stockPlan.find((entry) => {
+      if (entry.delta >= 0) return false;
+      const inventory = inventoryFor(entry.item);
+      return inventory.stock + entry.delta <= inventory.minStock;
+    });
+    if (lowStock) {
+      const inventory = inventoryFor(lowStock.item);
+      const proceed = await showStockWarning({
+        item: lowStock.item,
+        current: inventory.stock,
+        change: Math.abs(lowStock.delta),
+        remaining: inventory.stock + lowStock.delta,
+        minimum: inventory.minStock
+      });
+      if (!proceed) {
+        form.quantity.focus({ preventScroll: true });
+        return;
+      }
+    }
+    const stockOperationId = uid();
+    const appliedStockAdjustments = stockPlan.map((entry, index) => applyConsumptionInventoryDelta(entry.item, entry.delta, {
+      eventId: `consumption:${stockOperationId}:${index}`,
+      sessionId,
+      reference: itemId ? "EDICION_CONSUMO" : "NUEVO_CONSUMO"
+    })).filter(Boolean);
     const payload = {
       session_id: sessionId,
       table_id: session.table_id,
@@ -2998,6 +4450,14 @@ const App = (() => {
         4
       );
       if (!saved) {
+        appliedStockAdjustments.forEach((adjustment, index) => {
+          applyConsumptionInventoryDelta(adjustment.item, -adjustment.delta, {
+            eventId: `${adjustment.eventId}:rollback:${index}`,
+            reversesEventId: adjustment.eventId,
+            sessionId,
+            reference: "REVERSION_CONSUMO_NO_GUARDADO"
+          });
+        });
         state.optimisticSessionStates.delete(sessionId);
         state.sessions = state.sessions.map((entry) => entry.id === sessionId
           ? session
@@ -3258,7 +4718,7 @@ const App = (() => {
     form.new_category.value = "";
     form.item_name.value = item.name;
     form.description.value = item.description || "";
-    form.price.value = item.price;
+    setCurrencyInputValue(form.price, item.price);
     form.image_url.value = item.image_url || "";
     form.is_available.checked = item.is_available;
     form.sort_order.value = item.sort_order || 0;
@@ -3268,7 +4728,17 @@ const App = (() => {
   };
 
   const deleteRow = async (table, id, label) => {
-    if (!confirm(`Eliminar ${label}?`)) return;
+    if (table === "menu_items") {
+      const product = state.items.find((entry) => entry.id === id);
+      const unitsInOpenTables = state.sessions.reduce((sum, session) => sum + (session.session_items || [])
+        .filter((entry) => entry.status !== "cancelled" && entry.menu_item_id === id)
+        .reduce((lineSum, entry) => lineSum + Number(entry.quantity || 0), 0), 0);
+      if (unitsInOpenTables > 0) {
+        toast(`No puedes eliminar ${product?.name || "este producto"}: tiene ${unitsInOpenTables} unidad${unitsInOpenTables === 1 ? "" : "es"} en mesas abiertas.`, "error", `product-in-open-table:${id}`);
+        return;
+      }
+      if (!confirm(`¿Eliminar “${product?.name || "este producto"}”?\n\nSe retirará del menú y del inventario. Las ventas históricas conservarán su detalle.`)) return;
+    } else if (!confirm(`Eliminar ${label}?`)) return;
     const property = {
       restaurant_tables: "tables",
       menu_categories: "categories",
@@ -3283,7 +4753,17 @@ const App = (() => {
         () => state.sb.from(table).delete().eq("id", id).select("*").single(),
         4
       );
-      if (removed) return;
+      if (removed) {
+        if (table === "menu_items") {
+          if (state.inventoryMeta[id]) {
+            delete state.inventoryMeta[id];
+            persistInventoryStore();
+          }
+          enqueueAppsScriptJob("delete_inventory", { productId: id }, `inventory-delete:${id}`);
+        }
+        if (table === "menu_items") resetInventoryForm();
+        return;
+      }
       if (property) state[property] = original;
       if (property) persistBootstrapCache();
       renderAdmin();
@@ -3292,6 +4772,7 @@ const App = (() => {
   };
 
   const bindAdmin = () => {
+    bindCurrencyInputs();
     $("#businessForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveBusiness(event.currentTarget);
@@ -3311,9 +4792,94 @@ const App = (() => {
       event.preventDefault();
       await saveItem(event.currentTarget);
     });
+    $("#inventoryForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await saveInventoryProduct(event.currentTarget);
+    });
+    $("#inventoryForm")?.addEventListener("input", renderInventoryLiveCalculation);
+    $("#incomeFilterForm")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      state.incomeRangePreset = "custom";
+      markIncomeRangePreset();
+      void loadIncomeReport();
+    });
+    $("#incomeSearch")?.addEventListener("input", () => {
+      clearTimeout(state.incomeSearchTimer);
+      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 350);
+    });
+    $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
+    [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
+      state.incomeRangePreset = "custom";
+      markIncomeRangePreset();
+      if ($("#incomeDateFrom")?.value && $("#incomeDateTo")?.value) void loadIncomeReport();
+    }));
+    $("#inventorySearch")?.addEventListener("input", (event) => {
+      state.inventorySearch = event.currentTarget.value;
+      renderInventory();
+    });
+    $("#inventoryStatusFilter")?.addEventListener("change", (event) => {
+      state.inventoryStatusFilter = event.currentTarget.value || "all";
+      renderInventory();
+    });
     $("#consumptionForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await addManualConsumption(event.currentTarget);
+    });
+    $("#consumptionForm")?.elements.quantity?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    });
+    $("#paymentForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await processPayment(event.currentTarget, event.submitter);
+    });
+    $("#paymentForm")?.addEventListener("change", (event) => {
+      if (event.target.name === "payment_method") {
+        const mixed = event.target.value === "mixed";
+        $("#mixedPaymentFields").hidden = !mixed;
+        if (mixed) updateMixedPayment("mixed_amount_one");
+      }
+      if (event.target.name === "mixed_method_one" || event.target.name === "mixed_method_two") syncMixedMethods(event.target.name);
+    });
+    $("#paymentForm")?.addEventListener("input", (event) => {
+      if (event.target.name === "mixed_amount_one" || event.target.name === "mixed_amount_two") updateMixedPayment(event.target.name);
+    });
+    const productSearch = $("#consumptionProductSearch");
+    productSearch?.addEventListener("input", (event) => {
+      const form = event.currentTarget.form;
+      if (form) {
+        form.menu_item_id.value = "";
+        form.item_name.value = event.currentTarget.value.trim();
+      }
+      renderConsumptionProductOptions(event.currentTarget.value);
+      showConsumptionProductOptions();
+    });
+    productSearch?.addEventListener("focus", () => {
+      renderConsumptionProductOptions(productSearch.value);
+      showConsumptionProductOptions();
+    });
+    productSearch?.addEventListener("keydown", (event) => {
+      const availableButtons = $$('[data-consumption-product]:not(:disabled)', $("#consumptionProductOptions"));
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        showConsumptionProductOptions();
+        const currentIndex = Number($("#consumptionProductCombobox")?.dataset.activeIndex ?? -1);
+        setConsumptionProductActiveIndex(currentIndex < 0 ? (event.key === "ArrowDown" ? 0 : availableButtons.length - 1) : currentIndex + (event.key === "ArrowDown" ? 1 : -1));
+      }
+      if (event.key === "Enter" && !$("#consumptionProductOptions")?.hidden) {
+        const index = Number($("#consumptionProductCombobox")?.dataset.activeIndex ?? -1);
+        const selected = index >= 0 ? availableButtons[index] : (availableButtons.length === 1 ? availableButtons[0] : null);
+        if (selected) {
+          event.preventDefault();
+          selectConsumptionProduct(selected.dataset.consumptionProduct);
+        }
+      }
+      if (event.key === "Escape") closeConsumptionProductOptions();
+    });
+    $("#consumptionProductOptions")?.addEventListener("click", (event) => {
+      const option = event.target.closest("[data-consumption-product]");
+      if (option && !option.disabled) selectConsumptionProduct(option.dataset.consumptionProduct);
     });
     $("#userForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -3366,6 +4932,7 @@ const App = (() => {
     });
     document.addEventListener("pointerdown", (event) => {
       if (!event.target.closest("#waiterTableCombobox")) closeWaiterTableOptions();
+      if (!event.target.closest("#consumptionProductCombobox")) closeConsumptionProductOptions();
     });
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
@@ -3390,7 +4957,7 @@ const App = (() => {
         const item = state.items.find((entry) => entry.id === event.target.value);
         const form = event.target.form;
         form.item_name.value = item?.name || "";
-        form.unit_price.value = item?.price || 0;
+        setCurrencyInputValue(form.unit_price, item?.price || 0);
       }
     });
 
@@ -3424,9 +4991,22 @@ const App = (() => {
         renderTableManager();
       }
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
+      if (target.id === "syncAppsScriptInventory") {
+        await syncInventoryWithAppsScript();
+        await flushAppsScriptOutbox();
+      }
+      if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
+      if (target.id === "refreshIncomeReport") await loadIncomeReport();
+      if (target.id === "exportIncomeCsv") exportIncomeCsv();
+      if (target.id === "newInventoryProduct" || target.id === "cancelInventoryEdit") resetInventoryForm();
       if (target.dataset.acceptRequest) await acceptRequest(target.dataset.acceptRequest);
       if (target.dataset.sendBill) await sendBillToClient(target.dataset.sendBill);
       if (target.dataset.closeSession) await closeSession(target.dataset.closeSession);
+      if (target.dataset.chargeSession) openPaymentDialog(target.dataset.chargeSession);
+      if (target.dataset.printSession) {
+        const session = state.sessions.find((entry) => entry.id === target.dataset.printSession);
+        if (session) printThermalReceipt(session);
+      }
       if (target.dataset.addManual) openConsumptionDialog(target.dataset.addManual);
       if (target.dataset.editConsumption) editConsumption(target.dataset.sessionId, target.dataset.editConsumption);
       if (target.dataset.closeDialog !== undefined) target.closest("dialog")?.close();
@@ -3441,6 +5021,8 @@ const App = (() => {
       if (target.dataset.editTable) editTable(target.dataset.editTable);
       if (target.dataset.editCategory) editCategory(target.dataset.editCategory);
       if (target.dataset.editItem) editItem(target.dataset.editItem);
+      if (target.dataset.editInventory) editInventoryProduct(target.dataset.editInventory);
+      if (target.dataset.inventoryAdjust) adjustInventory(target.dataset.inventoryAdjust, Number(target.dataset.adjustment || 0));
       if (target.dataset.editUser) editUser(target.dataset.editUser);
       if (target.dataset.deleteTable) await deleteRow("restaurant_tables", target.dataset.deleteTable, "esta mesa");
       if (target.dataset.deleteCategory) await deleteRow("menu_categories", target.dataset.deleteCategory, "esta categoria");
@@ -3819,8 +5401,12 @@ const App = (() => {
 
   const applyCurrentUser = () => {
     document.body.dataset.userRole = state.currentUser?.role || "";
-    $("#currentUserName") && ($("#currentUserName").textContent = state.currentUser?.full_name || "Sin sesion");
+    const displayName = state.currentUser?.full_name || "Sin sesión";
+    $("#currentUserName") && ($("#currentUserName").textContent = displayName);
     $("#currentUserRole") && ($("#currentUserRole").textContent = state.currentUser?.role === "admin" ? "Administrador" : "Mesero");
+    $("#currentUserInitials") && ($("#currentUserInitials").textContent = state.currentUser
+      ? displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part.charAt(0)).join("").toUpperCase()
+      : "TN");
     document.body.classList.toggle("admin-authenticated", Boolean(state.currentUser));
   };
 
@@ -3988,6 +5574,7 @@ const App = (() => {
     setLoading(true);
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
+    loadInventoryStore();
     state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") === "1";
     const initialSection = pendingScan ? "service" : (location.hash.replace("#", "") || "dashboard");
     renderAdmin();
@@ -4003,6 +5590,8 @@ const App = (() => {
     renderAdmin();
     showAdminSection(initialSection);
     renderTableFormQr();
+    initRemoteStorage();
+    window.addEventListener("online", flushAppsScriptOutbox);
     startAdminPolling();
     void loadUsers().then(renderUsers);
     if (pendingScan) {

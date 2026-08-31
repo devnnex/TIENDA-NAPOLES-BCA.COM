@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Admin - Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="style.css?v=20260822-1">
+    <link rel="stylesheet" href="style.css?v=20260831-song-9">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -34,20 +34,27 @@
       </div>
       <nav>
         <a href="#dashboard"><i data-lucide="layout-dashboard"></i> Inicio</a>
-        <a href="#service"><i data-lucide="scan-line"></i> Atender mesa</a>
-        <a href="#brand" data-admin-only><i data-lucide="paintbrush"></i> Marca</a>
-        <a href="#menu" data-admin-only><i data-lucide="layout-grid"></i> Mesas</a>
+        <a href="#inventory" data-admin-only><i data-lucide="boxes"></i> Inventario</a>
+        <a href="#service" class="service-nav-link"><i data-lucide="scan-line"></i> Atender mesa <span class="nav-request-badge" id="navRequestBadge" aria-label="Solicitudes pendientes" hidden>0</span></a>
         <a href="#accounts"><i data-lucide="receipt-text"></i> Cuentas</a>
+        <a href="#income" data-admin-only><i data-lucide="chart-no-axes-combined"></i> Ingresos</a>
+        <a href="#menu" data-admin-only><i data-lucide="layout-grid"></i> Mesas</a>
         <a href="#users" data-admin-only><i data-lucide="users"></i> Usuarios</a>
+        <a href="#brand" data-admin-only><i data-lucide="paintbrush"></i> Marca</a>
       </nav>
-      <div class="operator-box">
-        <strong id="currentUserName">Sin sesion</strong>
-        <span id="currentUserRole">Usuario</span>
-        <button class="ghost small" id="logoutButton" type="button"><i data-lucide="log-out"></i> Salir</button>
-      </div>
       <div class="sound-box">
         <button class="ghost" id="enableSound" type="button"><i data-lucide="volume-2"></i> Activar alarma</button>
         <span id="soundHint">Toca aqui para permitir el sonido de las alertas.</span>
+      </div>
+      <div class="operator-box">
+        <div class="operator-identity">
+          <span class="operator-avatar" id="currentUserInitials" aria-hidden="true">TN</span>
+          <div>
+            <strong id="currentUserName">Sin sesión</strong>
+            <span id="currentUserRole">Usuario</span>
+          </div>
+        </div>
+        <button class="operator-logout" id="logoutButton" type="button"><i data-lucide="log-out"></i> Cerrar sesión</button>
       </div>
     </aside>
 
@@ -82,7 +89,7 @@
                 <option value="all">Todas</option>
                 <option value="waiter">Mesero</option>
                 <option value="bill">Cuenta</option>
-                <option value="other">Ayuda</option>
+                <option value="song">Canciones</option>
                 <option value="chat">Chat / pedido</option>
               </select>
             </label>
@@ -205,7 +212,7 @@
           <label>Categoria<select name="category_id" class="js-category-select"></select></label>
           <label>Nueva categoria<input name="new_category" placeholder="Crear si no existe"></label>
           <label>Producto<input name="item_name" placeholder="Hamburguesa artesanal"></label>
-          <label>Precio<input name="price" type="number" min="0" step="100" placeholder="25000"></label>
+          <label>Precio<input name="price" type="text" inputmode="numeric" autocomplete="off" value="$0" placeholder="$25.000" data-currency-input></label>
           <label>Imagen URL<input name="image_url" placeholder="https://..."></label>
           <label>Orden<input name="sort_order" type="number" value="0"></label>
           <label class="wide">Descripcion<textarea name="description" rows="3" placeholder="Ingredientes, tamano, notas"></textarea></label>
@@ -215,6 +222,147 @@
         <div class="manager-list" id="itemList"></div>
       </section>
       -->
+
+      <section class="inventory-section" id="inventory" data-admin-section="inventory" data-admin-only>
+        <div class="section-head inventory-heading">
+          <div>
+            <span class="eyebrow">Control inteligente</span>
+            <h2>Inventario y rentabilidad</h2>
+            <p>Consulta existencias, costos, utilidad estimada y alertas de reposicion en un solo lugar.</p>
+          </div>
+          <div class="inventory-heading-actions">
+            <span class="inventory-sync-status is-local" id="inventorySyncStatus"><i data-lucide="hard-drive"></i> Respaldo local</span>
+            <button class="primary" id="newInventoryProduct" type="button"><i data-lucide="package-plus"></i> Nuevo producto</button>
+          </div>
+        </div>
+
+        <div class="apps-script-setup inventory-history-sync">
+          <div>
+            <strong><i data-lucide="cloud-cog"></i> Historial y respaldo</strong>
+            <p>Si se corta internet, las ventas y ajustes pendientes quedan guardados temporalmente en esta caja y se envían al volver la conexión.</p>
+          </div>
+          <button class="ghost" id="syncAppsScriptInventory" type="button"><i data-lucide="refresh-cw"></i> Sincronizar ahora</button>
+        </div>
+
+        <div class="inventory-metrics" id="inventoryMetrics"></div>
+
+        <div class="inventory-workbench">
+          <article class="panel inventory-editor">
+            <div class="section-head">
+              <div>
+                <span class="eyebrow">Ficha de producto</span>
+                <h2 id="inventoryFormTitle">Agregar producto</h2>
+              </div>
+              <span class="tool-chip"><i data-lucide="calculator"></i> Calculo automatico</span>
+            </div>
+            <form class="inventory-form" id="inventoryForm">
+              <input type="hidden" name="product_id">
+              <label class="wide">Producto<input name="product_name" type="text" maxlength="100" placeholder="Ej. Cerveza Nacional" required></label>
+              <label>Siglas<input name="product_code" type="text" maxlength="12" placeholder="Se generan: CN"></label>
+              <label>Categoria
+                <select name="category_id" class="js-category-select"><option value="">Sin categoria</option></select>
+              </label>
+              <label class="wide">Nueva categoria<input name="new_category" type="text" maxlength="60" placeholder="Solo si no aparece en la lista"></label>
+              <label>Costo unitario<input name="cost_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+              <label>Precio de venta<input name="sale_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input required></label>
+              <label>Existencia actual<input name="stock" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
+              <label>Stock minimo<input name="min_stock" type="number" min="0" step="0.01" value="5" inputmode="decimal"></label>
+              <label>Unidad
+                <select name="unit">
+                  <option value="unidad">Unidad</option>
+                  <option value="botella">Botella</option>
+                  <option value="lata">Lata</option>
+                  <option value="paquete">Paquete</option>
+                  <option value="porción">Porcion</option>
+                </select>
+              </label>
+              <label class="check"><input name="is_available" type="checkbox" checked> Disponible para vender</label>
+              <div class="inventory-live-calculation wide" id="inventoryLiveCalculation" aria-live="polite"></div>
+              <div class="inventory-form-actions wide">
+                <button class="ghost" id="cancelInventoryEdit" type="button">Limpiar</button>
+                <button class="primary" type="submit"><i data-lucide="save"></i> Guardar producto</button>
+              </div>
+            </form>
+          </article>
+
+          <article class="panel inventory-catalog">
+            <div class="inventory-toolbar">
+              <label class="inventory-search">
+                <span>Buscar producto o siglas</span>
+                <span class="inventory-search-control"><i data-lucide="search"></i><input id="inventorySearch" type="search" autocomplete="off" placeholder="Ej. cerveza o CN"></span>
+              </label>
+              <label>Estado
+                <select id="inventoryStatusFilter">
+                  <option value="all">Todos</option>
+                  <option value="ok">Existencia normal</option>
+                  <option value="low">Stock bajo</option>
+                  <option value="out">Agotados</option>
+                </select>
+              </label>
+            </div>
+            <div class="inventory-list" id="inventoryList"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="income-section" id="income" data-admin-section="income" data-admin-only>
+        <div class="section-head income-heading">
+          <div>
+            <span class="eyebrow">Contabilidad inteligente</span>
+            <h2>Ingresos y ventas cerradas</h2>
+            <p>Analiza lo facturado, la utilidad estimada y la distribución por medios de pago.</p>
+          </div>
+          <div class="income-heading-actions">
+            <button class="ghost" id="exportIncomeCsv" type="button"><i data-lucide="file-down"></i> Exportar</button>
+            <button class="primary" id="refreshIncomeReport" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
+          </div>
+        </div>
+
+        <div class="panel income-filter-panel">
+          <div class="income-range-presets" aria-label="Rangos rápidos">
+            <button type="button" data-income-range="today">Hoy</button>
+            <button type="button" data-income-range="yesterday">Ayer</button>
+            <button type="button" data-income-range="7days">7 días</button>
+            <button type="button" data-income-range="15days">15 días</button>
+            <button type="button" data-income-range="month">Este mes</button>
+            <button type="button" data-income-range="30days">30 días</button>
+            <button type="button" data-income-range="year">Este año</button>
+          </div>
+          <form class="income-filter-form" id="incomeFilterForm">
+            <label class="income-search">Buscar factura, mesa, producto o responsable
+              <span><i data-lucide="search"></i><input id="incomeSearch" name="query" type="search" autocomplete="off" placeholder="Ej. TN-2026, Mesa 4, cerveza..."></span>
+            </label>
+            <label>Medio de pago
+              <select id="incomePaymentMethod" name="payment_method">
+                <option value="all">Todos los medios</option>
+                <option value="cash">Efectivo</option>
+                <option value="transfer">Transferencia</option>
+                <option value="breb">Bre-B</option>
+                <option value="mixed">Pagos mixtos</option>
+              </select>
+            </label>
+            <label>Desde<input id="incomeDateFrom" name="date_from" type="date" required></label>
+            <label>Hasta<input id="incomeDateTo" name="date_to" type="date" required></label>
+            <button class="primary" type="submit"><i data-lucide="sliders-horizontal"></i> Aplicar filtros</button>
+          </form>
+          <div class="income-filter-summary" id="incomeFilterSummary" aria-live="polite"></div>
+        </div>
+
+        <div class="income-kpis" id="incomeKpis"></div>
+
+        <div class="income-payment-grid" id="incomePaymentBreakdown"></div>
+
+        <div class="panel income-ledger-panel">
+          <div class="section-head income-results-head">
+            <div>
+              <span class="eyebrow">Movimientos facturados</span>
+              <h2>Detalle de ingresos</h2>
+            </div>
+            <span class="income-report-status" id="incomeReportStatus"><i data-lucide="loader-circle"></i> Preparando informe</span>
+          </div>
+          <div class="income-records" id="incomeRecords"></div>
+        </div>
+      </section>
 
       <section class="panel" id="accounts" data-admin-section="accounts">
         <div class="section-head">
@@ -280,14 +428,30 @@
             <i data-lucide="x"></i>
           </button>
         </div>
-        <label>Producto<select name="menu_item_id" id="consumptionItem"></select></label>
-        <label>Nombre<input name="item_name" type="text" placeholder="Producto personalizado"></label>
-        <label>Quien paga<input name="payer_name" type="text" placeholder="Nombre del responsable de la cuenta"></label>
-        <div class="modal-grid">
-          <label>Cantidad<input name="quantity" type="number" min="1" value="1"></label>
-          <label>Precio<input name="unit_price" type="number" min="0" step="100" value="0"></label>
+        <div class="product-picker-field">
+          <label for="consumptionProductSearch">Producto</label>
+          <div class="product-combobox" id="consumptionProductCombobox">
+            <span class="product-search-control">
+              <i data-lucide="search"></i>
+              <input id="consumptionProductSearch" type="search" autocomplete="off" placeholder="Buscar por nombre o siglas (CN)" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="consumptionProductOptions">
+            </span>
+            <input name="menu_item_id" id="consumptionItem" type="hidden">
+            <div class="product-combobox-options" id="consumptionProductOptions" role="listbox" hidden></div>
+          </div>
+          <small id="consumptionProductHint">Selecciona un producto del inventario o escribe un consumo personalizado.</small>
         </div>
-        <label>Nota<textarea name="notes" rows="2" placeholder="Sin cebolla, termino medio, etc."></textarea></label>
+        <label class="consumption-quantity">Cantidad
+          <input name="quantity" type="number" min="1" max="100" step="1" value="" inputmode="numeric" autocomplete="off" placeholder="Escribe la cantidad y presiona Enter" required>
+        </label>
+        <details class="consumption-optional" id="consumptionOptionalFields">
+          <summary><i data-lucide="sliders-horizontal"></i> Datos opcionales</summary>
+          <div class="consumption-optional-grid">
+            <label>Nombre personalizado<input name="item_name" type="text" placeholder="Solo si no eliges un producto"></label>
+            <label>Quién paga<input name="payer_name" type="text" placeholder="Responsable de la cuenta"></label>
+            <label>Precio manual<input name="unit_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+            <label class="wide">Nota<textarea name="notes" rows="2" placeholder="Observaciones opcionales"></textarea></label>
+          </div>
+        </details>
         <div class="modal-actions">
           <button class="ghost" type="button" data-close-dialog>Cancelar</button>
           <button class="primary" type="submit"><i data-lucide="plus"></i> Agregar</button>
@@ -295,9 +459,87 @@
       </form>
     </dialog>
 
+    <dialog class="modal" id="stockWarningDialog">
+      <form class="modal-card stock-warning-card" method="dialog">
+        <div class="stock-warning-icon"><i data-lucide="triangle-alert"></i></div>
+        <div>
+          <span class="eyebrow">Control de inventario</span>
+          <h2 id="stockWarningTitle">Stock bajo</h2>
+          <p id="stockWarningMessage"></p>
+        </div>
+        <div class="stock-warning-values">
+          <span><small>Existencia actual</small><strong id="stockWarningCurrent">0</strong></span>
+          <span><small>Este consumo descuenta</small><strong id="stockWarningRequested">0</strong></span>
+          <span><small>Existencia restante</small><strong id="stockWarningRemaining">0</strong></span>
+        </div>
+        <div class="modal-actions">
+          <button class="ghost" id="stockWarningCancel" value="cancel">Cancelar</button>
+          <button class="primary" id="stockWarningConfirm" value="confirm">Agregar de todas formas</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal payment-modal" id="paymentDialog">
+      <form class="modal-card payment-card" id="paymentForm">
+        <input type="hidden" name="session_id">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Caja y facturacion</span>
+            <h2>Cobrar mesa</h2>
+          </div>
+          <button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button>
+        </div>
+
+        <div class="payment-summary">
+          <span id="paymentTableLabel">Mesa</span>
+          <strong id="paymentTotal">$0</strong>
+          <small>El total se valida antes de cerrar la cuenta.</small>
+        </div>
+
+        <fieldset class="payment-methods">
+          <legend>Forma de pago</legend>
+          <label><input type="radio" name="payment_method" value="cash" checked><span><i data-lucide="banknote"></i>Efectivo</span></label>
+          <label><input type="radio" name="payment_method" value="transfer"><span><i data-lucide="landmark"></i>Transferencia</span></label>
+          <label><input type="radio" name="payment_method" value="breb"><span><i data-lucide="scan-line"></i>Bre-B</span></label>
+          <label><input type="radio" name="payment_method" value="mixed"><span><i data-lucide="split"></i>Mixto</span></label>
+        </fieldset>
+
+        <div class="mixed-payment" id="mixedPaymentFields" hidden>
+          <div class="mixed-payment-head">
+            <strong>Distribuir el pago</strong>
+            <span>Al escribir un valor, el otro se calcula automaticamente.</span>
+          </div>
+          <label>Primer medio
+            <select name="mixed_method_one">
+              <option value="cash">Efectivo</option>
+              <option value="transfer">Transferencia</option>
+              <option value="breb">Bre-B</option>
+            </select>
+          </label>
+          <label>Valor<input name="mixed_amount_one" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+          <label>Segundo medio
+            <select name="mixed_method_two">
+              <option value="transfer">Transferencia</option>
+              <option value="breb">Bre-B</option>
+              <option value="cash">Efectivo</option>
+            </select>
+          </label>
+          <label>Valor<input name="mixed_amount_two" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+          <div class="payment-balance wide" id="paymentBalance"></div>
+        </div>
+
+        <label>Referencia o nota (opcional)<input name="payment_reference" type="text" maxlength="100" placeholder="Ultimos 4 digitos, comprobante, observacion..."></label>
+        <div class="modal-actions payment-actions">
+          <button class="ghost" type="button" data-close-dialog>Cancelar</button>
+          <button class="ghost" type="submit" name="receipt_action" value="save"><i data-lucide="badge-check"></i> Cobrar sin imprimir</button>
+          <button class="primary" type="submit" name="receipt_action" value="print"><i data-lucide="printer"></i> Cobrar e imprimir</button>
+        </div>
+      </form>
+    </dialog>
+
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260822-2"></script>
+    <script src="app.js?v=20260831-song-13"></script>
   </body>
 </html>
