@@ -3981,6 +3981,8 @@ button:disabled {
   text-align: center;
 }
 .request-btn.is-active { color: #fff; background: #3f246f; border-color: #3f246f; }
+#songModeToggle.is-active { color: var(--text); }
+#songModeToggle.is-active svg { color: var(--text); }
 
 .admin-ai-layout { display: grid; gap: .75rem; }
 .admin-ai-suggestions { display: flex; flex-wrap: wrap; gap: .45rem; }
