@@ -304,13 +304,14 @@ const App = (() => {
     assistantThreads: { bar: [], song: [] },
     assistantMode: "bar",
     chatMessages: [],
-    adminChatSessionId: "",
-    adminChatRequestIds: [],
-    adminChatClosing: false,
-    adminChatChannel: null,
+    adminChats: new Map(),
+    adminChatTypingTimers: new Map(),
     adminBroadcastChannel: null,
     adminChatActive: false,
     adminChatNotice: "",
+    clientChatInitialized: false,
+    clientChatSoundSessionId: "",
+    clientStaffMessageSoundIds: new Set(),
     chatPollTimer: null,
     chatTypingTimer: null,
     peerTyping: false,
@@ -1192,6 +1193,17 @@ const App = (() => {
     try {
       await audio.play();
       localStorage.setItem(`receipt_sound_${requestId}`, "1");
+    } catch (error) {
+      // Browsers can block audio until the client interacts with the page.
+    }
+  };
+
+  const playClientChatReceipt = async (messageId) => {
+    if (!messageId) return;
+    const audio = new Audio(RECEIPT_SOUND);
+    audio.volume = 1;
+    try {
+      await audio.play();
     } catch (error) {
       // Browsers can block audio until the client interacts with the page.
     }
@@ -2081,10 +2093,19 @@ const App = (() => {
     return request;
   };
 
-  const mergeChatMessages = (messages = []) => {
-    const merged = new Map(state.chatMessages.map((message) => [message.id, message]));
+  const mergeChatMessageList = (current = [], messages = []) => {
+    const merged = new Map(current.map((message) => [message.id, message]));
     messages.forEach((message) => message?.id && merged.set(message.id, message));
-    state.chatMessages = Array.from(merged.values()).sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))).slice(-300);
+    return Array.from(merged.values()).sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))).slice(-300);
+  };
+
+  const mergeChatMessages = (messages = [], sessionId = state.currentSession?.id) => {
+    if (state.page === "admin") {
+      const chat = state.adminChats.get(String(sessionId || ""));
+      if (chat) chat.messages = mergeChatMessageList(chat.messages, messages);
+      return;
+    }
+    state.chatMessages = mergeChatMessageList(state.chatMessages, messages);
   };
 
   const chatRpcPayload = (sessionId = state.currentSession?.id, table = state.currentTable) => ({
@@ -2099,17 +2120,36 @@ const App = (() => {
     const result = await dbQuiet(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)), null);
     const messages = Array.isArray(result) ? result : result?.messages;
     if (!Array.isArray(messages)) return false;
-    state.chatMessages = messages.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+    const sortedMessages = messages.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
     if (state.page === "client") {
+      const currentSessionId = String(sessionId);
+      if (state.clientChatSoundSessionId !== currentSessionId) {
+        state.clientChatSoundSessionId = currentSessionId;
+        state.clientChatInitialized = false;
+        state.clientStaffMessageSoundIds.clear();
+      }
+      const newStaffMessages = sortedMessages.filter((message) => message.sender_type === "staff" && !state.clientStaffMessageSoundIds.has(message.id));
+      sortedMessages.filter((message) => message.sender_type === "staff").forEach((message) => state.clientStaffMessageSoundIds.add(message.id));
+      if (state.clientChatInitialized) {
+        newStaffMessages.forEach((message, index) => {
+          window.setTimeout(() => void playClientChatReceipt(message.id), index * 300);
+        });
+      }
+      state.clientChatInitialized = true;
+      state.chatMessages = sortedMessages;
       const joinMessage = state.chatMessages.find((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
       if (joinMessage) {
         state.adminChatActive = true;
         state.adminChatNotice = joinMessage.body;
         state.assistantThreads.bar = (state.assistantThreads.bar || []).filter((message) => message.role !== "bot");
       }
+      renderAssistant();
+    } else {
+      const chat = state.adminChats.get(String(sessionId));
+      if (!chat) return false;
+      chat.messages = sortedMessages;
+      renderAdminChat(sessionId);
     }
-    if (state.page === "client") renderAssistant();
-    else renderAdminChat();
     return true;
   };
 
@@ -2125,52 +2165,86 @@ const App = (() => {
     const result = await retryQuiet(() => state.sb.rpc("sendChatMessage", payload), 3);
     const message = result?.message || result;
     if (message?.id) {
-      mergeChatMessages([message]);
+      mergeChatMessages([message], sessionId);
       if (state.page === "client") renderAssistant();
-      else renderAdminChat();
+      else renderAdminChat(sessionId);
       return message;
     }
     return null;
   };
 
-  const setPeerTyping = (typing, role) => {
-    state.peerTyping = Boolean(typing);
-    const target = state.page === "client" ? $("#clientChatTyping") : $("#adminChatTyping");
+  const setPeerTyping = (typing, role, sessionId = "") => {
+    const active = Boolean(typing);
+    if (state.page === "client") state.peerTyping = active;
+    const chat = state.page === "admin" ? state.adminChats.get(String(sessionId)) : null;
+    if (chat) chat.peerTyping = active;
+    const target = state.page === "client" ? $("#clientChatTyping") : chat?.element?.querySelector("[data-admin-chat-typing]");
     if (target) {
-      target.hidden = !state.peerTyping;
+      target.hidden = !active;
       const label = target.querySelector("span");
       if (label) label.textContent = role === "staff" ? "El administrador esta escribiendo" : "El cliente esta escribiendo";
     }
   };
 
-  const broadcastChatEvent = (event, payload = {}) => {
-    const channel = state.page === "client" ? state.clientChannel : state.adminChatChannel;
-    channel?.send?.({ type: "broadcast", event, payload: { sessionId: state.page === "client" ? state.currentSession?.id : state.adminChatSessionId, ...payload } });
+  const broadcastChatEvent = (event, payload = {}, sessionId = state.currentSession?.id) => {
+    const targetSessionId = String(sessionId || "");
+    const channel = state.page === "client" ? state.clientChannel : state.adminChats.get(targetSessionId)?.channel;
+    return channel?.send?.({ type: "broadcast", event, payload: { sessionId: targetSessionId, ...payload } });
   };
 
-  const broadcastTyping = (role) => {
-    broadcastChatEvent("typing", { role, typing: true });
+  const broadcastTyping = (role, sessionId = state.currentSession?.id) => {
+    const targetSessionId = String(sessionId || "");
+    broadcastChatEvent("typing", { role, typing: true }, targetSessionId);
+    if (state.page === "admin") {
+      window.clearTimeout(state.adminChatTypingTimers.get(targetSessionId));
+      state.adminChatTypingTimers.set(targetSessionId, window.setTimeout(() => {
+        broadcastChatEvent("typing", { role, typing: false }, targetSessionId);
+        state.adminChatTypingTimers.delete(targetSessionId);
+      }, 900));
+      return;
+    }
     window.clearTimeout(state.chatTypingTimer);
-    state.chatTypingTimer = window.setTimeout(() => broadcastChatEvent("typing", { role, typing: false }), 900);
+    state.chatTypingTimer = window.setTimeout(() => broadcastChatEvent("typing", { role, typing: false }, targetSessionId), 900);
   };
 
-  const renderAdminChat = () => {
-    const target = $("#adminChatMessages");
-    if (!target) return;
-    target.innerHTML = state.chatMessages.length ? state.chatMessages.map((message) => `<div class="live-chat-message ${escapeHTML(message.sender_type || "system")}"><span>${escapeHTML(message.sender_name || (message.sender_type === "staff" ? "Equipo" : message.sender_type === "client" ? "Cliente" : "Sistema"))}</span><p>${escapeHTML(message.body || "")}</p><small>${escapeHTML(prettyDateTime(message.created_at))}</small></div>`).join("") : emptyState("Conversacion nueva", "Los mensajes apareceran aqui en tiempo real.", "messages-square");
+  const renderAdminChat = (sessionId) => {
+    const chat = state.adminChats.get(String(sessionId || ""));
+    const target = chat?.element?.querySelector("[data-admin-chat-messages]");
+    if (!chat || !target) return;
+    target.innerHTML = chat.messages.length ? chat.messages.map((message) => `<div class="live-chat-message ${escapeHTML(message.sender_type || "system")}"><span>${escapeHTML(message.sender_name || (message.sender_type === "staff" ? "Equipo" : message.sender_type === "client" ? "Cliente" : "Sistema"))}</span><p>${escapeHTML(message.body || "")}</p><small>${escapeHTML(prettyDateTime(message.created_at))}</small></div>`).join("") : emptyState("Conversacion nueva", "Los mensajes apareceran aqui en tiempo real.", "messages-square");
+    const dot = chat.element.querySelector("[data-admin-chat-online-dot]");
+    const presence = chat.element.querySelector("[data-admin-chat-presence]");
+    dot?.classList.toggle("is-online", Boolean(chat.connected));
+    if (presence) presence.textContent = chat.connected ? "Conectado" : "Conectando...";
     target.scrollTop = target.scrollHeight;
     refreshIcons();
   };
 
-  const subscribeAdminChat = (tableId, joinNotice) => {
-    if (state.adminChatChannel) state.sb.removeChannel(state.adminChatChannel);
-    state.adminChatChannel = state.sb.channel(`table:${tableId}`, { config: { broadcast: { self: false }, private: false } })
+  const createAdminChatWindow = (chat) => {
+    const dock = $("#adminChatDock");
+    if (!dock) return null;
+    const windowElement = document.createElement("article");
+    windowElement.className = "admin-chat-window";
+    windowElement.dataset.adminChatWindow = chat.sessionId;
+    windowElement.innerHTML = `<header class="admin-chat-window-head"><div><span class="eyebrow">Conversacion en vivo</span><h2><span class="admin-chat-online-dot" data-admin-chat-online-dot aria-hidden="true"></span>${escapeHTML(tableLabel(chat.table))}</h2><small data-admin-chat-presence>Conectando...</small></div><button class="icon-btn" type="button" data-finish-admin-chat="${escapeHTML(chat.sessionId)}" aria-label="Finalizar y borrar chat"><i data-lucide="x"></i></button></header><div class="live-chat-thread" data-admin-chat-messages></div><div class="typing-indicator" data-admin-chat-typing hidden><i></i><i></i><i></i><span>El cliente esta escribiendo</span></div><form class="admin-chat-form" data-admin-chat-form="${escapeHTML(chat.sessionId)}"><div class="admin-chat-composer"><input name="message" type="text" maxlength="600" autocomplete="off" placeholder="Escribe una respuesta..." required><button class="primary" type="submit" aria-label="Enviar"><i data-lucide="send"></i></button></div></form><button class="ghost danger-text admin-chat-finish" type="button" data-finish-admin-chat="${escapeHTML(chat.sessionId)}"><i data-lucide="log-out"></i> Finalizar y borrar chat</button>`;
+    dock.prepend(windowElement);
+    chat.element = windowElement;
+    refreshIcons();
+    return windowElement;
+  };
+
+  const subscribeAdminChat = (chat, joinNotice) => {
+    chat.channel = state.sb.channel(`table:${chat.tableId}`, { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "typing" }, ({ payload }) => {
-        if (String(payload?.sessionId) === String(state.adminChatSessionId) && payload?.role === "client") setPeerTyping(payload.typing, "client");
+        if (String(payload?.sessionId) === chat.sessionId && payload?.role === "client") setPeerTyping(payload.typing, "client", chat.sessionId);
       })
-      .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages(state.adminChatSessionId, state.tables.find((entry) => String(entry.id) === String(tableId))))
+      .on("broadcast", { event: "chat-refresh" }, ({ payload }) => {
+        if (!payload?.sessionId || String(payload.sessionId) === chat.sessionId) void loadChatMessages(chat.sessionId, chat.table);
+      })
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice });
+        chat.connected = status === "SUBSCRIBED";
+        renderAdminChat(chat.sessionId);
+        if (chat.connected) broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice }, chat.sessionId);
       });
   };
 
@@ -2182,46 +2256,62 @@ const App = (() => {
       return;
     }
     const table = state.tables.find((entry) => String(entry.id) === String(request.table_id));
-    state.adminChatSessionId = request.session_id;
-    state.adminChatRequestIds = ids;
-    state.chatMessages = [];
-    $("#adminChatTitle").textContent = `Chat · ${tableLabel(table)}`;
-    $("#adminChatPresence").textContent = "Administrador conectado";
-    $("#adminChatDialog")?.showModal();
-    renderAdminChat();
+    const sessionId = String(request.session_id);
+    let chat = state.adminChats.get(sessionId);
+    if (chat) {
+      ids.forEach((id) => chat.requestIds.add(id));
+      chat.element?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+      chat.element?.querySelector('input[name="message"]')?.focus();
+      await loadChatMessages(sessionId, chat.table);
+      acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
+      return;
+    }
+    chat = { sessionId, tableId: request.table_id, table, requestIds: new Set(ids), messages: [], channel: null, element: null, connected: false, peerTyping: false, closing: false };
+    state.adminChats.set(sessionId, chat);
+    createAdminChatWindow(chat);
+    renderAdminChat(sessionId);
     const joinNotice = "El administrador se unió al chat.";
-    subscribeAdminChat(request.table_id, joinNotice);
-    await loadChatMessages(request.session_id, table);
-    const joinAlreadyRegistered = state.chatMessages.some((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
+    subscribeAdminChat(chat, joinNotice);
+    await loadChatMessages(sessionId, table);
+    const joinAlreadyRegistered = chat.messages.some((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
     if (!joinAlreadyRegistered) void persistChatMessage("system", joinNotice, { sessionId: request.session_id, table });
+    chat.element?.querySelector('input[name="message"]')?.focus();
     acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
   };
 
-  const finishAdminChat = async () => {
-    if (!state.adminChatSessionId || state.adminChatClosing) return;
-    const sessionId = state.adminChatSessionId;
-    const dialog = $("#adminChatDialog");
-    const closeButtons = [$("#closeAdminChat"), $("#finishAdminChat")].filter(Boolean);
-    state.adminChatClosing = true;
+  const finishAdminChat = async (sessionId) => {
+    const targetSessionId = String(sessionId || "");
+    const chat = state.adminChats.get(targetSessionId);
+    if (!chat || chat.closing) return;
+    const closeButtons = Array.from(chat.element?.querySelectorAll("[data-finish-admin-chat]") || []);
+    chat.closing = true;
     closeButtons.forEach((button) => { button.disabled = true; });
     try {
-      const result = await retryQuiet(() => state.sb.rpc("closeChatSession", { p_session_id: sessionId, p_auth_token: state.authToken }), 3);
+      const result = await retryQuiet(() => state.sb.rpc("closeChatSession", { p_session_id: targetSessionId, p_auth_token: state.authToken }), 3);
       if (!result) {
-        toast("No se pudo finalizar el chat. Intenta nuevamente.", "error", `chat-close:${sessionId}`);
+        toast("No se pudo finalizar el chat. Intenta nuevamente.", "error", `chat-close:${targetSessionId}`);
         return;
       }
-      const requestIds = [...state.adminChatRequestIds];
-      broadcastChatEvent("chat-closed", {});
+      const relatedIds = state.requests
+        .filter((request) => String(request.session_id || "") === targetSessionId && requestKind(request) === "chat")
+        .map((request) => request.id);
+      const requestIds = Array.from(new Set([...chat.requestIds, ...relatedIds]));
+      await broadcastChatEvent("chat-closed", {}, targetSessionId);
       state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
-      state.chatMessages = [];
-      state.adminChatSessionId = "";
-      state.adminChatRequestIds = [];
-      dialog?.close();
-      toast("Chat finalizado y mensajes eliminados.", "ok", `chat-finished:${sessionId}`);
-      void dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).in("id", requestIds), null)
-        .then(() => refreshAdminNow());
+      if (chat.channel) state.sb.removeChannel(chat.channel);
+      window.clearTimeout(state.adminChatTypingTimers.get(targetSessionId));
+      state.adminChatTypingTimers.delete(targetSessionId);
+      chat.element?.remove();
+      state.adminChats.delete(targetSessionId);
+      toast("Chat finalizado y mensajes eliminados.", "ok", `chat-finished:${targetSessionId}`);
+      if (requestIds.length) {
+        void dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).in("id", requestIds), null)
+          .then(() => refreshAdminNow());
+      } else {
+        void refreshAdminNow();
+      }
     } finally {
-      state.adminChatClosing = false;
+      chat.closing = false;
       closeButtons.forEach((button) => { button.disabled = false; });
     }
   };
@@ -2515,6 +2605,12 @@ const App = (() => {
 
   const subscribeClient = () => {
     if (!state.currentSession) return;
+    const sessionId = String(state.currentSession.id);
+    if (state.clientChatSoundSessionId !== sessionId) {
+      state.clientChatSoundSessionId = sessionId;
+      state.clientChatInitialized = false;
+      state.clientStaffMessageSoundIds.clear();
+    }
     clearInterval(state.clientPollTimer);
     if (state.clientChannel) state.sb.removeChannel(state.clientChannel);
     const refresh = async () => {
@@ -2548,6 +2644,8 @@ const App = (() => {
       })
       .on("broadcast", { event: "chat-closed" }, () => {
         state.chatMessages = [];
+        state.clientChatInitialized = false;
+        state.clientStaffMessageSoundIds.clear();
         state.assistantThreads.bar = [];
         state.adminChatActive = false;
         state.adminChatNotice = "";
@@ -2647,6 +2745,13 @@ const App = (() => {
   };
 
   const activeRequests = () => state.requests.filter((request) => request.status === "pending");
+
+  const hasOpenAdminChatForRequest = (request) => {
+    if (requestKind(request) !== "chat") return false;
+    const sessionId = String(request.session_id || "");
+    if (sessionId && state.adminChats.has(sessionId)) return true;
+    return Array.from(state.adminChats.values()).some((chat) => String(chat.tableId) === String(request.table_id));
+  };
 
   const requestSignature = () => activeRequests().map((request) => request.id).join("|");
 
@@ -2768,7 +2873,8 @@ const App = (() => {
         const batch = state.alertAnnouncementQueue.splice(0).filter((request) => activeIds.has(request.id));
         if (!batch.length) continue;
         await playAlarmToneOnce();
-        if (state.soundEnabled) await speakAlertRequests(batch);
+        const voiceBatch = batch.filter((request) => !hasOpenAdminChatForRequest(request));
+        if (state.soundEnabled && voiceBatch.length) await speakAlertRequests(voiceBatch);
       }
     } finally {
       state.alertAnnouncementBusy = false;
@@ -5761,24 +5867,23 @@ const App = (() => {
       event.preventDefault();
       await saveUser(event.currentTarget);
     });
-    $("#adminChatForm")?.addEventListener("submit", async (event) => {
+    $("#adminChatDock")?.addEventListener("submit", async (event) => {
+      const form = event.target.closest("[data-admin-chat-form]");
+      if (!form) return;
       event.preventDefault();
-      const input = event.currentTarget.message;
+      const sessionId = String(form.dataset.adminChatForm || "");
+      const chat = state.adminChats.get(sessionId);
+      const input = form.elements.message;
       const body = input.value.trim();
-      if (!body || !state.adminChatSessionId) return;
+      if (!body || !chat) return;
       input.value = "";
-      const request = state.requests.find((entry) => state.adminChatRequestIds.includes(entry.id));
-      const table = state.tables.find((entry) => String(entry.id) === String(request?.table_id));
-      const saved = await persistChatMessage("staff", body, { sessionId: state.adminChatSessionId, table });
-      if (saved) broadcastChatEvent("chat-refresh");
-      else toast("No se pudo enviar el mensaje. Intenta nuevamente.", "error", "chat-message-failed");
+      const saved = await persistChatMessage("staff", body, { sessionId, table: chat.table });
+      if (saved) broadcastChatEvent("chat-refresh", {}, sessionId);
+      else toast("No se pudo enviar el mensaje. Intenta nuevamente.", "error", `chat-message-failed:${sessionId}`);
     });
-    $("#adminChatDialog")?.addEventListener("cancel", (event) => {
-      event.preventDefault();
-      void finishAdminChat();
-    });
-    $("#adminChatForm")?.elements.message?.addEventListener("input", () => {
-      if (state.adminChatSessionId) broadcastTyping("staff");
+    $("#adminChatDock")?.addEventListener("input", (event) => {
+      const form = event.target.closest("[data-admin-chat-form]");
+      if (form && event.target.name === "message") broadcastTyping("staff", form.dataset.adminChatForm);
     });
     $("#adminAiForm")?.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -5909,8 +6014,7 @@ const App = (() => {
         $("#inventoryDialog")?.close();
       }
       if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
-      if (target.id === "closeAdminChat") await finishAdminChat();
-      if (target.id === "finishAdminChat") await finishAdminChat();
+      if (target.dataset.finishAdminChat) await finishAdminChat(target.dataset.finishAdminChat);
       if (target.id === "newWalkInSale") await createWalkInSale();
       if (target.id === "paymentAddItem") {
         const sessionId = $("#paymentForm")?.session_id?.value || "";

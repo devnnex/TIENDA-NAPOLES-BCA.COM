@@ -3948,6 +3948,42 @@ button:disabled {
 
 .admin-chat-modal { width: min(620px, calc(100vw - 1.5rem)); }
 .admin-chat-card { width: 100%; max-width: none; }
+.admin-chat-dock {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 1200;
+  max-width: calc(100vw - 2rem);
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: end;
+  gap: .75rem;
+  overflow-x: auto;
+  padding: .25rem;
+  pointer-events: none;
+  scrollbar-width: thin;
+}
+.admin-chat-window {
+  width: min(380px, calc(100vw - 2.5rem));
+  flex: 0 0 min(380px, calc(100vw - 2.5rem));
+  display: grid;
+  gap: .6rem;
+  padding: .85rem;
+  border: 1px solid rgba(18, 24, 31, .12);
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 22px 55px rgba(18, 24, 31, .24);
+  pointer-events: auto;
+}
+.admin-chat-window-head { display: flex; align-items: flex-start; justify-content: space-between; gap: .7rem; }
+.admin-chat-window-head > div { min-width: 0; }
+.admin-chat-window-head h2 { display: flex; align-items: center; gap: .45rem; margin: .12rem 0; font-size: 1.05rem; }
+.admin-chat-window-head small { color: #07844c; font-size: .68rem; font-weight: 800; }
+.admin-chat-online-dot { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 50%; background: #98a2b3; }
+.admin-chat-online-dot.is-online { background: #39ff88; box-shadow: 0 0 0 4px rgba(57, 255, 136, .16), 0 0 12px rgba(57, 255, 136, .9); animation: liveDot 1.2s ease-in-out infinite; }
+.admin-chat-window .live-chat-thread { min-height: 210px; height: 34vh; max-height: 330px; }
+.admin-chat-form { display: block; }
+.admin-chat-finish { width: 100%; justify-content: center; }
 .live-chat-thread,
 .admin-ai-chat { min-height: 280px; max-height: 55vh; display: grid; align-content: start; gap: .65rem; overflow-y: auto; padding: .8rem; border: 1px solid rgba(18, 24, 31, .08); border-radius: 16px; background: #f5f7fa; }
 .live-chat-message { max-width: 82%; display: grid; gap: .18rem; justify-self: start; padding: .7rem .8rem; color: #253042; background: #fff; border-radius: 5px 15px 15px; box-shadow: 0 6px 16px rgba(18, 24, 31, .06); }
@@ -4011,6 +4047,9 @@ button:disabled {
 }
 
 @media (max-width: 620px) {
+  .admin-chat-dock { right: .5rem; bottom: .5rem; max-width: calc(100vw - 1rem); }
+  .admin-chat-window { width: calc(100vw - 1.5rem); flex-basis: calc(100vw - 1.5rem); }
+  .admin-chat-window .live-chat-thread { height: 38vh; }
   .tables-grid.compact-tables-grid,
   .compact-tables-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .compact-table-tile { min-height: 74px; padding: .55rem; }

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Admin - Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="style.css?v=20260903-chat-1">
+    <link rel="stylesheet" href="style.css?v=20260903-multichat-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -583,14 +583,7 @@
       <form class="modal-card confirm-card" method="dialog"><span class="confirm-icon"><i data-lucide="volume-x"></i></span><div><span class="eyebrow">Alarma del equipo</span><h2>¿Desactivar la alarma?</h2><p>Dejaras de oir los llamados y avisos por voz hasta volver a activarla.</p></div><div class="modal-actions"><button class="ghost" type="submit" value="cancel">Mantener activa</button><button class="danger-button" type="submit" value="confirm">Si, desactivar</button></div></form>
     </dialog>
 
-    <dialog class="modal admin-chat-modal" id="adminChatDialog">
-      <form class="modal-card admin-chat-card" id="adminChatForm">
-        <div class="section-head"><div><span class="eyebrow">Conversacion en vivo</span><h2 id="adminChatTitle">Chat con cliente</h2><small id="adminChatPresence">Conectando...</small></div><button class="icon-btn" id="closeAdminChat" type="button" aria-label="Finalizar y borrar chat"><i data-lucide="x"></i></button></div>
-        <div class="live-chat-thread" id="adminChatMessages"></div><div class="typing-indicator" id="adminChatTyping" hidden><i></i><i></i><i></i><span>El cliente esta escribiendo</span></div>
-        <div class="admin-chat-composer"><input name="message" type="text" maxlength="600" autocomplete="off" placeholder="Escribe una respuesta..." required><button class="primary" type="submit" aria-label="Enviar"><i data-lucide="send"></i></button></div>
-        <button class="ghost danger-text" id="finishAdminChat" type="button"><i data-lucide="log-out"></i> Finalizar y borrar chat</button>
-      </form>
-    </dialog>
+    <section class="admin-chat-dock" id="adminChatDock" aria-label="Chats activos" aria-live="polite"></section>
 
     <dialog class="modal income-edit-modal" id="incomeEditDialog">
       <form class="modal-card" id="incomeEditForm">
@@ -605,6 +598,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260903-users-1"></script>
+    <script src="app.js?v=20260903-multichat-1"></script>
   </body>
 </html>
