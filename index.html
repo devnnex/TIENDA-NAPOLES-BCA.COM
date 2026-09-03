@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="style.css?v=20260831-song-9">
+    <link rel="stylesheet" href="style.css?v=20260903-chat-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="client">
@@ -42,7 +42,7 @@
           <i data-lucide="receipt-text"></i>
           <span>Ver cuenta</span>
         </button>
-        <button class="request-btn" type="button" data-song-request>
+        <button class="request-btn" id="songModeToggle" type="button" data-song-request>
           <i data-lucide="music-2"></i>
           <span>Pedir canción</span>
         </button>
@@ -58,6 +58,7 @@
             <span class="assistant-mode-icon" id="assistantModeIcon"><i data-lucide="bot"></i></span>
           </div>
           <div class="assistant-chat" id="assistantChat"></div>
+          <div class="typing-indicator client-typing-indicator" id="clientChatTyping" hidden><i></i><i></i><i></i><span>El administrador está escribiendo</span></div>
           <div class="assistant-suggestions" id="assistantSuggestions"></div>
           <form class="assistant-form" id="assistantForm">
             <input id="assistantInput" name="message" type="text" autocomplete="off" placeholder="Ej: Quiero una canasta de cerveza">
@@ -70,6 +71,6 @@
     </main>
 
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="app.js?v=20260831-song-13"></script>
+    <script src="app.js?v=20260903-chat-1"></script>
   </body>
 </html>

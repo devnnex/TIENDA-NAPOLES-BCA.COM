@@ -1,4 +1,4 @@
-const SYNC_INTERVAL_MS = 30000;
+const SYNC_INTERVAL_MS = 5000;
 
 const SUPABASE_CONFIG = {
   url: "https://izvcbkwgtciuoampunba.supabase.co",
@@ -7,8 +7,9 @@ const SUPABASE_CONFIG = {
 
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbxsjx-MMAXu_IyVoEGibbC9gaPPSB9fLT6Uk73FLg_oluXNcgB2JGtbVo0sx4SM3nX3wg/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbwggVntPjHXjdQgwOLPjlIjzgKVE7DGBfq6M8GCdDPLdvnJkN-nQBS190xnOE_gFtGi/exec"
 };
+const APPS_SCRIPT_REQUIRED_VERSION = "2.3.1";
 
 const SupabaseDb = (() => {
   let authToken = "";
@@ -22,10 +23,14 @@ const SupabaseDb = (() => {
     getCurrentUser: "get_current_user",
     listUsers: "list_users",
     saveUser: "save_user",
+    deleteUser: "delete_user",
     acknowledgeServiceRequests: "acknowledge_service_requests",
     resolveBill: "resolve_bill",
     createServiceRequest: "create_service_request",
-    createServiceRequestsBatch: "create_service_requests_batch"
+    createServiceRequestsBatch: "create_service_requests_batch",
+    listChatMessages: "list_chat_messages",
+    sendChatMessage: "send_chat_message",
+    closeChatSession: "close_chat_session"
   };
 
   const init = () => {
@@ -73,7 +78,10 @@ const App = (() => {
   const DEFAULT_CURRENCY = "COP";
   const INVENTORY_STORAGE_KEY = "tienda_napoles_inventory_v1";
   const INVOICE_STORAGE_KEY = "tienda_napoles_invoices_v1";
+  const INVENTORY_MOVEMENTS_STORAGE_KEY = "tienda_napoles_inventory_movements_v1";
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
+  const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
+  const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
   const REQUEST_IMAGES = {
     waiter: "images/mesero.png",
     bill: "images/check.png"
@@ -249,6 +257,9 @@ const App = (() => {
     currentUser: null,
     users: [],
     inventoryMeta: {},
+    inventoryMovements: [],
+    movementSearch: "",
+    movementTypeFilter: "all",
     invoiceHistory: [],
     inventorySearch: "",
     inventoryStatusFilter: "all",
@@ -290,7 +301,20 @@ const App = (() => {
     selectedTableQrIds: new Set(),
     tableRenderSignature: "",
     assistantMessages: [],
+    assistantThreads: { bar: [], song: [] },
     assistantMode: "bar",
+    chatMessages: [],
+    adminChatSessionId: "",
+    adminChatRequestIds: [],
+    adminChatClosing: false,
+    adminChatChannel: null,
+    adminBroadcastChannel: null,
+    adminChatActive: false,
+    adminChatNotice: "",
+    chatPollTimer: null,
+    chatTypingTimer: null,
+    peerTyping: false,
+    adminAiMessages: [],
     tableLocked: false,
     qrLocked: false,
     clientChannel: null,
@@ -469,6 +493,22 @@ const App = (() => {
     loadInventoryStore();
   };
 
+  const ensurePresetCategories = async () => {
+    if (state.currentUser?.role !== "admin") return;
+    const existing = new Set(state.categories.map((category) => normalizeText(category.name)));
+    const missing = CATEGORY_PRESETS.filter((name) => !existing.has(normalizeText(name)));
+    if (!missing.length) return;
+    const created = (await Promise.all(missing.map((name, index) => dbQuiet(
+      state.sb.from("menu_categories").insert({ name, sort_order: 100 + index, is_active: true }).select("*").single(),
+      null
+    )))).filter(Boolean);
+    if (created.length) {
+      state.categories = [...state.categories, ...created];
+      persistBootstrapCache();
+      renderMenuManager();
+    }
+  };
+
   const emptyState = (title, text, iconName = "sparkles") => `
     <div class="empty-state">
       ${icon(iconName, 26)}
@@ -478,6 +518,16 @@ const App = (() => {
   `;
 
   const tableLabel = (table) => table?.table_name || `Mesa ${table?.table_number || ""}`.trim();
+
+  const sessionLabel = (session) => session?.sale_channel === "walk_in" || !session?.table_id
+    ? "Venta individual"
+    : tableLabel(session?.restaurant_tables);
+
+  const sessionReference = (session) => String(session?.id || "")
+    .replace(/^walk-in-/i, "")
+    .replace(/-/g, "")
+    .slice(0, 8)
+    .toUpperCase();
 
   const tableCode = (table) => table?.qr_code || `mesa-${table?.table_number || ""}`;
 
@@ -552,7 +602,7 @@ const App = (() => {
   };
 
   const showAdminSection = (section = "dashboard") => {
-    if (state.currentUser?.role === "waiter" && ["brand", "menu", "inventory", "income", "users"].includes(section)) section = "service";
+    if (state.currentUser?.role === "waiter" && ["brand", "menu", "inventory", "movements", "income", "assistant", "users"].includes(section)) section = "service";
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -566,17 +616,23 @@ const App = (() => {
       renderTables();
     }
     if (section === "accounts") renderAccounts();
+    if (section === "service") renderServiceTables();
     if (section === "menu") {
       renderTableManager();
       renderTableFormQr();
     }
     if (section === "inventory") renderInventory();
+    if (section === "movements") {
+      renderInventoryMovements();
+      void loadInventoryMovements();
+    }
     if (section === "income") {
       initializeIncomeFilters();
       renderIncomeReport();
       void loadIncomeReport();
     }
     if (section === "users") renderUsers();
+    if (section === "assistant") renderAdminAi();
     refreshIcons();
   };
 
@@ -1317,6 +1373,39 @@ const App = (() => {
     state.inventoryMeta = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
     const invoices = readLocalJson(INVOICE_STORAGE_KEY, []);
     state.invoiceHistory = Array.isArray(invoices) ? invoices : [];
+    const movements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, []);
+    state.inventoryMovements = Array.isArray(movements) ? movements : [];
+    if (state.page === "admin") loadWalkInDrafts();
+  };
+
+  const isLocalWalkInSession = (session) => session?.sale_channel === "walk_in"
+    && (session?.local_only === true || String(session?.id || "").startsWith("walk-in-"));
+
+  function loadWalkInDrafts() {
+    const stored = readLocalJson(WALK_IN_DRAFTS_STORAGE_KEY, []);
+    const drafts = (Array.isArray(stored) ? stored : [])
+      .filter((session) => isLocalWalkInSession(session) && session.status === "open")
+      .map((session) => ({ ...session, local_only: true, restaurant_tables: null, session_items: Array.isArray(session.session_items) ? session.session_items : [] }));
+    state.sessions = [
+      ...drafts,
+      ...state.sessions.filter((session) => !isLocalWalkInSession(session))
+    ];
+    drafts.forEach((session) => state.optimisticSessionStates.set(session.id, {
+      mode: "upsert",
+      localOnly: true,
+      session
+    }));
+  }
+
+  const persistWalkInDrafts = () => {
+    const drafts = state.sessions
+      .filter((session) => isLocalWalkInSession(session) && session.status === "open")
+      .slice(0, 50);
+    try {
+      localStorage.setItem(WALK_IN_DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+    } catch (error) {
+      toast("No se pudo conservar el borrador de la venta individual en este equipo.", "error", "walk-in-storage-failed");
+    }
   };
 
   const persistInventoryStore = () => {
@@ -1333,6 +1422,35 @@ const App = (() => {
     } catch (error) {
       toast("La venta se cerro, pero no se pudo guardar el historial local.", "error", "invoice-storage-failed");
     }
+  };
+
+  const persistInventoryMovements = () => {
+    try {
+      localStorage.setItem(INVENTORY_MOVEMENTS_STORAGE_KEY, JSON.stringify(state.inventoryMovements.slice(-3000)));
+    } catch (error) { /* Historial remoto y memoria siguen disponibles. */ }
+  };
+
+  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "" }) => {
+    const numericDelta = Number(delta || 0);
+    const isNewProduct = String(type || "").toUpperCase() === "NUEVO_PRODUCTO";
+    if (!item || !Number.isFinite(numericDelta) || (!numericDelta && !isNewProduct) || state.inventoryMovements.some((movement) => movement.movementId === eventId)) return null;
+    const movement = {
+      movementId: eventId,
+      productId: item.id,
+      code: inventoryFor(item).code,
+      product: item.name || "Producto",
+      type: type || (delta > 0 ? "ENTRADA_MANUAL" : "SALIDA_MANUAL"),
+      delta: numericDelta,
+      before: Number(before || 0),
+      after: Number(after || 0),
+      reference,
+      date: occurredAt,
+      user: user || state.currentUser?.full_name || state.currentUser?.username || "Sistema"
+    };
+    state.inventoryMovements.push(movement);
+    persistInventoryMovements();
+    if (state.activeAdminSection === "movements") renderInventoryMovements();
+    return movement;
   };
 
   const inventoryFor = (item) => {
@@ -1546,7 +1664,7 @@ const App = (() => {
             writeAppsScriptOutbox(jobs);
             toast(
               legacyInventoryService
-                ? "El inventario se conciliara al cerrar la mesa. Publica la actualizacion 2.2.0 para sincronizar cada consumo de inmediato."
+                ? `El inventario se conciliara al cerrar la mesa. Publica la actualizacion ${APPS_SCRIPT_REQUIRED_VERSION} para sincronizar cada consumo de inmediato.`
                 : (result.error || "No se pudo aplicar un movimiento de inventario."),
               "error",
               legacyInventoryService ? "inventory-service-update-required" : `inventory-job-rejected:${job.id}`
@@ -1597,6 +1715,9 @@ const App = (() => {
         supabaseAnonKey: SUPABASE_CONFIG.anonKey
       });
       if (!result?.ok) throw new Error(result?.error || "No fue posible inicializar el respaldo remoto.");
+      if (String(result.version || "") !== APPS_SCRIPT_REQUIRED_VERSION) {
+        toast(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para activar movimientos y correccion de ventas cerradas.`, "error", "appscript-version-required");
+      }
       setInventorySyncStatus("Respaldo remoto listo", "synced", "cloud-check");
       await syncInventoryWithAppsScript();
       await flushAppsScriptOutbox();
@@ -1629,9 +1750,11 @@ const App = (() => {
     }
   };
 
-  const queueInventoryUpsert = (item) => {
+  const queueInventoryUpsert = (item, movement = {}) => {
     if (!item) return;
-    enqueueAppsScriptJob("upsert_inventory", { item: inventoryPayload(item) }, `inventory:${item.id}`);
+    enqueueAppsScriptJob("upsert_inventory", {
+      item: { ...inventoryPayload(item), ...movement }
+    }, `inventory:${item.id}`);
   };
 
   const applyConsumptionInventoryDelta = (item, delta, context = {}) => {
@@ -1647,6 +1770,15 @@ const App = (() => {
     };
     persistInventoryStore();
     const eventId = context.eventId || `consumption-stock:${uid()}`;
+    recordLocalInventoryMovement({
+      eventId,
+      item,
+      delta: change,
+      before: current.stock,
+      after: nextStock,
+      type: context.movementType || (change < 0 ? "CONSUMO_MESA" : "DEVOLUCION_CONSUMO"),
+      reference: context.reference || ""
+    });
     enqueueAppsScriptJob("adjust_inventory", {
       adjustment: {
         eventId,
@@ -1656,6 +1788,7 @@ const App = (() => {
         delta: change,
         sessionId: context.sessionId || "",
         reference: context.reference || "",
+        movementType: context.movementType || "",
         reversesEventId: context.reversesEventId || "",
         occurredAt: new Date().toISOString()
       }
@@ -1734,8 +1867,10 @@ const App = (() => {
   };
 
   const assistantSay = (role, text) => {
-    state.assistantMessages.push({ role, text });
-    state.assistantMessages = state.assistantMessages.slice(-16);
+    const thread = state.assistantThreads[state.assistantMode] || [];
+    thread.push({ role, text, local: true, created_at: new Date().toISOString() });
+    state.assistantThreads[state.assistantMode] = thread.slice(-40);
+    state.assistantMessages = state.assistantThreads[state.assistantMode];
     renderAssistant();
   };
 
@@ -1748,29 +1883,45 @@ const App = (() => {
     const title = $("#assistantTitle");
     const modeIcon = $("#assistantModeIcon");
     const input = $("#assistantInput");
+    const toggle = $("#songModeToggle");
     if (eyebrow) eyebrow.textContent = songMode ? "Música para tu mesa" : "Agente de bar";
     if (title) title.innerHTML = `<span class="assistant-live-dot" aria-hidden="true"></span>${songMode ? "Pide una canción" : "Pide por chat"}`;
     if (modeIcon) modeIcon.innerHTML = icon(songMode ? "music-2" : "bot", 24);
     if (input) input.placeholder = songMode
       ? "Nombre exacto de la canción y artista"
       : "Ej: Quiero una canasta de cerveza";
-    const messages = state.assistantMessages.length
-      ? state.assistantMessages
+    if (toggle) {
+      toggle.classList.toggle("is-active", songMode);
+      toggle.innerHTML = songMode ? `${icon("message-circle", 22)}<span>Volver al chat</span>` : `${icon("music-2", 22)}<span>Pedir canción</span>`;
+    }
+    const activeThread = (state.assistantThreads[state.assistantMode] || [])
+      .filter((message) => songMode || !state.adminChatActive || message.role !== "bot");
+    const serverMessages = !songMode ? state.chatMessages.map((message) => ({
+      role: message.sender_type === "client" ? "user" : message.sender_type === "staff" ? "staff" : "system",
+      text: message.body,
+      created_at: message.created_at
+    })) : [];
+    const hasJoinNotice = serverMessages.some((message) => message.role === "system" && normalizeText(message.text).includes("se unio al chat"));
+    const localJoinNotice = !songMode && state.adminChatActive && state.adminChatNotice && !hasJoinNotice
+      ? [{ role: "system", text: state.adminChatNotice, local: true, created_at: new Date().toISOString() }]
+      : [];
+    const messages = [...serverMessages, ...activeThread, ...localJoinNotice].filter((message, index, values) => !message.local || !values.some((candidate) => !candidate.local && candidate.text === message.text && candidate.role === message.role));
+    const visibleMessages = messages.length
+      ? messages
       : [{
           role: "bot",
           text: songMode
             ? "Escribe el nombre exacto de la canción y, si lo conoces, también el artista. Enviaremos tu solicitud al equipo."
             : "Hola, soy tu agente de bar. Dime qué deseas pedir y enviaré la solicitud al mesero para que confirme contigo los detalles."
         }];
-    chat.innerHTML = messages
-      .map((message) => `<div class="assistant-message ${message.role}">${escapeHTML(message.text)}</div>`)
+    chat.innerHTML = visibleMessages
+      .map((message) => `<div class="assistant-message ${message.role}">${message.role === "staff" ? `<small>Administrador</small>` : ""}${escapeHTML(message.text)}</div>`)
       .join("");
     chat.scrollTop = chat.scrollHeight;
     if (songMode) {
       suggestions.innerHTML = `<span class="assistant-song-hint">${icon("music", 16)} Ejemplo: Nombre de la canción — Artista</span>`;
     } else {
-      const productSuggestions = assistantOptions().slice(0, 2).map((item) => `Quiero ${item.name}`);
-      const suggestionTexts = [...productSuggestions, "Ver mi cuenta", "Llamar al mesero"].slice(0, 3);
+      const suggestionTexts = ["Deseo una cerveza", "Deseo cigarrillo", "Deseo un producto diferente"];
       suggestions.innerHTML = suggestionTexts
         .map((text) => `<button type="button" class="chip" data-assistant-suggest="${escapeHTML(text)}">${escapeHTML(text)}</button>`)
         .join("");
@@ -1779,11 +1930,9 @@ const App = (() => {
   };
 
   const activateSongRequestMode = () => {
-    state.assistantMode = "song";
-    state.assistantMessages = [{
-      role: "bot",
-      text: "Escribe el nombre exacto de la canción y el artista para solicitarla."
-    }];
+    state.assistantMode = state.assistantMode === "song" ? "bar" : "song";
+    if (state.assistantMode === "song" && !state.assistantThreads.song.length) state.assistantThreads.song = [{ role: "bot", text: "Escribe el nombre exacto de la canción y el artista para solicitarla.", local: true }];
+    state.assistantMessages = state.assistantThreads[state.assistantMode];
     renderAssistant();
     $(".assistant-panel")?.scrollIntoView({ block: "center", behavior: "auto" });
     window.requestAnimationFrame(() => $("#assistantInput")?.focus({ preventScroll: true }));
@@ -1827,7 +1976,7 @@ const App = (() => {
       writeRequestOutbox(outbox);
     }
     window.clearTimeout(state.requestOutboxTimer);
-    state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 70);
+    state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 0);
   };
 
   const flushRequestOutbox = async () => {
@@ -1893,6 +2042,7 @@ const App = (() => {
         return [{ ...item, attempts, next_attempt_at: Date.now() + delay }];
       });
       writeRequestOutbox(nextOutbox);
+      if (succeeded.size) state.adminBroadcastChannel?.send?.({ type: "broadcast", event: "refresh", payload: { requestIds: Array.from(succeeded) } });
       renderBillChat();
     } finally {
       state.requestOutboxBusy = false;
@@ -1931,28 +2081,181 @@ const App = (() => {
     return request;
   };
 
+  const mergeChatMessages = (messages = []) => {
+    const merged = new Map(state.chatMessages.map((message) => [message.id, message]));
+    messages.forEach((message) => message?.id && merged.set(message.id, message));
+    state.chatMessages = Array.from(merged.values()).sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))).slice(-300);
+  };
+
+  const chatRpcPayload = (sessionId = state.currentSession?.id, table = state.currentTable) => ({
+    p_session_id: sessionId || null,
+    p_table_id: table?.id || null,
+    p_table_access_code: table ? tableCode(table) : "",
+    p_auth_token: state.authToken || ""
+  });
+
+  const loadChatMessages = async (sessionId = state.currentSession?.id, table = state.currentTable) => {
+    if (!sessionId) return false;
+    const result = await dbQuiet(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)), null);
+    const messages = Array.isArray(result) ? result : result?.messages;
+    if (!Array.isArray(messages)) return false;
+    state.chatMessages = messages.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+    if (state.page === "client") {
+      const joinMessage = state.chatMessages.find((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
+      if (joinMessage) {
+        state.adminChatActive = true;
+        state.adminChatNotice = joinMessage.body;
+        state.assistantThreads.bar = (state.assistantThreads.bar || []).filter((message) => message.role !== "bot");
+      }
+    }
+    if (state.page === "client") renderAssistant();
+    else renderAdminChat();
+    return true;
+  };
+
+  const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable } = {}) => {
+    const clean = String(body || "").trim().replace(/\s+/g, " ").slice(0, 600);
+    if (!clean || !sessionId) return null;
+    const payload = {
+      ...chatRpcPayload(sessionId, table),
+      p_message_id: uid(),
+      p_sender_type: senderType,
+      p_body: clean
+    };
+    const result = await retryQuiet(() => state.sb.rpc("sendChatMessage", payload), 3);
+    const message = result?.message || result;
+    if (message?.id) {
+      mergeChatMessages([message]);
+      if (state.page === "client") renderAssistant();
+      else renderAdminChat();
+      return message;
+    }
+    return null;
+  };
+
+  const setPeerTyping = (typing, role) => {
+    state.peerTyping = Boolean(typing);
+    const target = state.page === "client" ? $("#clientChatTyping") : $("#adminChatTyping");
+    if (target) {
+      target.hidden = !state.peerTyping;
+      const label = target.querySelector("span");
+      if (label) label.textContent = role === "staff" ? "El administrador esta escribiendo" : "El cliente esta escribiendo";
+    }
+  };
+
+  const broadcastChatEvent = (event, payload = {}) => {
+    const channel = state.page === "client" ? state.clientChannel : state.adminChatChannel;
+    channel?.send?.({ type: "broadcast", event, payload: { sessionId: state.page === "client" ? state.currentSession?.id : state.adminChatSessionId, ...payload } });
+  };
+
+  const broadcastTyping = (role) => {
+    broadcastChatEvent("typing", { role, typing: true });
+    window.clearTimeout(state.chatTypingTimer);
+    state.chatTypingTimer = window.setTimeout(() => broadcastChatEvent("typing", { role, typing: false }), 900);
+  };
+
+  const renderAdminChat = () => {
+    const target = $("#adminChatMessages");
+    if (!target) return;
+    target.innerHTML = state.chatMessages.length ? state.chatMessages.map((message) => `<div class="live-chat-message ${escapeHTML(message.sender_type || "system")}"><span>${escapeHTML(message.sender_name || (message.sender_type === "staff" ? "Equipo" : message.sender_type === "client" ? "Cliente" : "Sistema"))}</span><p>${escapeHTML(message.body || "")}</p><small>${escapeHTML(prettyDateTime(message.created_at))}</small></div>`).join("") : emptyState("Conversacion nueva", "Los mensajes apareceran aqui en tiempo real.", "messages-square");
+    target.scrollTop = target.scrollHeight;
+    refreshIcons();
+  };
+
+  const subscribeAdminChat = (tableId, joinNotice) => {
+    if (state.adminChatChannel) state.sb.removeChannel(state.adminChatChannel);
+    state.adminChatChannel = state.sb.channel(`table:${tableId}`, { config: { broadcast: { self: false }, private: false } })
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        if (String(payload?.sessionId) === String(state.adminChatSessionId) && payload?.role === "client") setPeerTyping(payload.typing, "client");
+      })
+      .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages(state.adminChatSessionId, state.tables.find((entry) => String(entry.id) === String(tableId))))
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice });
+      });
+  };
+
+  const openAdminChat = async (requestIds) => {
+    const ids = String(requestIds || "").split(",").filter(Boolean);
+    const request = state.requests.find((entry) => ids.includes(entry.id));
+    if (!request?.session_id) {
+      toast("Esta solicitud aun no tiene una sesion de chat disponible.", "error", "chat-session-missing");
+      return;
+    }
+    const table = state.tables.find((entry) => String(entry.id) === String(request.table_id));
+    state.adminChatSessionId = request.session_id;
+    state.adminChatRequestIds = ids;
+    state.chatMessages = [];
+    $("#adminChatTitle").textContent = `Chat · ${tableLabel(table)}`;
+    $("#adminChatPresence").textContent = "Administrador conectado";
+    $("#adminChatDialog")?.showModal();
+    renderAdminChat();
+    const joinNotice = "El administrador se unió al chat.";
+    subscribeAdminChat(request.table_id, joinNotice);
+    await loadChatMessages(request.session_id, table);
+    const joinAlreadyRegistered = state.chatMessages.some((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
+    if (!joinAlreadyRegistered) void persistChatMessage("system", joinNotice, { sessionId: request.session_id, table });
+    acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
+  };
+
+  const finishAdminChat = async () => {
+    if (!state.adminChatSessionId || state.adminChatClosing) return;
+    const sessionId = state.adminChatSessionId;
+    const dialog = $("#adminChatDialog");
+    const closeButtons = [$("#closeAdminChat"), $("#finishAdminChat")].filter(Boolean);
+    state.adminChatClosing = true;
+    closeButtons.forEach((button) => { button.disabled = true; });
+    try {
+      const result = await retryQuiet(() => state.sb.rpc("closeChatSession", { p_session_id: sessionId, p_auth_token: state.authToken }), 3);
+      if (!result) {
+        toast("No se pudo finalizar el chat. Intenta nuevamente.", "error", `chat-close:${sessionId}`);
+        return;
+      }
+      const requestIds = [...state.adminChatRequestIds];
+      broadcastChatEvent("chat-closed", {});
+      state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
+      state.chatMessages = [];
+      state.adminChatSessionId = "";
+      state.adminChatRequestIds = [];
+      dialog?.close();
+      toast("Chat finalizado y mensajes eliminados.", "ok", `chat-finished:${sessionId}`);
+      void dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).in("id", requestIds), null)
+        .then(() => refreshAdminNow());
+    } finally {
+      state.adminChatClosing = false;
+      closeButtons.forEach((button) => { button.disabled = false; });
+    }
+  };
+
   const describeAssistantItem = (item) =>
     `${item.name}: ${item.detail}`;
 
-  const addAssistantOrder = async (order, originalMessage) => {
+  const addAssistantOrder = async (order) => {
     if (!state.currentTable) {
       assistantSay("bot", "Primero selecciona tu mesa para poder enviar el pedido correctamente.");
       return;
     }
     await ensureOpenSession(state.currentTable.id);
-    const request = await createServiceNotification(
-      "other",
-      `${tableLabel(state.currentTable)} solicita atención para pedir ${order.quantity} x ${order.item.name}. Mensaje del cliente: ${polishGuestText(originalMessage)}`
-    );
-    if (request) {
-      assistantSay("bot", `Perfecto. Ya envié tu solicitud de ${order.quantity} x ${order.item.name}. El mesero te atenderá para confirmar los detalles.`);
-    }
+    assistantSay("bot", `Perfecto. Ya envié tu solicitud de ${order.quantity} x ${order.item.name}. El mesero te atenderá para confirmar los detalles.`);
   };
 
   const handleAssistantMessage = async (message) => {
     const text = message.trim();
     if (!text) return;
     assistantSay("user", text);
+    if (state.currentTable) {
+      const session = state.currentSession || await ensureOpenSession(state.currentTable.id);
+      if (session) {
+        void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable }).then((saved) => {
+          if (saved) broadcastChatEvent("chat-refresh");
+        });
+        // La cola durable avisa desde el primer mensaje, incluso si es un saludo.
+        await createServiceNotification(
+          "other",
+          `${tableLabel(state.currentTable)} escribió en el chat: ${polishGuestText(text)}`
+        );
+      }
+    }
+    if (state.adminChatActive) return;
     const normalized = normalizeText(text);
     const item = findAssistantItem(text);
     const asksCapabilities = includesAny(normalized, [
@@ -2011,11 +2314,10 @@ const App = (() => {
     const order = parseAssistantOrder(text);
     if (order) {
       assistantSay("bot", "Recibido. Estoy registrando el pedido para tu mesa.");
-      void addAssistantOrder(order, text);
+      void addAssistantOrder(order);
       return;
     }
     assistantSay("bot", "Entendido. Ya envié tu solicitud para que el mesero te atienda y confirme los detalles.");
-    void createServiceNotification("other", `${tableLabel(state.currentTable)} solicita atención: ${polishGuestText(text)}`);
   };
 
   const handleSongRequest = async (message) => {
@@ -2206,6 +2508,9 @@ const App = (() => {
       if (state.assistantMode === "song") await handleSongRequest(message);
       else await handleAssistantMessage(message);
     });
+    $("#assistantInput")?.addEventListener("input", () => {
+      if (state.currentSession && state.assistantMode === "bar") broadcastTyping("client");
+    });
   };
 
   const subscribeClient = () => {
@@ -2220,6 +2525,7 @@ const App = (() => {
           renderAccount();
           renderBillChat();
         }
+        await loadChatMessages();
       } finally {
         state.clientSyncBusy = false;
       }
@@ -2227,8 +2533,29 @@ const App = (() => {
     state.clientChannel = state.sb
       .channel(`table:${state.currentTable.id}`, { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refresh)
+      .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages())
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        if (String(payload?.sessionId) === String(state.currentSession?.id) && payload?.role === "staff") setPeerTyping(payload.typing, "staff");
+      })
+      .on("broadcast", { event: "admin-presence" }, ({ payload }) => {
+        if (payload?.active) {
+          state.adminChatActive = true;
+          state.adminChatNotice = payload.notice || "El administrador se unió al chat.";
+          state.assistantThreads.bar = (state.assistantThreads.bar || []).filter((message) => message.role !== "bot");
+          state.assistantMessages = state.assistantThreads[state.assistantMode] || [];
+          renderAssistant();
+        }
+      })
+      .on("broadcast", { event: "chat-closed" }, () => {
+        state.chatMessages = [];
+        state.assistantThreads.bar = [];
+        state.adminChatActive = false;
+        state.adminChatNotice = "";
+        assistantSay("bot", "La conversacion fue finalizada. Puedes iniciar una nueva cuando lo necesites.");
+      })
       .subscribe();
     state.clientPollTimer = setInterval(refresh, SYNC_INTERVAL_MS);
+    void loadChatMessages();
   };
 
   const initClient = async () => {
@@ -2263,6 +2590,7 @@ const App = (() => {
     renderBillChat();
     renderAssistant();
     bindClient();
+    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self: false }, private: false } }).subscribe();
     subscribeClient();
     setLoading(false);
     // La pantalla queda usable tras el bootstrap; la cuenta se hidrata en segundo plano.
@@ -2470,6 +2798,24 @@ const App = (() => {
     audio.currentTime = 0;
   };
 
+  const disableAlarm = () => {
+    stopAlarm();
+    state.soundEnabled = false;
+    state.soundPrimed = false;
+    localStorage.removeItem("waiter_alarm_enabled");
+    updateAlarmButton();
+    toast("Alarma desactivada en este equipo.", "ok", "alarm-disabled");
+  };
+
+  const confirmDisableAlarm = () => {
+    const dialog = $("#alarmConfirmDialog");
+    if (!dialog) return Promise.resolve(window.confirm("¿Deseas desactivar la alarma?"));
+    dialog.returnValue = "";
+    dialog.showModal();
+    refreshIcons();
+    return new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true }));
+  };
+
   const unlockAlarm = async ({ silent = false } = {}) => {
     const audio = getAlarmAudio();
     if (!audio) {
@@ -2608,11 +2954,12 @@ const App = (() => {
 
   const renderAdminShell = () => {
     renderBrand();
+    const tableSessions = state.sessions.filter((session) => !isLocalWalkInSession(session));
     const totals = {
       tables: state.tables.filter((table) => table.is_active).length,
       alerts: activeRequests().length,
-      open: state.sessions.length,
-      sales: state.sessions.reduce((sum, session) => sum + sessionTotal(session), 0)
+      open: tableSessions.length,
+      sales: tableSessions.reduce((sum, session) => sum + sessionTotal(session), 0)
     };
     $("#metricTables").textContent = totals.tables;
     $("#metricAlerts").textContent = totals.alerts;
@@ -2623,25 +2970,12 @@ const App = (() => {
 
   const integerMoney = (value) => Math.max(0, Math.round(Number(value || 0)));
 
-  const calculatedCharge = (configured, base) => {
-    const value = Number(configured || 0);
-    if (!Number.isFinite(value) || value <= 0) return 0;
-    if (value <= 1) return integerMoney(base * value);
-    if (value <= 100) return integerMoney(base * value / 100);
-    return integerMoney(value);
-  };
-
   const sessionTotals = (session) => {
     const subtotal = (session?.session_items || [])
       .filter((item) => item.status !== "cancelled")
       .reduce((sum, item) => sum + integerMoney(item.unit_price) * Math.max(0, Number(item.quantity || 0)), 0);
-    const discount = Math.min(subtotal, integerMoney(session?.discount));
-    const taxable = Math.max(0, subtotal - discount);
-    const tax = session?.tax ? integerMoney(session.tax) : calculatedCharge(state.business?.tax_rate, taxable);
-    const serviceFee = session?.service_fee
-      ? integerMoney(session.service_fee)
-      : calculatedCharge(state.business?.service_fee, taxable);
-    return { subtotal: integerMoney(subtotal), discount, tax, serviceFee, total: integerMoney(taxable + tax + serviceFee) };
+    const total = integerMoney(subtotal);
+    return { subtotal: total, discount: 0, tax: 0, serviceFee: 0, total };
   };
 
   const sessionTotal = (session) => sessionTotals(session).total;
@@ -2712,7 +3046,9 @@ const App = (() => {
                 ${
                   request.request_type === "bill"
                     ? `<button class="primary" data-send-bill="${request.request_ids.join(",")}">${icon("send", 17)} Enviar cuenta</button>`
-                    : `<button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>`
+                    : request.kind === "chat"
+                      ? `<button class="primary" data-open-chat="${request.request_ids.join(",")}">${icon("messages-square", 17)} Abrir chat</button>`
+                      : `<button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>`
                 }
               </article>
             `
@@ -2735,41 +3071,29 @@ const App = (() => {
     refreshIcons();
   };
 
+  const compactTableTiles = () => state.tables
+    .filter((table) => table.is_active !== false)
+    .map((table) => {
+      const session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
+      const pending = state.requests.filter((request) => request.table_id === table.id && request.status === "pending").length;
+      const occupied = Boolean(session);
+      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
+    }).join("");
+
   const renderTables = () => {
     const box = $("#tablesGrid");
     if (!box) return;
     state.tableRenderSignature = tablesSignature();
-    box.innerHTML = state.tables.length
-      ? state.tables
-          .map((table) => {
-            const session = state.sessions.find((entry) => entry.table_id === table.id);
-            const pending = state.requests.filter(
-              (request) => request.table_id === table.id && request.status === "pending"
-            );
-            return `
-              <article class="table-card ${pending.length ? "needs-attention" : ""}">
-                <div class="table-top">
-                  <span>${icon(pending.length ? "alarm-clock" : "square", 16)} ${escapeHTML(tableLabel(table))}</span>
-                  <strong>${session ? money(sessionTotal(session)) : money(0)}</strong>
-                </div>
-                <p>${pending.length ? `${pending.length} solicitud(es) activa(s)` : session ? "Cuenta abierta" : "Disponible"}</p>
-                <div class="table-qr-inline" data-table-qr="${table.id}"></div>
-                <div class="table-actions">
-                  <button class="ghost small" data-copy-qr="${tableCode(table)}">
-                    ${icon("qr-code", 15)} Copiar QR
-                  </button>
-                  <button class="ghost small" data-download-qr="${table.id}">
-                    ${icon("download", 15)} Descargar QR
-                  </button>
-                  ${session ? `<button class="ghost small" data-view-session="${session.id}">${icon("receipt", 15)} Ver cuenta</button>` : ""}
-                </div>
-              </article>
-            `;
-          })
-          .join("")
-      : emptyState("Sin mesas", "Crea las mesas del negocio para generar enlaces QR.", "layout-grid");
+    box.classList.add("compact-tables-grid");
+    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea las mesas del negocio para comenzar.", "layout-grid");
     refreshIcons();
-    renderGeneratedTableQrs();
+  };
+
+  const renderServiceTables = () => {
+    const box = $("#waiterTablesGrid");
+    if (!box) return;
+    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea una mesa activa para atenderla.", "armchair");
+    refreshIcons();
   };
 
   const renderBusinessForm = () => {
@@ -2797,8 +3121,10 @@ const App = (() => {
     state.selectedTableQrIds = new Set(
       [...state.selectedTableQrIds].filter((id) => validIds.has(String(id)))
     );
-    list.innerHTML = state.tables.length
-      ? state.tables
+    const query = normalizeText($("#tableManagerSearch")?.value || "");
+    const visibleTables = state.tables.filter((table) => !query || normalizeText(`${table.table_number} ${table.table_name || ""}`).includes(query));
+    list.innerHTML = visibleTables.length
+      ? visibleTables
           .map(
             (table) => `
               <div class="manager-row table-manager-row${state.selectedTableQrIds.has(String(table.id)) ? " is-selected" : ""}">
@@ -2821,7 +3147,7 @@ const App = (() => {
             `
           )
           .join("")
-      : emptyState("Sin mesas", "Agrega una mesa para generar su QR.", "qr-code");
+      : emptyState(state.tables.length ? "Sin coincidencias" : "Sin mesas", state.tables.length ? "Prueba con otro numero o nombre." : "Agrega una mesa para generar su QR.", "qr-code");
     renderQrBatchControls();
     refreshIcons();
     renderGeneratedTableQrs();
@@ -2972,6 +3298,45 @@ const App = (() => {
     }
   };
 
+  const openCompactTable = async (tableId) => {
+    await openScannedTable(tableId);
+  };
+
+  const createWalkInSale = async () => {
+    const button = $("#newWalkInSale");
+    if (button) button.disabled = true;
+    try {
+      const existing = state.sessions.find((session) => isLocalWalkInSession(session) && session.status === "open");
+      if (existing) {
+        openPaymentDialog(existing.id);
+        return;
+      }
+      const openedAt = new Date().toISOString();
+      const session = {
+        id: uid(),
+        local_only: true,
+        table_id: null,
+        status: "open",
+        sale_channel: "walk_in",
+        payer_name: "Cliente individual",
+        assigned_waiter_id: state.currentUser?.id || null,
+        assigned_waiter: state.currentUser,
+        restaurant_tables: null,
+        session_items: [],
+        opened_at: openedAt,
+        created_at: openedAt,
+        updated_at: openedAt
+      };
+      state.sessions = [session, ...state.sessions.filter((entry) => entry.id !== session.id)];
+      state.optimisticSessionStates.set(session.id, { mode: "upsert", localOnly: true, session });
+      persistWalkInDrafts();
+      renderAdminLive();
+      openPaymentDialog(session.id);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  };
+
   const renderConsumptionProductOptions = (searchValue = "") => {
     const options = $("#consumptionProductOptions");
     const combobox = $("#consumptionProductCombobox");
@@ -3056,9 +3421,13 @@ const App = (() => {
   const renderMenuManager = () => {
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
+      const excludedInventoryCategories = new Set(["entrada", "entradas", "plato fuerte", "platos fuertes", "postre", "postres"]);
+      const categories = select.closest("#inventoryForm")
+        ? state.categories.filter((category) => !excludedInventoryCategories.has(normalizeText(category.name)))
+        : state.categories;
       select.innerHTML = `
         <option value="">Elegir categoria</option>
-        ${state.categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name)}</option>`).join("")}
+        ${categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name)}</option>`).join("")}
       `;
     });
 
@@ -3200,17 +3569,60 @@ const App = (() => {
     refreshIcons();
   };
 
-  const resetInventoryForm = () => {
+  const movementKind = (movement) => Number(movement.delta ?? movement.quantityChange ?? 0) >= 0 ? "entry" : "exit";
+
+  const renderInventoryMovements = () => {
+    const list = $("#inventoryMovementList");
+    const summary = $("#movementSummary");
+    if (!list || !summary) return;
+    const query = normalizeText(state.movementSearch);
+    const movements = [...state.inventoryMovements]
+      .filter((movement) => state.movementTypeFilter === "all" || movementKind(movement) === state.movementTypeFilter)
+      .filter((movement) => !query || normalizeText([movement.product, movement.code, movement.type, movement.reference, movement.user].join(" ")).includes(query))
+      .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")));
+    const entries = movements.filter((movement) => movementKind(movement) === "entry").reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
+    const exits = movements.filter((movement) => movementKind(movement) === "exit").reduce((sum, movement) => sum + Math.abs(Number(movement.delta || 0)), 0);
+    summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line", 19)}<span><small>Unidades ingresadas</small><strong>+${entries.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></span></article><article class="movement-kpi exit">${icon("arrow-up-from-line", 19)}<span><small>Unidades retiradas</small><strong>-${exits.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></span></article><article class="movement-kpi">${icon("list-checks", 19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
+    list.innerHTML = movements.length ? movements.map((movement) => {
+      const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
+      const kind = delta >= 0 ? "entry" : "exit";
+      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
+    }).join("") : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
+    refreshIcons();
+  };
+
+  const loadInventoryMovements = async () => {
+    if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    try {
+      const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
+      if (!result?.ok || !Array.isArray(result.movements)) return false;
+      const merged = new Map(state.inventoryMovements.map((movement) => [movement.movementId, movement]));
+      result.movements.forEach((movement) => merged.set(movement.movementId, movement));
+      state.inventoryMovements = Array.from(merged.values()).slice(-3000);
+      persistInventoryMovements();
+      renderInventoryMovements();
+      return true;
+    } catch (error) {
+      renderInventoryMovements();
+      return false;
+    }
+  };
+
+  const resetInventoryForm = ({ open = false } = {}) => {
     const form = $("#inventoryForm");
     if (!form) return;
     form.reset();
     form.product_id.value = "";
-    form.stock.value = 0;
+    form.stock.value = "";
     form.min_stock.value = 5;
     form.unit.value = "unidad";
     form.is_available.checked = true;
     $("#inventoryFormTitle") && ($("#inventoryFormTitle").textContent = "Agregar producto");
     renderInventoryLiveCalculation();
+    if (open) {
+      $("#inventoryDialog")?.showModal();
+      window.setTimeout(() => form.product_name.focus({ preventScroll: true }), 0);
+    }
   };
 
   const editInventoryProduct = (id) => {
@@ -3231,7 +3643,8 @@ const App = (() => {
     form.is_available.checked = item.is_available !== false;
     $("#inventoryFormTitle") && ($("#inventoryFormTitle").textContent = `Editar ${item.name}`);
     renderInventoryLiveCalculation();
-    form.scrollIntoView({ behavior: "smooth", block: "center" });
+    $("#inventoryDialog")?.showModal();
+    window.setTimeout(() => form.product_name.focus({ preventScroll: true }), 0);
   };
 
   const saveInventoryProduct = async (form) => {
@@ -3245,6 +3658,7 @@ const App = (() => {
       return;
     }
     const id = form.product_id.value;
+    const previousInventory = id ? inventoryFor(state.items.find((item) => item.id === id)) : null;
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
     if (!categoryId && newCategory) {
@@ -3279,10 +3693,29 @@ const App = (() => {
       unit: form.unit.value || "unidad",
       updatedAt: new Date().toISOString()
     };
+    const beforeStock = Number(previousInventory?.stock || 0);
+    const stockDelta = stock - beforeStock;
+    const movementEventId = (!id || stockDelta) ? `product:${saved.id}:${Date.now()}` : "";
+    if (movementEventId) {
+      recordLocalInventoryMovement({
+        eventId: movementEventId,
+        item: hydrated,
+        delta: stockDelta,
+        before: beforeStock,
+        after: stock,
+        type: id ? (stockDelta > 0 ? "ENTRADA_EDICION" : "SALIDA_EDICION") : "NUEVO_PRODUCTO",
+        reference: id ? "Edicion de producto" : "Registro inicial"
+      });
+    }
     persistInventoryStore();
     persistBootstrapCache();
-    queueInventoryUpsert(hydrated);
+    queueInventoryUpsert(hydrated, movementEventId ? {
+      movementEventId,
+      movementType: id ? (stockDelta > 0 ? "ENTRADA_EDICION" : "SALIDA_EDICION") : "NUEVO_PRODUCTO",
+      movementReference: id ? "Edicion de producto" : "Registro inicial"
+    } : {});
     resetInventoryForm();
+    $("#inventoryDialog")?.close();
     renderMenuManager();
     renderInventory();
     toast(id ? "Producto e inventario actualizados." : "Producto agregado al inventario.");
@@ -3300,7 +3733,9 @@ const App = (() => {
       updatedAt: new Date().toISOString()
     };
     persistInventoryStore();
-    queueInventoryUpsert(item);
+    const eventId = `manual:${uid()}`;
+    recordLocalInventoryMovement({ eventId, item, delta: nextStock - current.stock, before: current.stock, after: nextStock, type: adjustment > 0 ? "ENTRADA_MANUAL" : "SALIDA_MANUAL", reference: "Ajuste rapido" });
+    enqueueAppsScriptJob("adjust_inventory", { adjustment: { eventId, productId: item.id, code: current.code, name: item.name, delta: nextStock - current.stock, reference: "AJUSTE_MANUAL", movementType: adjustment > 0 ? "ENTRADA_MANUAL" : "SALIDA_MANUAL", occurredAt: new Date().toISOString() } }, `inventory-adjust:${eventId}`);
     renderInventory();
   };
 
@@ -3414,7 +3849,16 @@ const App = (() => {
         const quantity = Number(line.quantity || 0);
         const unitPrice = Number(line.unit_price || 0);
         const unitCost = Number(state.inventoryMeta[line.menu_item_id]?.costPrice || 0);
-        return { name: line.item_name || "Producto", quantity, unitPrice, total: quantity * unitPrice, cost: quantity * unitCost, profit: quantity * (unitPrice - unitCost) };
+        return {
+          lineId: line.id || "",
+          menuItemId: line.menu_item_id || null,
+          name: line.item_name || "Producto",
+          quantity,
+          unitPrice,
+          total: quantity * unitPrice,
+          cost: quantity * unitCost,
+          profit: quantity * (unitPrice - unitCost)
+        };
       });
       const cost = items.reduce((sum, item) => sum + item.cost, 0);
       const total = Number(invoice.totals?.total || 0);
@@ -3489,6 +3933,78 @@ const App = (() => {
     refreshIcons();
   };
 
+  const renderAdminAi = () => {
+    const chat = $("#adminAiChat");
+    const suggestions = $("#adminAiSuggestions");
+    if (!chat || !suggestions) return;
+    suggestions.innerHTML = ["¿Cuanto se vendio hoy?", "¿Que producto se vendio mas?", "¿Quien realizo las ventas?", "¿Que productos tienen stock bajo?"]
+      .map((question) => `<button class="chip" type="button" data-admin-ai-question="${escapeHTML(question)}">${escapeHTML(question)}</button>`).join("");
+    const messages = state.adminAiMessages.length ? state.adminAiMessages : [{ role: "bot", text: "Puedo cruzar el informe de ingresos, el inventario y los movimientos visibles. Preguntame por productos, cantidades, responsables, ventas o existencias." }];
+    chat.innerHTML = messages.map((message) => `<div class="admin-ai-message ${message.role}">${message.role === "bot" ? icon("sparkles", 17) : ""}<p>${escapeHTML(message.text)}</p></div>`).join("");
+    chat.scrollTop = chat.scrollHeight;
+    refreshIcons();
+  };
+
+  const askAdminAi = async (question) => {
+    const clean = String(question || "").trim();
+    if (!clean) return;
+    state.adminAiMessages.push({ role: "user", text: clean });
+    renderAdminAi();
+    if (!state.incomeReport) await loadIncomeReport();
+    const normalized = normalizeText(clean);
+    const mentionsEntries = includesAny(normalized, [
+      "ingreso al inventario", "se ingreso", "ingresaron", "entrada", "entraron",
+      "agrego al inventario", "sumo unidades", "movimiento"
+    ]);
+    if (mentionsEntries) await loadInventoryMovements();
+    const records = state.incomeReport?.records || localIncomeRecords(incomeFiltersFromForm());
+    const product = state.items
+      .filter((item) => normalized.includes(normalizeText(item.name)))
+      .sort((left, right) => String(right.name).length - String(left.name).length)[0] || null;
+    const mentionsInventory = includesAny(normalized, ["inventario", "existencia", "stock", "queda", "quedan"]);
+    let answer = "No encontre una coincidencia exacta. Prueba incluyendo el nombre del producto y palabras como vendio, ingreso, responsable, utilidad o stock.";
+    if (mentionsInventory && product) {
+      const inventory = inventoryFor(product);
+      answer = `${product.name} tiene ${inventory.stock.toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${inventory.unit}${inventory.stock === 1 ? "" : "s"}. Su minimo es ${inventory.minStock} y su valor estimado a costo es ${money(inventory.stock * inventory.costPrice)}.`;
+    } else if (mentionsInventory) {
+      const low = state.items.filter((item) => inventoryStatus(item) !== "ok");
+      answer = low.length ? `Hay ${low.length} productos por revisar: ${low.slice(0, 8).map((item) => `${item.name} (${inventoryFor(item).stock})`).join(", ")}.` : "No hay productos agotados ni por debajo del stock minimo.";
+    } else if (mentionsEntries) {
+      const matching = state.inventoryMovements.filter((movement) => (!product || movement.productId === product.id) && Number(movement.delta || 0) > 0);
+      const units = matching.reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
+      answer = `${product ? product.name : "El inventario"} registra ${units.toLocaleString("es-CO", { maximumFractionDigits: 2 })} unidades de entrada en ${matching.length} movimiento${matching.length === 1 ? "" : "s"}.`;
+    } else if (includesAny(normalized, ["quien", "responsable", "vendio"]) && product) {
+      const sellers = new Map();
+      records.forEach((record) => {
+        const quantity = (record.items || []).filter((item) => normalizeText(item.name).includes(normalizeText(product.name))).reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+        if (quantity) sellers.set(record.waiter || "Sin asignar", Number(sellers.get(record.waiter || "Sin asignar") || 0) + quantity);
+      });
+      answer = sellers.size ? `${product.name} fue vendido por ${Array.from(sellers).map(([name, quantity]) => `${name}: ${quantity} unidad${quantity === 1 ? "" : "es"}`).join("; ")}.` : `No encontre ventas de ${product.name} en el rango seleccionado.`;
+    } else if (product && includesAny(normalized, ["vendio", "vendieron", "unidades", "cuanto"])) {
+      const lines = records.flatMap((record) => (record.items || []).filter((item) => normalizeText(item.name).includes(normalizeText(product.name))));
+      const quantity = lines.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+      const total = lines.reduce((sum, item) => sum + Number(item.total || 0), 0);
+      answer = `En el rango actual se vendieron ${quantity.toLocaleString("es-CO", { maximumFractionDigits: 2 })} unidades de ${product.name}, por ${money(total)}.`;
+    } else if (includesAny(normalized, ["producto", "mas vendido", "vendio mas"])) {
+      const totals = new Map();
+      records.flatMap((record) => record.items || []).forEach((item) => totals.set(item.name, Number(totals.get(item.name) || 0) + Number(item.quantity || 0)));
+      const top = Array.from(totals).sort((a, b) => b[1] - a[1])[0];
+      answer = top ? `El producto mas vendido en el rango actual es ${top[0]}, con ${top[1].toLocaleString("es-CO", { maximumFractionDigits: 2 })} unidades.` : "No hay productos vendidos en el rango seleccionado.";
+    } else if (includesAny(normalized, ["utilidad", "ganancia"])) {
+      answer = `La utilidad estimada del rango seleccionado es ${money(state.incomeReport?.totals?.profit || 0)}, sobre ingresos de ${money(state.incomeReport?.totals?.income || 0)}.`;
+    } else if (includesAny(normalized, ["quien", "responsable", "vendedor", "mesero"])) {
+      const sellers = new Map();
+      records.forEach((record) => sellers.set(record.waiter || "Sin asignar", Number(sellers.get(record.waiter || "Sin asignar") || 0) + Number(record.total || 0)));
+      answer = sellers.size ? Array.from(sellers).sort((a, b) => b[1] - a[1]).map(([name, total]) => `${name}: ${money(total)}`).join("; ") : "No hay ventas con responsable en el rango seleccionado.";
+    } else if (includesAny(normalized, ["venta", "vendio", "ingreso", "facturo", "cuanto"])) {
+      const totals = state.incomeReport?.totals || {};
+      answer = `En el rango seleccionado se registraron ${Number(totals.sales || 0)} ventas por ${money(totals.income || 0)}. El ticket promedio fue ${money(totals.averageTicket || 0)}.`;
+    }
+    state.adminAiMessages.push({ role: "bot", text: answer });
+    state.adminAiMessages = state.adminAiMessages.slice(-30);
+    renderAdminAi();
+  };
+
   const formatIncomeDate = (value) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value || "Sin fecha");
@@ -3531,7 +4047,7 @@ const App = (() => {
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
             <div class="income-record-main">
-              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small></div>
+              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button></div>
               <div><small>Mesa / responsable</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
               <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
               <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span>Utilidad ${money(record.profit)}</span></div>
@@ -3541,7 +4057,7 @@ const App = (() => {
               <summary>${icon("list-collapse", 15)} Ver productos y desglose</summary>
               <div class="income-record-detail">
                 <ul>${itemRows || "<li><span>Sin detalle de productos</span></li>"}</ul>
-                <dl><div><dt>Subtotal</dt><dd>${money(record.subtotal)}</dd></div><div><dt>Descuento</dt><dd>${money(record.discount)}</dd></div><div><dt>Impuestos</dt><dd>${money(record.tax)}</dd></div><div><dt>Servicio</dt><dd>${money(record.service)}</dd></div><div><dt>Costo</dt><dd>${money(record.cost)}</dd></div></dl>
+                <dl class="income-total-only"><div><dt>Total pagado</dt><dd>${money(record.total)}</dd></div></dl>
               </div>
             </details>
           </article>`;
@@ -3579,6 +4095,97 @@ const App = (() => {
       return false;
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
+    }
+  };
+
+  const dateTimeLocalValue = (value) => {
+    const date = new Date(value || Date.now());
+    if (Number.isNaN(date.getTime())) return "";
+    const offset = date.getTimezoneOffset() * 60000;
+    return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+  };
+
+  const openIncomeEdit = (saleId) => {
+    const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
+    const form = $("#incomeEditForm");
+    if (!record || !form) return;
+    form.sale_id.value = record.saleId;
+    form.table.value = record.table || "Venta individual";
+    form.payer.value = record.payer || "";
+    form.waiter.value = record.waiter || state.currentUser?.full_name || "";
+    form.date.value = dateTimeLocalValue(record.date);
+    form.payment_method.value = record.isMixed ? "mixed" : (record.payments?.[0]?.method || "cash");
+    form.reference.value = record.reference || "";
+    const lines = $("#incomeEditLines");
+    lines.innerHTML = `<div class="income-edit-lines-head"><strong>Productos facturados</strong><small>Edita producto, cantidad o precio, o usa la canasta para retirar un articulo cobrado.</small></div>${(record.items || []).map((item, index) => `<div class="income-edit-line" data-income-line="${index}" data-line-id="${escapeHTML(item.lineId || item.id || "")}" data-menu-item-id="${escapeHTML(item.menuItemId || item.menu_item_id || "")}"><label>Producto<input data-line-field="name" value="${escapeHTML(item.name || "Producto")}" maxlength="100" required></label><label>Cantidad<input data-line-field="quantity" type="number" min="1" step="1" value="${Number(item.quantity || 0)}" required></label><label>Precio<input data-line-field="price" type="text" value="${formattedCurrencyInput(item.unitPrice || item.unit_price || 0)}" inputmode="numeric" data-currency-input required></label><button class="icon-btn danger income-line-delete" type="button" data-remove-income-line aria-label="Eliminar ${escapeHTML(item.name || "producto")}">${icon("trash-2", 17)}</button></div>`).join("")}`;
+    bindCurrencyInputs(lines);
+    $("#incomeEditDialog")?.showModal();
+    refreshIcons();
+  };
+
+  const saveIncomeEdit = async (form) => {
+    const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(form.sale_id.value));
+    if (!record) return;
+    const items = $$('[data-income-line]', form).map((row) => ({
+      id: row.dataset.lineId || uid(),
+      menu_item_id: row.dataset.menuItemId || null,
+      item_name: row.querySelector('[data-line-field="name"]')?.value.trim() || "",
+      quantity: Number(row.querySelector('[data-line-field="quantity"]')?.value || 0),
+      unit_price: currencyInputNumber(row.querySelector('[data-line-field="price"]'))
+    })).filter((item) => item.item_name && item.quantity > 0);
+    if (!items.length || items.some((item) => !Number.isInteger(item.quantity) || item.quantity < 1 || item.unit_price < 0)) {
+      toast("La venta debe conservar al menos un producto con cantidad y precio validos.", "error", "invalid-income-edit");
+      return;
+    }
+    const subtotal = items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0);
+    const total = subtotal;
+    const selectedPaymentMethod = form.payment_method.value;
+    const existingPaymentTotal = (record.payments || []).reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+    const correctedPayments = selectedPaymentMethod === "mixed" && record.payments?.length > 1
+      ? record.payments.map((payment, index, payments) => ({
+          method: payment.method,
+          amount: index === payments.length - 1
+            ? total - payments.slice(0, -1).reduce((sum, entry) => sum + Math.round(total * Number(entry.amount || 0) / Math.max(1, existingPaymentTotal)), 0)
+            : Math.round(total * Number(payment.amount || 0) / Math.max(1, existingPaymentTotal))
+        }))
+      : [{ method: selectedPaymentMethod === "mixed" ? "cash" : selectedPaymentMethod, amount: total }];
+    const correctedDate = new Date(form.date.value);
+    if (Number.isNaN(correctedDate.getTime())) {
+      toast("Selecciona una fecha y hora validas para la venta.", "error", "invalid-income-date");
+      return;
+    }
+    const corrected = {
+      id: record.saleId,
+      number: record.invoice,
+      sessionId: record.sessionId,
+      table: form.table.value.trim(),
+      createdAt: correctedDate.toISOString(),
+      payerName: form.payer.value.trim(),
+      waiterName: form.waiter.value.trim(),
+      paymentMethod: selectedPaymentMethod,
+      payments: correctedPayments,
+      reference: form.reference.value.trim(),
+      totals: { subtotal, discount: 0, tax: 0, serviceFee: 0, total },
+      items
+    };
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const result = await appsScriptRequest("edit_sale", { invoice: corrected }, 40000);
+      if (!result?.ok) throw new Error(result?.error || "No se pudo corregir la venta.");
+      const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
+      if (localIndex >= 0) {
+        state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
+        persistInvoiceHistory();
+      }
+      $("#incomeEditDialog")?.close();
+      state.incomeReport = null;
+      await loadIncomeReport();
+      toast("Venta corregida. El cambio quedo registrado en auditoria.", "ok", `income-edited:${record.saleId}`);
+    } catch (error) {
+      toast(String(error?.message || error), "error", `income-edit-failed:${record.saleId}`);
+    } finally {
+      if (submit) submit.disabled = false;
     }
   };
 
@@ -3638,10 +4245,11 @@ const App = (() => {
   const renderAccounts = () => {
     const box = $("#accountsPanel");
     if (!box) return;
+    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session));
     const renderSignature = JSON.stringify([
       state.business?.tax_rate,
       state.business?.service_fee,
-      state.sessions.map((session) => [
+      accountSessions.map((session) => [
         session.id,
         session.status,
         session.payer_name,
@@ -3654,8 +4262,8 @@ const App = (() => {
     ]);
     if (renderSignature === state.accountsRenderSignature) return;
     state.accountsRenderSignature = renderSignature;
-    box.innerHTML = state.sessions.length
-      ? state.sessions
+    box.innerHTML = accountSessions.length
+      ? accountSessions
           .map((session) => {
             const billRequest = state.requests.find(
               (request) => request.session_id === session.id && request.request_type === "bill"
@@ -3673,7 +4281,7 @@ const App = (() => {
               year: "numeric"
             });
             return `
-              <article class="account-card invoice-ticket ${items.length ? "" : "is-empty"}">
+              <article class="account-card invoice-ticket ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
                 ${items.length ? "" : `<button class="icon-btn danger empty-account-close" type="button" data-close-session="${session.id}" aria-label="Quitar cuenta vacia" title="Quitar cuenta vacia">${icon("x", 18)}</button>`}
                 <div class="invoice-total-block">
                   <span>Total actual</span>
@@ -3681,8 +4289,8 @@ const App = (() => {
                 </div>
 
                 <div class="invoice-identity">
-                  <span>${escapeHTML(tableLabel(session.restaurant_tables))}</span>
-                  <strong>#${String(session.id).slice(0, 8).toUpperCase()}</strong>
+                  <span>${escapeHTML(sessionLabel(session))}</span>
+                  <strong>#${sessionReference(session)}</strong>
                 </div>
 
                 <div class="invoice-meta-grid">
@@ -3712,6 +4320,7 @@ const App = (() => {
                           </div>
                           <strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong>
                           <button class="icon-btn" data-edit-consumption="${item.id}" data-session-id="${session.id}" aria-label="Editar consumo">${icon("pencil", 15)}</button>
+                          <button class="icon-btn danger" data-delete-consumption="${item.id}" data-session-id="${session.id}" aria-label="Eliminar consumo">${icon("trash-2", 15)}</button>
                         </div>
                       `
                     )
@@ -3720,6 +4329,7 @@ const App = (() => {
 
                 <div class="invoice-actions">
                   <button class="ghost small" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>
+                  ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
                   <button class="ghost small" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>
                   ${
                     billRequest
@@ -3745,16 +4355,20 @@ const App = (() => {
     renderBusinessForm();
     renderTableManager();
     renderWaiterTableSelect();
+    renderServiceTables();
     renderMenuManager();
     renderInventory();
+    renderInventoryMovements();
     renderIncomeReport();
     renderAccounts();
+    renderAdminAi();
   };
 
   const renderAdminLive = () => {
     renderAdminShell();
     renderAlerts();
     if (state.activeAdminSection === "dashboard" && tablesSignature() !== state.tableRenderSignature) renderTables();
+    if (state.activeAdminSection === "service") renderServiceTables();
     if (state.activeAdminSection === "accounts") renderAccounts();
   };
 
@@ -4026,10 +4640,93 @@ const App = (() => {
     );
   };
 
+  const openMoveSessionDialog = (sessionId) => {
+    const session = state.sessions.find((entry) => entry.id === sessionId);
+    if (!session?.table_id) return;
+    const form = $("#moveTableForm");
+    const options = $("#moveTableOptions");
+    if (!form || !options) return;
+    form.reset();
+    form.session_id.value = sessionId;
+    const occupiedIds = new Set(state.sessions.filter((entry) => entry.id !== sessionId && entry.status === "open").map((entry) => String(entry.table_id)));
+    const tables = state.tables.filter((table) => table.is_active !== false && String(table.id) !== String(session.table_id));
+    $("#moveTableHint").textContent = `${sessionLabel(session)} · elige una mesa libre para trasladar todos los consumos.`;
+    options.innerHTML = tables.length ? tables.map((table) => {
+      const occupied = occupiedIds.has(String(table.id));
+      return `<label class="move-table-option${occupied ? " is-occupied" : ""}"><input type="radio" name="target_table_id" value="${escapeHTML(table.id)}" ${occupied ? "disabled" : ""}><span>${icon("armchair", 20)}<strong>${escapeHTML(tableLabel(table))}</strong><small>${occupied ? "Ocupada" : "Libre"}</small></span></label>`;
+    }).join("") : emptyState("No hay otra mesa", "Crea o activa otra mesa para mover esta cuenta.", "armchair");
+    $("#moveTableDialog")?.showModal();
+    refreshIcons();
+  };
+
+  const moveSessionToTable = async (sessionId, targetTableId) => {
+    const session = state.sessions.find((entry) => entry.id === sessionId);
+    if (!session?.table_id) return;
+    const table = state.tables.find((entry) => String(entry.id) === String(targetTableId) && entry.is_active !== false);
+    if (!table) {
+      toast("Selecciona una mesa libre para continuar.", "error", "move-table-not-found");
+      return;
+    }
+    if (String(table.id) === String(session.table_id)) return;
+    if (state.sessions.some((entry) => entry.id !== sessionId && String(entry.table_id) === String(table.id) && entry.status === "open")) {
+      toast("La mesa elegida ya tiene una cuenta abierta.", "error", "move-table-occupied");
+      return;
+    }
+    $("#moveTableDialog")?.close();
+    const original = session;
+    state.sessions = state.sessions.map((entry) => entry.id === sessionId ? { ...entry, table_id: table.id, restaurant_tables: table } : entry);
+    state.accountsRenderSignature = "";
+    renderAdminLive();
+    const saved = await retryQuiet(() => state.sb.from("table_sessions").update({ table_id: table.id, sale_channel: "table" }).eq("id", sessionId).select("*").single(), 4);
+    if (!saved) {
+      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? original : entry);
+      state.accountsRenderSignature = "";
+      renderAdminLive();
+      toast("No se pudo cambiar la mesa. La cuenta fue restaurada.", "error", `move-table:${sessionId}`);
+      return;
+    }
+    const relatedUpdates = await Promise.all([
+      dbQuiet(state.sb.from("session_items").update({ table_id: table.id, updated_by_user_id: state.currentUser?.id || null }).eq("session_id", sessionId).select("id"), null),
+      dbQuiet(state.sb.from("service_requests").update({ table_id: table.id }).eq("session_id", sessionId).select("id"), null)
+    ]);
+    if (relatedUpdates.some((result) => result === null)) {
+      await Promise.all([
+        dbQuiet(state.sb.from("table_sessions").update({ table_id: original.table_id, sale_channel: original.sale_channel || "table" }).eq("id", sessionId), null),
+        dbQuiet(state.sb.from("session_items").update({ table_id: original.table_id }).eq("session_id", sessionId), null),
+        dbQuiet(state.sb.from("service_requests").update({ table_id: original.table_id }).eq("session_id", sessionId), null)
+      ]);
+      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? original : entry);
+      state.accountsRenderSignature = "";
+      renderAdminLive();
+      toast("No se pudo completar el cambio de mesa. La cuenta fue restaurada.", "error", `move-table-related:${sessionId}`);
+      return;
+    }
+    toast(`Cuenta movida a ${tableLabel(table)}.`, "ok", `moved-table:${sessionId}`);
+  };
+
   const closeSession = async (id) => {
     const session = state.sessions.find((entry) => entry.id === id);
     if (!session) return null;
     const totals = sessionTotals(session);
+    if (isLocalWalkInSession(session)) {
+      const closedAt = new Date().toISOString();
+      const saved = {
+        ...session,
+        status: "closed",
+        closed_at: closedAt,
+        updated_at: closedAt,
+        subtotal: totals.subtotal,
+        discount: totals.discount,
+        tax: totals.tax,
+        service_fee: totals.serviceFee,
+        total: totals.total
+      };
+      state.sessions = state.sessions.filter((entry) => entry.id !== id);
+      state.optimisticSessionStates.delete(id);
+      persistWalkInDrafts();
+      renderAdminLive();
+      return { session, saved, totals };
+    }
     const originalSessions = state.sessions;
     const originalRequests = state.requests;
     state.optimisticSessionStates.set(id, { mode: "remove", session });
@@ -4065,7 +4762,7 @@ const App = (() => {
     const totals = invoice?.totals || sessionTotals(session);
     const items = (invoice?.items || session.session_items || []).filter((item) => item.status !== "cancelled");
     const isPaid = Boolean(invoice);
-    const receiptNumber = invoice?.number || `PRE-${String(session.id).slice(0, 8).toUpperCase()}`;
+    const receiptNumber = invoice?.number || `PRE-${sessionReference(session)}`;
     const issuedAt = new Date(invoice?.createdAt || Date.now());
     const payments = invoice?.payments || [];
     return `<!doctype html>
@@ -4092,7 +4789,7 @@ const App = (() => {
         <div class="rule"></div>
         <div class="meta">
           <span>Documento:</span><strong>${escapeHTML(receiptNumber)}</strong>
-          <span>Mesa:</span><strong>${escapeHTML(tableLabel(session.restaurant_tables))}</strong>
+          <span>Origen:</span><strong>${escapeHTML(sessionLabel(session))}</strong>
           <span>Fecha:</span><strong>${issuedAt.toLocaleDateString("es-CO")}</strong>
           <span>Hora:</span><strong>${issuedAt.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}</strong>
           <span>Responsable:</span><strong>${escapeHTML(session.payer_name || "Consumidor final")}</strong>
@@ -4160,8 +4857,10 @@ const App = (() => {
     const dialog = $("#paymentDialog");
     const form = $("#paymentForm");
     if (!session || !dialog || !form) return;
+    const quickSale = isLocalWalkInSession(session);
+    const activeItems = (session.session_items || []).filter((item) => item.status !== "cancelled");
     const total = sessionTotal(session);
-    if (!(session.session_items || []).some((item) => item.status !== "cancelled")) {
+    if (!activeItems.length && !quickSale) {
       toast("Agrega al menos un consumo antes de cobrar la mesa.", "error", `empty-payment:${sessionId}`);
       return;
     }
@@ -4173,12 +4872,51 @@ const App = (() => {
     setCurrencyInputValue(form.mixed_amount_one, total);
     setCurrencyInputValue(form.mixed_amount_two, 0);
     state.activePaymentTotal = total;
-    $("#paymentTableLabel").textContent = tableLabel(session.restaurant_tables);
+    $("#paymentTableLabel").textContent = sessionLabel(session);
     $("#paymentTotal").textContent = money(total);
+    const paymentLines = $("#paymentSaleLines");
+    if (paymentLines) paymentLines.innerHTML = activeItems.length
+      ? activeItems.map((item) => `<div><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("")
+      : '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
+    const addItemButton = $("#paymentAddItem");
+    if (addItemButton) {
+      addItemButton.hidden = !quickSale;
+      addItemButton.innerHTML = `<i data-lucide="plus"></i> ${activeItems.length ? "Agregar otro producto" : "Agregar producto"}`;
+    }
+    $$('button[type="submit"]', form).forEach((button) => { button.disabled = !activeItems.length; });
+    if ($("#paymentDialogTitle")) $("#paymentDialogTitle").textContent = quickSale ? "Cobrar venta individual" : "Cobrar mesa";
     $("#mixedPaymentFields").hidden = true;
     updateMixedPayment("mixed_amount_one");
     dialog.showModal();
     refreshIcons();
+  };
+
+  const discardLocalWalkInSession = (sessionId) => {
+    const session = state.sessions.find((entry) => entry.id === sessionId);
+    if (!isLocalWalkInSession(session)) return;
+    (session.session_items || []).filter((item) => item.status !== "cancelled").forEach((line, index) => {
+      const product = state.items.find((entry) => entry.id === line.menu_item_id);
+      if (product) applyConsumptionInventoryDelta(product, Number(line.quantity || 0), {
+        eventId: `cancel-walk-in:${session.id}:${line.id}:${index}`,
+        sessionId: session.id,
+        reference: "CANCELAR_VENTA_INDIVIDUAL",
+        movementType: "DEVOLUCION_CONSUMO"
+      });
+    });
+    state.sessions = state.sessions.filter((entry) => entry.id !== session.id);
+    state.optimisticSessionStates.delete(session.id);
+    persistWalkInDrafts();
+    renderAdminLive();
+  };
+
+  const cancelPayment = () => {
+    const sessionId = $("#paymentForm")?.session_id?.value || "";
+    const session = state.sessions.find((entry) => entry.id === sessionId);
+    $("#paymentDialog")?.close();
+    if (isLocalWalkInSession(session)) {
+      discardLocalWalkInSession(sessionId);
+      toast("Venta individual cancelada. El inventario fue restaurado.", "ok", `walk-in-cancelled:${sessionId}`);
+    }
   };
 
   const paymentFromForm = (form) => {
@@ -4207,6 +4945,10 @@ const App = (() => {
       toast("La cuenta ya no esta abierta.", "error", "payment-session-missing");
       return;
     }
+    if (!(session.session_items || []).some((item) => item.status !== "cancelled")) {
+      toast("Agrega al menos un producto antes de cobrar.", "error", `empty-payment:${session.id}`);
+      return;
+    }
     const payment = paymentFromForm(form);
     if (!payment) {
       toast("En pago mixto usa dos medios diferentes y distribuye exactamente el total.", "error", "invalid-mixed-payment");
@@ -4226,13 +4968,15 @@ const App = (() => {
     const createdAt = closed.saved.closed_at || new Date().toISOString();
     const invoice = {
       id: uid(),
-      number: `TN-${new Date(createdAt).toISOString().slice(0, 10).replace(/-/g, "")}-${String(session.id).slice(0, 6).toUpperCase()}`,
+      number: `TN-${new Date(createdAt).toISOString().slice(0, 10).replace(/-/g, "")}-${sessionReference(session)}`,
       sessionId: session.id,
       tableId: session.table_id,
-      table: tableLabel(session.restaurant_tables),
+      table: sessionLabel(session),
+      saleChannel: session.sale_channel || "table",
+      soldByUserId: state.currentUser?.id || session.assigned_waiter_id || null,
       createdAt,
       payerName: session.payer_name || "",
-      waiterName: session.assigned_waiter?.full_name || state.currentUser?.full_name || "",
+      waiterName: state.currentUser?.full_name || session.assigned_waiter?.full_name || "",
       paymentMethod: payment.method,
       payments: payment.payments,
       reference: form.payment_reference.value.trim(),
@@ -4254,13 +4998,15 @@ const App = (() => {
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
   };
 
-  const openConsumptionDialog = (sessionId) => {
+  const openConsumptionDialog = (sessionId = "", { pendingTableId = "", quickCheckout = false } = {}) => {
     const dialog = $("#consumptionDialog");
     const form = $("#consumptionForm");
     if (!dialog || !form) return;
     form.reset();
     form.session_id.value = sessionId;
     form.session_item_id.value = "";
+    form.pending_table_id.value = pendingTableId;
+    form.quick_checkout.value = quickCheckout ? "1" : "0";
     const session = state.sessions.find((entry) => entry.id === sessionId);
     form.payer_name.value = session?.payer_name || "";
     form.quantity.value = "";
@@ -4269,11 +5015,31 @@ const App = (() => {
     if (productSearch) productSearch.value = "";
     const optionalFields = $("#consumptionOptionalFields");
     if (optionalFields) optionalFields.open = false;
+    const table = state.tables.find((entry) => String(entry.id) === String(pendingTableId || session?.table_id));
+    if ($("#consumptionEyebrow")) $("#consumptionEyebrow").textContent = quickCheckout ? "Venta individual" : "Consumo";
+    if ($("#consumptionDialogTitle")) $("#consumptionDialogTitle").textContent = quickCheckout ? "Agregar producto y cobrar" : `Agregar a ${table ? tableLabel(table) : "la cuenta"}`;
+    const submitLabel = $("#consumptionSubmitButton span");
+    if (submitLabel) submitLabel.textContent = quickCheckout ? "Agregar y continuar al cobro" : "Agregar";
     closeConsumptionProductOptions();
     dialog.showModal();
     window.setTimeout(() => {
       productSearch?.focus({ preventScroll: true });
     }, 0);
+  };
+
+  const cancelConsumption = () => {
+    const form = $("#consumptionForm");
+    if (!form) return;
+    const session = state.sessions.find((entry) => entry.id === form.session_id.value);
+    const quickCheckout = form.quick_checkout.value === "1";
+    $("#consumptionDialog")?.close();
+    if (!quickCheckout || !isLocalWalkInSession(session)) return;
+    const hasItems = (session.session_items || []).some((item) => item.status !== "cancelled");
+    if (hasItems) openPaymentDialog(session.id);
+    else {
+      discardLocalWalkInSession(session.id);
+      toast("Venta individual cancelada.", "ok", `walk-in-cancelled:${session.id}`);
+    }
   };
 
   const editConsumption = (sessionId, itemId) => {
@@ -4285,6 +5051,12 @@ const App = (() => {
     form.reset();
     form.session_id.value = session.id;
     form.session_item_id.value = item.id;
+    form.pending_table_id.value = "";
+    form.quick_checkout.value = "0";
+    if ($("#consumptionEyebrow")) $("#consumptionEyebrow").textContent = "Consumo";
+    if ($("#consumptionDialogTitle")) $("#consumptionDialogTitle").textContent = "Editar consumo";
+    const submitLabel = $("#consumptionSubmitButton span");
+    if (submitLabel) submitLabel.textContent = "Guardar cambios";
     form.menu_item_id.value = item.menu_item_id || "";
     form.item_name.value = item.item_name || "";
     form.payer_name.value = session.payer_name || "";
@@ -4300,6 +5072,43 @@ const App = (() => {
     closeConsumptionProductOptions();
     dialog.showModal();
     refreshIcons();
+  };
+
+  const deleteConsumption = async (sessionId, itemId) => {
+    const session = state.sessions.find((entry) => entry.id === sessionId);
+    const item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
+    if (!session || !item) return;
+    if (!window.confirm(`¿Eliminar “${item.item_name}” de esta cuenta?\n\nSi controla inventario, las unidades se devolveran automaticamente.`)) return;
+    const product = state.items.find((entry) => entry.id === item.menu_item_id);
+    const stockAdjustment = product ? applyConsumptionInventoryDelta(product, Number(item.quantity || 0), {
+      eventId: `delete-consumption:${uid()}`,
+      sessionId,
+      reference: "ELIMINAR_CONSUMO",
+      movementType: "DEVOLUCION_CONSUMO"
+    }) : null;
+    const originalSession = session;
+    state.sessions = state.sessions.map((entry) => entry.id === sessionId
+      ? { ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) }
+      : entry);
+    state.accountsRenderSignature = "";
+    renderAdminLive();
+    if (isLocalWalkInSession(session)) {
+      const updatedSession = state.sessions.find((entry) => entry.id === sessionId);
+      state.optimisticSessionStates.set(sessionId, { mode: "upsert", localOnly: true, session: updatedSession });
+      persistWalkInDrafts();
+      toast("Consumo eliminado y existencias corregidas.", "ok", `consumption-deleted:${itemId}`);
+      return;
+    }
+    const saved = await retryQuiet(() => state.sb.from("session_items").update({ status: "cancelled", updated_by_user_id: state.currentUser?.id || null }).eq("id", itemId).select("*").single(), 4);
+    if (!saved) {
+      if (stockAdjustment) applyConsumptionInventoryDelta(product, -stockAdjustment.delta, { eventId: `${stockAdjustment.eventId}:rollback`, reversesEventId: stockAdjustment.eventId, sessionId, reference: "REVERSION_ELIMINACION" });
+      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? originalSession : entry);
+      state.accountsRenderSignature = "";
+      renderAdminLive();
+      toast("No se pudo eliminar el consumo. La cuenta fue restaurada.", "error", `delete-consumption:${itemId}`);
+      return;
+    }
+    toast("Consumo eliminado y existencias corregidas.", "ok", `consumption-deleted:${itemId}`);
   };
 
   const showStockWarning = ({ item, current, change, remaining, minimum, insufficient = false }) => {
@@ -4326,8 +5135,9 @@ const App = (() => {
   };
 
   const addManualConsumption = async (form) => {
-    const sessionId = form.session_id.value;
-    const session = state.sessions.find((entry) => entry.id === sessionId);
+    let sessionId = form.session_id.value;
+    let session = state.sessions.find((entry) => entry.id === sessionId);
+    const pendingTableId = form.pending_table_id.value;
     const selectedItem = state.items.find((item) => item.id === form.menu_item_id.value);
     const name = form.item_name.value.trim() || selectedItem?.name;
     const price = form.unit_price.value.trim() ? currencyInputNumber(form.unit_price) : Number(selectedItem?.price || 0);
@@ -4346,7 +5156,7 @@ const App = (() => {
       form.quantity.focus({ preventScroll: true });
       return;
     }
-    if (!session) return;
+    if (!session && !pendingTableId) return;
     const stockDeltaByProduct = new Map();
     if (previousItem && Object.prototype.hasOwnProperty.call(state.inventoryMeta, previousItem.id)) {
       stockDeltaByProduct.set(previousItem.id, Number(previousLine.quantity || 0));
@@ -4391,6 +5201,17 @@ const App = (() => {
         return;
       }
     }
+    if (!session && pendingTableId) {
+      const table = state.tables.find((entry) => String(entry.id) === String(pendingTableId) && entry.is_active !== false);
+      session = await ensureAdminTableSession(table);
+      if (!session) {
+        toast("No fue posible abrir la cuenta de la mesa. No se descontó inventario.", "error", `open-table-failed:${pendingTableId}`);
+        return;
+      }
+      sessionId = session.id;
+      form.session_id.value = sessionId;
+      form.pending_table_id.value = "";
+    }
     const stockOperationId = uid();
     const appliedStockAdjustments = stockPlan.map((entry, index) => applyConsumptionInventoryDelta(entry.item, entry.delta, {
       eventId: `consumption:${stockOperationId}:${index}`,
@@ -4410,7 +5231,13 @@ const App = (() => {
       updated_by_user_id: state.currentUser?.id || null
     };
     const temporaryId = itemId || `local-${uid()}`;
-    const optimisticItem = { ...payload, id: temporaryId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const optimisticItem = {
+      ...payload,
+      id: temporaryId,
+      created_by_user: previousLine?.created_by_user || state.currentUser,
+      created_at: previousLine?.created_at || new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
     let optimisticSession = session;
     state.sessions = state.sessions.map((entry) => entry.id === sessionId
       ? (optimisticSession = {
@@ -4434,6 +5261,17 @@ const App = (() => {
     });
     $("#consumptionDialog")?.close();
     renderAdminLive();
+    if (isLocalWalkInSession(session)) {
+      state.optimisticSessionStates.set(sessionId, {
+        mode: "upsert",
+        localOnly: true,
+        session: optimisticSession
+      });
+      persistWalkInDrafts();
+      toast(itemId ? "Consumo actualizado." : "Producto agregado a la venta individual.", "ok", `walk-in-consumption:${temporaryId}`);
+      if (form.quick_checkout.value === "1") openPaymentDialog(sessionId);
+      return;
+    }
     void (async () => {
       const sessionSaved = await retryQuiet(
         () => state.sb.from("table_sessions").update({
@@ -4784,6 +5622,13 @@ const App = (() => {
     $("#tableForm")?.addEventListener("input", (event) => {
       if (event.target.name === "table_number") renderTableFormQr();
     });
+    $("#tableForm")?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && event.target.matches('input[name="table_number"], input[name="table_name"]')) {
+        event.preventDefault();
+        event.currentTarget.requestSubmit();
+      }
+    });
+    $("#tableManagerSearch")?.addEventListener("input", renderTableManager);
     $("#categoryForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveCategory(event.currentTarget);
@@ -4803,6 +5648,15 @@ const App = (() => {
       markIncomeRangePreset();
       void loadIncomeReport();
     });
+    $("#incomeEditForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await saveIncomeEdit(event.currentTarget);
+    });
+    $("#moveTableForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const targetTableId = new FormData(event.currentTarget).get("target_table_id");
+      await moveSessionToTable(event.currentTarget.session_id.value, targetTableId);
+    });
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
       state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 350);
@@ -4820,6 +5674,14 @@ const App = (() => {
     $("#inventoryStatusFilter")?.addEventListener("change", (event) => {
       state.inventoryStatusFilter = event.currentTarget.value || "all";
       renderInventory();
+    });
+    $("#movementSearch")?.addEventListener("input", (event) => {
+      state.movementSearch = event.currentTarget.value;
+      renderInventoryMovements();
+    });
+    $("#movementTypeFilter")?.addEventListener("change", (event) => {
+      state.movementTypeFilter = event.currentTarget.value || "all";
+      renderInventoryMovements();
     });
     $("#consumptionForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -4844,6 +5706,20 @@ const App = (() => {
     });
     $("#paymentForm")?.addEventListener("input", (event) => {
       if (event.target.name === "mixed_amount_one" || event.target.name === "mixed_amount_two") updateMixedPayment(event.target.name);
+    });
+    $("#consumptionDialog")?.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      cancelConsumption();
+    });
+    $("#paymentDialog")?.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      cancelPayment();
+    });
+    $("#consumptionDialog")?.addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) cancelConsumption();
+    });
+    $("#paymentDialog")?.addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) cancelPayment();
     });
     const productSearch = $("#consumptionProductSearch");
     productSearch?.addEventListener("input", (event) => {
@@ -4884,6 +5760,30 @@ const App = (() => {
     $("#userForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveUser(event.currentTarget);
+    });
+    $("#adminChatForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = event.currentTarget.message;
+      const body = input.value.trim();
+      if (!body || !state.adminChatSessionId) return;
+      input.value = "";
+      const request = state.requests.find((entry) => state.adminChatRequestIds.includes(entry.id));
+      const table = state.tables.find((entry) => String(entry.id) === String(request?.table_id));
+      const saved = await persistChatMessage("staff", body, { sessionId: state.adminChatSessionId, table });
+      if (saved) broadcastChatEvent("chat-refresh");
+      else toast("No se pudo enviar el mensaje. Intenta nuevamente.", "error", "chat-message-failed");
+    });
+    $("#adminChatDialog")?.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      void finishAdminChat();
+    });
+    $("#adminChatForm")?.elements.message?.addEventListener("input", () => {
+      if (state.adminChatSessionId) broadcastTyping("staff");
+    });
+    $("#adminAiForm")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      askAdminAi(event.currentTarget.question.value);
+      event.currentTarget.reset();
     });
     const waiterTableSearch = $("#waiterTableSearch");
     waiterTableSearch?.addEventListener("input", (event) => {
@@ -4980,7 +5880,11 @@ const App = (() => {
       const target = event.target.closest("button");
       if (!target) return;
       if (target.id === "enableSound") {
-        await unlockAlarm();
+        if (state.soundEnabled) {
+          if (await confirmDisableAlarm()) disableAlarm();
+        } else {
+          await unlockAlarm();
+        }
       }
       if (target.id === "selectAllTableQrs") {
         state.selectedTableQrIds = new Set(state.tables.map((table) => String(table.id)));
@@ -4996,12 +5900,32 @@ const App = (() => {
         await flushAppsScriptOutbox();
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
+      if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.id === "refreshIncomeReport") await loadIncomeReport();
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
-      if (target.id === "newInventoryProduct" || target.id === "cancelInventoryEdit") resetInventoryForm();
+      if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
+      if (target.id === "cancelInventoryEdit") {
+        resetInventoryForm();
+        $("#inventoryDialog")?.close();
+      }
+      if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
+      if (target.id === "closeAdminChat") await finishAdminChat();
+      if (target.id === "finishAdminChat") await finishAdminChat();
+      if (target.id === "newWalkInSale") await createWalkInSale();
+      if (target.id === "paymentAddItem") {
+        const sessionId = $("#paymentForm")?.session_id?.value || "";
+        $("#paymentDialog")?.close();
+        openConsumptionDialog(sessionId, { quickCheckout: true });
+      }
+      if (target.dataset.cancelConsumption !== undefined) cancelConsumption();
+      if (target.dataset.cancelPayment !== undefined) cancelPayment();
+      if (target.dataset.openTable) await openCompactTable(target.dataset.openTable);
       if (target.dataset.acceptRequest) await acceptRequest(target.dataset.acceptRequest);
+      if (target.dataset.openChat) await openAdminChat(target.dataset.openChat);
+      if (target.dataset.adminAiQuestion) askAdminAi(target.dataset.adminAiQuestion);
       if (target.dataset.sendBill) await sendBillToClient(target.dataset.sendBill);
       if (target.dataset.closeSession) await closeSession(target.dataset.closeSession);
+      if (target.dataset.moveSession) openMoveSessionDialog(target.dataset.moveSession);
       if (target.dataset.chargeSession) openPaymentDialog(target.dataset.chargeSession);
       if (target.dataset.printSession) {
         const session = state.sessions.find((entry) => entry.id === target.dataset.printSession);
@@ -5009,6 +5933,13 @@ const App = (() => {
       }
       if (target.dataset.addManual) openConsumptionDialog(target.dataset.addManual);
       if (target.dataset.editConsumption) editConsumption(target.dataset.sessionId, target.dataset.editConsumption);
+      if (target.dataset.deleteConsumption) await deleteConsumption(target.dataset.sessionId, target.dataset.deleteConsumption);
+      if (target.dataset.removeIncomeLine !== undefined) {
+        const line = target.closest("[data-income-line]");
+        const lines = $$('[data-income-line]', $("#incomeEditForm"));
+        if (lines.length <= 1) toast("La venta debe conservar al menos un articulo.", "error", "income-last-line");
+        else line?.remove();
+      }
       if (target.dataset.closeDialog !== undefined) target.closest("dialog")?.close();
       if (target.dataset.copyQr) await copyQr(target.dataset.copyQr);
       if (target.dataset.downloadQr) await downloadQr(target.dataset.downloadQr);
@@ -5024,6 +5955,7 @@ const App = (() => {
       if (target.dataset.editInventory) editInventoryProduct(target.dataset.editInventory);
       if (target.dataset.inventoryAdjust) adjustInventory(target.dataset.inventoryAdjust, Number(target.dataset.adjustment || 0));
       if (target.dataset.editUser) editUser(target.dataset.editUser);
+      if (target.dataset.deleteUser) await deleteUser(target.dataset.deleteUser);
       if (target.dataset.deleteTable) await deleteRow("restaurant_tables", target.dataset.deleteTable, "esta mesa");
       if (target.dataset.deleteCategory) await deleteRow("menu_categories", target.dataset.deleteCategory, "esta categoria");
       if (target.dataset.deleteItem) await deleteRow("menu_items", target.dataset.deleteItem, "este producto");
@@ -5038,10 +5970,13 @@ const App = (() => {
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
+      .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
+      .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
       .subscribe((status) => {
         if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setRealtimeStatus("Respaldo cada 30 segundos", "fallback");
+          setRealtimeStatus("Respaldo cada 5 segundos", "fallback");
         }
       });
     state.subscriptions.push(channel);
@@ -5062,21 +5997,12 @@ const App = (() => {
     ) || null;
   };
 
-  const openScannedTable = async (value) => {
-    let table = tableFromScannedValue(value);
-    if (!table) {
-      await loadCore();
-      table = tableFromScannedValue(value);
-    }
-    if (!table) {
-      toast("No se encontro la mesa seleccionada. Actualiza la pagina e intenta de nuevo.", "error", "unknown-service-table");
-      return;
-    }
-    toast(`${tableLabel(table)} seleccionada.`, "ok", `selected:${table.id}`);
-    let session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
+  const ensureAdminTableSession = async (table) => {
+    if (!table) return null;
+    let session = state.sessions.find((entry) => String(entry.table_id) === String(table.id) && entry.status === "open");
     if (!session) {
       session = await dbQuiet(
-        state.sb.from("table_sessions").select("*")
+        state.sb.from("table_sessions").select("*, session_items(*)")
           .eq("table_id", table.id).eq("status", "open")
           .order("opened_at", { ascending: false }).limit(1).maybeSingle(),
         null
@@ -5087,19 +6013,51 @@ const App = (() => {
         state.sb.from("table_sessions").insert({
           table_id: table.id,
           status: "open",
+          sale_channel: "table",
           assigned_waiter_id: state.currentUser?.id || null
         }).select("*").single(),
         null
       );
-      // Si otro dispositivo abrió la mesa al mismo tiempo, usa la sesión ganadora.
       if (!session) {
         session = await dbQuiet(
-          state.sb.from("table_sessions").select("*")
+          state.sb.from("table_sessions").select("*, session_items(*)")
             .eq("table_id", table.id).eq("status", "open")
             .order("opened_at", { ascending: false }).limit(1).maybeSingle(),
           null
         );
       }
+    }
+    if (!session) return null;
+    session = {
+      ...session,
+      restaurant_tables: table,
+      assigned_waiter: state.currentUser || session.assigned_waiter,
+      session_items: session.session_items || []
+    };
+    state.sessions = [session, ...state.sessions.filter((entry) => entry.id !== session.id)];
+    state.accountsRenderSignature = "";
+    renderAdminLive();
+    return session;
+  };
+
+  const openScannedTable = async (value) => {
+    let table = tableFromScannedValue(value);
+    if (!table) {
+      await loadCore();
+      table = tableFromScannedValue(value);
+    }
+    if (!table) {
+      toast("No se encontro la mesa seleccionada. Actualiza la pagina e intenta de nuevo.", "error", "unknown-service-table");
+      return;
+    }
+    let session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
+    if (!session) {
+      session = await dbQuiet(
+        state.sb.from("table_sessions").select("*, session_items(*)")
+          .eq("table_id", table.id).eq("status", "open")
+          .order("opened_at", { ascending: false }).limit(1).maybeSingle(),
+        null
+      );
     }
     if (session) {
       session = {
@@ -5110,22 +6068,7 @@ const App = (() => {
       };
       state.sessions = [session, ...state.sessions.filter((entry) => entry.id !== session.id)];
     }
-    if (session && state.currentUser?.id && session.assigned_waiter_id !== state.currentUser.id) {
-      session = { ...session, assigned_waiter_id: state.currentUser.id, assigned_waiter: state.currentUser };
-      state.sessions = state.sessions.map((entry) => entry.id === session.id ? session : entry);
-      await dbQuiet(
-        state.sb.from("table_sessions").update({ assigned_waiter_id: state.currentUser.id }).eq("id", session.id).select("*").single(),
-        null
-      );
-    }
-    if (!session) {
-      toast("No fue posible abrir la mesa.", "error", `open-table-failed:${table.id}`);
-      return;
-    }
-    renderAdminLive();
-    history.replaceState(null, "", "#accounts");
-    showAdminSection("accounts");
-    openConsumptionDialog(session.id);
+    openConsumptionDialog(session?.id || "", { pendingTableId: session ? "" : table.id });
   };
 
   const stopQrCamera = () => {
@@ -5501,7 +6444,7 @@ const App = (() => {
               <strong>${escapeHTML(user.full_name)}</strong>
               <span>@${escapeHTML(user.username)} · ${user.role === "admin" ? "Administrador" : "Mesero"} · ${user.is_active ? "Activo" : "Inactivo"}</span>
             </div>
-            <button class="icon-btn" data-edit-user="${user.id}" aria-label="Editar usuario">${icon("pencil", 16)}</button>
+            <div class="row-actions user-row-actions"><button class="icon-btn" data-edit-user="${user.id}" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
           </div>`).join("")
       : emptyState("Sin usuarios", "Crea el equipo operativo.", "users");
     refreshIcons();
@@ -5558,6 +6501,33 @@ const App = (() => {
     form.scrollIntoView({ behavior: "smooth", block: "center" });
   };
 
+  const deleteUser = async (id) => {
+    const user = state.users.find((entry) => entry.id === id);
+    if (!user) return;
+    if (String(user.id) === String(state.currentUser?.id)) {
+      toast("No puedes eliminar el usuario con el que tienes la sesion abierta.", "error", "delete-current-user");
+      return;
+    }
+    if (!window.confirm(`¿Eliminar a ${user.full_name}?\n\nNo podrá volver a iniciar sesión; sus ventas anteriores conservarán el responsable.`)) return;
+    const original = [...state.users];
+    state.users = state.users.filter((entry) => entry.id !== id);
+    renderUsers();
+    const result = await retryQuiet(() => state.sb.rpc("deleteUser", { auth_token: state.authToken, user_id: id }), 3);
+    if (!result?.deleted) {
+      state.users = original;
+      renderUsers();
+      toast("No se pudo eliminar el usuario. La lista fue restaurada.", "error", `delete-user:${id}`);
+      return;
+    }
+    const form = $("#userForm");
+    if (form?.user_id.value === id) {
+      form.reset();
+      form.user_id.value = "";
+      form.is_active.checked = true;
+    }
+    toast("Usuario eliminado. El historial de sus ventas se conserva.", "ok", `user-deleted:${id}`);
+  };
+
   const logoutAdmin = async () => {
     const token = state.authToken;
     state.authToken = "";
@@ -5587,6 +6557,7 @@ const App = (() => {
     startAlarmLoop();
     setLoading(false);
     await loadBootstrap();
+    await ensurePresetCategories();
     renderAdmin();
     showAdminSection(initialSection);
     renderTableFormQr();

@@ -25,7 +25,7 @@ Cada vez que modifique `Code.gs`, edite la implementación y publique una versi�
 - `Ventas`: una fila por factura pagada.
 - `Detalle_Ventas`: productos, costos y utilidad por línea.
 - `Pagos`: efectivo, transferencia y Bre-B por separado.
-- `Movimientos_Inventario`: trazabilidad de cada descuento de existencias.
+- `Movimientos_Inventario`: trazabilidad de entradas, salidas, altas, devoluciones y correcciones con responsable y hora exacta.
 - `Ingresos_Diarios`: acumulado diario por medio de pago, costos y utilidad.
 
 El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer, 7 días, 15 días, mes, 30 días, año o fechas personalizadas. También permite filtrar por efectivo, transferencia, Bre-B y pagos mixtos, buscar facturas o productos y exportar el resultado visible en CSV.
@@ -36,6 +36,8 @@ El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer,
 - Cada producto agregado a una mesa descuenta su existencia inmediatamente; editar el consumo aplica solo la diferencia y un fallo de guardado devuelve las unidades.
 - Al pagar la mesa, el cierre reconoce esos movimientos y no vuelve a descontar el mismo consumo.
 - Una venta cerrada entra primero en una cola local y se sincroniza en segundo plano.
+- Las ventas individuales no crean mesa ni sesión en Supabase: su borrador permanece en el equipo y, al cobrar, Apps Script lo registra en `Ventas`, `Detalle_Ventas`, `Pagos` e `Ingresos_Diarios`.
+- Las ventas cerradas se pueden corregir desde **Ingresos**; el servicio recalcula detalle, pagos, inventario e ingresos diarios y conserva el evento en `Auditoria`.
 - El guardado es idempotente por `sale_id` y `session_id`, por lo que los reintentos no duplican facturas.
 - Después de confirmar la venta completa en el histórico, el servicio elimina de Supabase únicamente esa sesión cerrada, sus consumos y solicitudes.
 - Si no hay conexión, la cola permanece en el dispositivo y reintenta automáticamente.
@@ -43,4 +45,4 @@ El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer,
 
 ## Comprobación rápida
 
-Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.2.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.
+Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.3.1"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.

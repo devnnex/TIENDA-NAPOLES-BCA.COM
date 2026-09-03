@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Admin - Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="style.css?v=20260831-song-9">
+    <link rel="stylesheet" href="style.css?v=20260903-chat-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -34,10 +34,12 @@
       </div>
       <nav>
         <a href="#dashboard"><i data-lucide="layout-dashboard"></i> Inicio</a>
-        <a href="#inventory" data-admin-only><i data-lucide="boxes"></i> Inventario</a>
-        <a href="#service" class="service-nav-link"><i data-lucide="scan-line"></i> Atender mesa <span class="nav-request-badge" id="navRequestBadge" aria-label="Solicitudes pendientes" hidden>0</span></a>
+        <a href="#service" class="service-nav-link"><i data-lucide="scan-line"></i> Atender mesa <span class="nav-request-badge" id="navRequestBadge" role="status" aria-label="Solicitudes pendientes" hidden>0</span></a>
         <a href="#accounts"><i data-lucide="receipt-text"></i> Cuentas</a>
-        <a href="#income" data-admin-only><i data-lucide="chart-no-axes-combined"></i> Ingresos</a>
+        <a href="#inventory" data-admin-only><i data-lucide="boxes"></i> Inventario</a>
+        <a href="#movements" data-admin-only><i data-lucide="arrow-left-right"></i> Movimientos</a>
+        <a href="#income" data-admin-only><i data-lucide="circle-dollar-sign"></i> Ingresos</a>
+        <a href="#assistant" data-admin-only><i data-lucide="sparkles"></i> Asistente IA</a>
         <a href="#menu" data-admin-only><i data-lucide="layout-grid"></i> Mesas</a>
         <a href="#users" data-admin-only><i data-lucide="users"></i> Usuarios</a>
         <a href="#brand" data-admin-only><i data-lucide="paintbrush"></i> Marca</a>
@@ -136,7 +138,7 @@
         </form>
       </section>
 
-      <section class="admin-grid menu-workbench" id="menu" data-admin-section="menu" data-admin-only>
+      <section class="admin-grid menu-workbench menu-workbench-full" id="menu" data-admin-section="menu" data-admin-only>
         <div class="panel menu-tool-card">
           <div class="section-head">
             <div>
@@ -174,6 +176,9 @@
               </button>
             </div>
           </div>
+          <label class="table-manager-search">Buscar mesa
+            <span><i data-lucide="search"></i><input id="tableManagerSearch" type="search" autocomplete="off" placeholder="Numero o nombre de la mesa"></span>
+          </label>
           <div class="manager-list" id="tableManagerList"></div>
         </div>
 
@@ -246,45 +251,7 @@
 
         <div class="inventory-metrics" id="inventoryMetrics"></div>
 
-        <div class="inventory-workbench">
-          <article class="panel inventory-editor">
-            <div class="section-head">
-              <div>
-                <span class="eyebrow">Ficha de producto</span>
-                <h2 id="inventoryFormTitle">Agregar producto</h2>
-              </div>
-              <span class="tool-chip"><i data-lucide="calculator"></i> Calculo automatico</span>
-            </div>
-            <form class="inventory-form" id="inventoryForm">
-              <input type="hidden" name="product_id">
-              <label class="wide">Producto<input name="product_name" type="text" maxlength="100" placeholder="Ej. Cerveza Nacional" required></label>
-              <label>Siglas<input name="product_code" type="text" maxlength="12" placeholder="Se generan: CN"></label>
-              <label>Categoria
-                <select name="category_id" class="js-category-select"><option value="">Sin categoria</option></select>
-              </label>
-              <label class="wide">Nueva categoria<input name="new_category" type="text" maxlength="60" placeholder="Solo si no aparece en la lista"></label>
-              <label>Costo unitario<input name="cost_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
-              <label>Precio de venta<input name="sale_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input required></label>
-              <label>Existencia actual<input name="stock" type="number" min="0" step="0.01" value="0" inputmode="decimal"></label>
-              <label>Stock minimo<input name="min_stock" type="number" min="0" step="0.01" value="5" inputmode="decimal"></label>
-              <label>Unidad
-                <select name="unit">
-                  <option value="unidad">Unidad</option>
-                  <option value="botella">Botella</option>
-                  <option value="lata">Lata</option>
-                  <option value="paquete">Paquete</option>
-                  <option value="porción">Porcion</option>
-                </select>
-              </label>
-              <label class="check"><input name="is_available" type="checkbox" checked> Disponible para vender</label>
-              <div class="inventory-live-calculation wide" id="inventoryLiveCalculation" aria-live="polite"></div>
-              <div class="inventory-form-actions wide">
-                <button class="ghost" id="cancelInventoryEdit" type="button">Limpiar</button>
-                <button class="primary" type="submit"><i data-lucide="save"></i> Guardar producto</button>
-              </div>
-            </form>
-          </article>
-
+        <div class="inventory-workbench inventory-workbench-wide">
           <article class="panel inventory-catalog">
             <div class="inventory-toolbar">
               <label class="inventory-search">
@@ -305,6 +272,34 @@
         </div>
       </section>
 
+      <section class="inventory-section" id="movements" data-admin-section="movements" data-admin-only>
+        <div class="section-head inventory-heading">
+          <div>
+            <span class="eyebrow">Auditoria exacta</span>
+            <h2>Movimientos de inventario</h2>
+            <p>Entradas, salidas, productos nuevos y devoluciones con fecha, hora y responsable.</p>
+          </div>
+          <button class="primary" id="refreshInventoryMovements" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
+        </div>
+        <div class="movement-summary" id="movementSummary"></div>
+        <div class="panel movement-panel">
+          <div class="inventory-toolbar">
+            <label class="inventory-search">
+              <span>Buscar producto, referencia o responsable</span>
+              <span class="inventory-search-control"><i data-lucide="search"></i><input id="movementSearch" type="search" autocomplete="off" placeholder="Ej. cerveza, venta o nombre"></span>
+            </label>
+            <label>Tipo
+              <select id="movementTypeFilter">
+                <option value="all">Todos</option>
+                <option value="entry">Entradas</option>
+                <option value="exit">Salidas</option>
+              </select>
+            </label>
+          </div>
+          <div class="movement-list" id="inventoryMovementList"></div>
+        </div>
+      </section>
+
       <section class="income-section" id="income" data-admin-section="income" data-admin-only>
         <div class="section-head income-heading">
           <div>
@@ -319,7 +314,7 @@
         </div>
 
         <div class="panel income-filter-panel">
-          <div class="income-range-presets" aria-label="Rangos rápidos">
+          <div class="income-range-presets" role="group" aria-label="Rangos rápidos">
             <button type="button" data-income-range="today">Hoy</button>
             <button type="button" data-income-range="yesterday">Ayer</button>
             <button type="button" data-income-range="7days">7 días</button>
@@ -381,18 +376,28 @@
             <h2>Seleccionar y atender mesa</h2>
           </div>
         </div>
-        <form class="service-table-picker" id="waiterTableForm">
-          <label for="waiterTableSearch">Seleccionar mesa</label>
-          <div class="smart-table-combobox" id="waiterTableCombobox">
-            <span class="smart-table-search">
-              <i data-lucide="search"></i>
-              <input id="waiterTableSearch" type="search" inputmode="search" autocomplete="off" placeholder="Buscar mesa" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="waiterTableOptions">
-            </span>
-            <div class="smart-table-options" id="waiterTableOptions" role="listbox" aria-label="Mesas disponibles" hidden></div>
-          </div>
-          <small class="table-search-status" id="waiterTableSearchStatus" aria-live="polite">Cargando mesas...</small>
-          <p><i data-lucide="mouse-pointer-click"></i> Toca una mesa o escribe su numero y presiona Enter para agregar el consumo.</p>
-        </form>
+        <div class="service-sales-layout">
+          <article class="service-tables-panel">
+            <div class="service-block-title"><span><i data-lucide="armchair"></i></span><div><strong>Ventas por mesa</strong><small>Verde libre, amarillo con cuenta abierta</small></div></div>
+            <div class="compact-tables-grid" id="waiterTablesGrid"></div>
+          </article>
+          <article class="walk-in-sale-card">
+            <span class="walk-in-icon"><i data-lucide="shopping-bag"></i></span>
+            <div><span class="eyebrow">Venta rapida</span><h3>Cliente individual</h3><p>Sin ocupar mesa. Al cobrar se guarda en el historico de Apps Script y Google Sheets.</p></div>
+            <button class="primary" id="newWalkInSale" type="button"><i data-lucide="plus"></i> Nueva venta individual</button>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel admin-assistant-section" id="assistant" data-admin-section="assistant" data-admin-only>
+        <div class="section-head">
+          <div><span class="eyebrow">Analista del negocio</span><h2>Asistente inteligente</h2><p>Consulta ventas, productos, responsables e inventario con lenguaje natural.</p></div>
+        </div>
+        <div class="admin-ai-layout">
+          <div class="admin-ai-suggestions" id="adminAiSuggestions"></div>
+          <div class="admin-ai-chat" id="adminAiChat" aria-live="polite"></div>
+          <form class="admin-ai-form" id="adminAiForm"><input name="question" type="text" autocomplete="off" placeholder="Ej. ¿Cuantas cervezas se vendieron hoy?" required><button class="primary" type="submit"><i data-lucide="send"></i><span>Consultar</span></button></form>
+        </div>
       </section>
 
       <section class="panel" id="users" data-admin-section="users" data-admin-only>
@@ -419,12 +424,14 @@
       <form class="modal-card" id="consumptionForm">
         <input type="hidden" name="session_id">
         <input type="hidden" name="session_item_id">
+        <input type="hidden" name="pending_table_id">
+        <input type="hidden" name="quick_checkout" value="0">
         <div class="section-head">
           <div>
-            <span class="eyebrow">Consumo</span>
-            <h2>Agregar a la cuenta</h2>
+            <span class="eyebrow" id="consumptionEyebrow">Consumo</span>
+            <h2 id="consumptionDialogTitle">Agregar a la cuenta</h2>
           </div>
-          <button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar">
+          <button class="icon-btn" type="button" data-cancel-consumption aria-label="Cerrar">
             <i data-lucide="x"></i>
           </button>
         </div>
@@ -436,6 +443,7 @@
               <input id="consumptionProductSearch" type="search" autocomplete="off" placeholder="Buscar por nombre o siglas (CN)" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="consumptionProductOptions">
             </span>
             <input name="menu_item_id" id="consumptionItem" type="hidden">
+            <!-- [html-validate-disable-next prefer-native-element] -->
             <div class="product-combobox-options" id="consumptionProductOptions" role="listbox" hidden></div>
           </div>
           <small id="consumptionProductHint">Selecciona un producto del inventario o escribe un consumo personalizado.</small>
@@ -453,8 +461,8 @@
           </div>
         </details>
         <div class="modal-actions">
-          <button class="ghost" type="button" data-close-dialog>Cancelar</button>
-          <button class="primary" type="submit"><i data-lucide="plus"></i> Agregar</button>
+          <button class="ghost" type="button" data-cancel-consumption>Cancelar</button>
+          <button class="primary" id="consumptionSubmitButton" type="submit"><i data-lucide="plus"></i> <span>Agregar</span></button>
         </div>
       </form>
     </dialog>
@@ -473,8 +481,8 @@
           <span><small>Existencia restante</small><strong id="stockWarningRemaining">0</strong></span>
         </div>
         <div class="modal-actions">
-          <button class="ghost" id="stockWarningCancel" value="cancel">Cancelar</button>
-          <button class="primary" id="stockWarningConfirm" value="confirm">Agregar de todas formas</button>
+          <button class="ghost" id="stockWarningCancel" type="submit" value="cancel">Cancelar</button>
+          <button class="primary" id="stockWarningConfirm" type="submit" value="confirm">Agregar de todas formas</button>
         </div>
       </form>
     </dialog>
@@ -485,9 +493,9 @@
         <div class="section-head">
           <div>
             <span class="eyebrow">Caja y facturacion</span>
-            <h2>Cobrar mesa</h2>
+            <h2 id="paymentDialogTitle">Cobrar mesa</h2>
           </div>
-          <button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button>
+          <button class="icon-btn" type="button" data-cancel-payment aria-label="Cerrar"><i data-lucide="x"></i></button>
         </div>
 
         <div class="payment-summary">
@@ -495,6 +503,9 @@
           <strong id="paymentTotal">$0</strong>
           <small>El total se valida antes de cerrar la cuenta.</small>
         </div>
+
+        <div class="payment-sale-lines" id="paymentSaleLines"></div>
+        <button class="ghost payment-add-item" id="paymentAddItem" type="button" hidden><i data-lucide="plus"></i> Agregar otro producto</button>
 
         <fieldset class="payment-methods">
           <legend>Forma de pago</legend>
@@ -530,16 +541,70 @@
 
         <label>Referencia o nota (opcional)<input name="payment_reference" type="text" maxlength="100" placeholder="Ultimos 4 digitos, comprobante, observacion..."></label>
         <div class="modal-actions payment-actions">
-          <button class="ghost" type="button" data-close-dialog>Cancelar</button>
+          <button class="ghost" type="button" data-cancel-payment>Cancelar</button>
           <button class="ghost" type="submit" name="receipt_action" value="save"><i data-lucide="badge-check"></i> Cobrar sin imprimir</button>
           <button class="primary" type="submit" name="receipt_action" value="print"><i data-lucide="printer"></i> Cobrar e imprimir</button>
         </div>
       </form>
     </dialog>
 
+    <dialog class="modal inventory-product-modal" id="inventoryDialog">
+      <form class="modal-card inventory-editor" id="inventoryForm">
+        <input type="hidden" name="product_id">
+        <div class="section-head"><div><span class="eyebrow">Ficha de producto</span><h2 id="inventoryFormTitle">Agregar producto</h2></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <div class="inventory-form">
+          <label class="wide">Producto<input name="product_name" type="text" maxlength="100" placeholder="Ej. Cerveza Nacional" required></label>
+          <label>Siglas<input name="product_code" type="text" maxlength="12" placeholder="Se generan: CN"></label>
+          <label>Categoria<select name="category_id" class="js-category-select"><option value="">Elegir categoria</option></select></label>
+          <label class="wide">Nueva categoria<input name="new_category" type="text" maxlength="60" list="inventoryCategoryPresets" placeholder="Snack, Bebidas, Medicina u Otros"></label>
+          <datalist id="inventoryCategoryPresets"><option value="Snack"></option><option value="Bebidas"></option><option value="Medicina"></option><option value="Otros"></option></datalist>
+          <label>Costo unitario<input name="cost_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+          <label>Precio de venta<input name="sale_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input required></label>
+          <label>Existencia actual<input name="stock" type="number" min="0" step="0.01" value="" inputmode="decimal" placeholder="Escribe la existencia"></label>
+          <label>Stock minimo<input name="min_stock" type="number" min="0" step="0.01" value="5" inputmode="decimal"></label>
+          <label>Unidad<select name="unit"><option value="unidad">Unidad</option><option value="botella">Botella</option><option value="lata">Lata</option><option value="paquete">Paquete</option><option value="porcion">Porcion</option></select></label>
+          <label class="check"><input name="is_available" type="checkbox" checked> Disponible para vender</label>
+          <div class="inventory-live-calculation wide" id="inventoryLiveCalculation" aria-live="polite"></div>
+          <div class="inventory-form-actions wide"><button class="ghost" id="cancelInventoryEdit" type="button">Cancelar</button><button class="primary" type="submit"><i data-lucide="save"></i> Guardar producto</button></div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal move-table-modal" id="moveTableDialog">
+      <form class="modal-card" id="moveTableForm">
+        <input type="hidden" name="session_id">
+        <div class="section-head"><div><span class="eyebrow">Organizar salon</span><h2>Cambiar cuenta de mesa</h2><p id="moveTableHint">Selecciona la nueva mesa.</p></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <div class="move-table-options" id="moveTableOptions"></div>
+        <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Cancelar</button><button class="primary" type="submit"><i data-lucide="replace"></i> Cambiar mesa</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="modal" id="alarmConfirmDialog">
+      <form class="modal-card confirm-card" method="dialog"><span class="confirm-icon"><i data-lucide="volume-x"></i></span><div><span class="eyebrow">Alarma del equipo</span><h2>¿Desactivar la alarma?</h2><p>Dejaras de oir los llamados y avisos por voz hasta volver a activarla.</p></div><div class="modal-actions"><button class="ghost" type="submit" value="cancel">Mantener activa</button><button class="danger-button" type="submit" value="confirm">Si, desactivar</button></div></form>
+    </dialog>
+
+    <dialog class="modal admin-chat-modal" id="adminChatDialog">
+      <form class="modal-card admin-chat-card" id="adminChatForm">
+        <div class="section-head"><div><span class="eyebrow">Conversacion en vivo</span><h2 id="adminChatTitle">Chat con cliente</h2><small id="adminChatPresence">Conectando...</small></div><button class="icon-btn" id="closeAdminChat" type="button" aria-label="Finalizar y borrar chat"><i data-lucide="x"></i></button></div>
+        <div class="live-chat-thread" id="adminChatMessages"></div><div class="typing-indicator" id="adminChatTyping" hidden><i></i><i></i><i></i><span>El cliente esta escribiendo</span></div>
+        <div class="admin-chat-composer"><input name="message" type="text" maxlength="600" autocomplete="off" placeholder="Escribe una respuesta..." required><button class="primary" type="submit" aria-label="Enviar"><i data-lucide="send"></i></button></div>
+        <button class="ghost danger-text" id="finishAdminChat" type="button"><i data-lucide="log-out"></i> Finalizar y borrar chat</button>
+      </form>
+    </dialog>
+
+    <dialog class="modal income-edit-modal" id="incomeEditDialog">
+      <form class="modal-card" id="incomeEditForm">
+        <input type="hidden" name="sale_id">
+        <div class="section-head"><div><span class="eyebrow">Correccion auditada</span><h2>Editar venta cerrada</h2></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <div class="form-grid"><label>Origen / mesa<input name="table" type="text" maxlength="80" required></label><label>Responsable<input name="payer" type="text" maxlength="100"></label><label>Vendido por<input name="waiter" type="text" maxlength="100"></label><label>Fecha y hora<input name="date" type="datetime-local" required></label><label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option><option value="mixed">Conservar pago mixto</option></select></label><label>Referencia<input name="reference" type="text" maxlength="100"></label></div>
+        <div class="income-edit-lines" id="incomeEditLines"></div>
+        <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Cancelar</button><button class="primary" type="submit"><i data-lucide="save"></i> Guardar correccion</button></div>
+      </form>
+    </dialog>
+
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260831-song-13"></script>
+    <script src="app.js?v=20260903-chat-1"></script>
   </body>
 </html>

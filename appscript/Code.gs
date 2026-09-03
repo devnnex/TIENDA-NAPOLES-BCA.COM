@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.2.0",
+  version: "2.3.1",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -143,11 +143,19 @@ function apiRequest(payloadText) {
     var payload = request.payload || {};
     var result;
     if (request.action === "get_inventory") result = getInventory_();
+    else if (request.action === "get_inventory_movements") {
+      requireAdmin_(user);
+      result = getInventoryMovements_(payload.limit);
+    }
     else if (request.action === "get_income_report") {
       requireAdmin_(user);
       result = getIncomeReport_(payload.filters || {});
     }
     else if (request.action === "record_sale") result = recordSale_(payload.invoice, user, request.authToken);
+    else if (request.action === "edit_sale") {
+      requireAdmin_(user);
+      result = editSale_(payload.invoice, user);
+    }
     else if (request.action === "adjust_inventory") result = adjustInventory_(payload.adjustment, user);
     else if (request.action === "delete_inventory") {
       requireAdmin_(user);
@@ -281,6 +289,31 @@ function getInventory_() {
   return { items: items, syncedAt: new Date().toISOString() };
 }
 
+function getInventoryMovements_(requestedLimit) {
+  var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
+  var rows = readSheetRows_(sheet, HEADERS.movements.length);
+  var limit = Math.min(2000, Math.max(50, asNumber_(requestedLimit) || 800));
+  return {
+    movements: rows.slice(-limit).map(function (row) {
+      return {
+        movementId: String(row[0] || ""),
+        productId: String(row[1] || ""),
+        code: String(row[2] || ""),
+        product: String(row[3] || "Producto"),
+        type: String(row[4] || "MOVIMIENTO"),
+        delta: asNumber_(row[5]),
+        before: asNumber_(row[6]),
+        after: asNumber_(row[7]),
+        unitCost: asNumber_(row[8]),
+        reference: String(row[9] || row[10] || ""),
+        sessionId: String(row[10] || ""),
+        date: row[11] instanceof Date ? row[11].toISOString() : String(row[11] || ""),
+        user: String(row[12] || "Sistema")
+      };
+    })
+  };
+}
+
 function getIncomeReport_(filters) {
   var spreadsheet = getSpreadsheet_();
   var timezone = getTimezone_();
@@ -316,6 +349,8 @@ function getIncomeReport_(filters) {
     if (!saleId) return;
     if (!detailsBySale[saleId]) detailsBySale[saleId] = [];
     detailsBySale[saleId].push({
+      lineId: String(row[2] || ""),
+      menuItemId: String(row[3] || ""),
       name: String(row[4] || "Producto"),
       quantity: asNumber_(row[5]),
       unitPrice: asNumber_(row[6]),
@@ -439,9 +474,21 @@ function upsertInventory_(item, user) {
     var rowIndex = findInventoryIndex_(table.rows, item.productId);
     var current = rowIndex >= 0 ? table.rows[rowIndex] : null;
     var next = inventoryObjectToRow_(item, current);
+    var beforeStock = current ? asNumber_(current[7]) : 0;
+    var afterStock = asNumber_(next[7]);
+    var stockDelta = afterStock - beforeStock;
     if (rowIndex >= 0) table.rows[rowIndex] = next;
     else table.rows.push(next);
     writeInventoryRows_(table.sheet, table.rows);
+    if (!current || stockDelta !== 0) {
+      var movementType = safeText_(item.movementType) || (current ? (stockDelta > 0 ? "ENTRADA_EDICION" : "SALIDA_EDICION") : "NUEVO_PRODUCTO");
+      var movementEventId = safeText_(item.movementEventId) || ("UPSERT-" + safeText_(item.productId) + "-" + new Date().getTime());
+      appendRows_(getSpreadsheet_().getSheetByName(APP.sheets.movements), [[
+        movementEventId, safeText_(item.productId), safeText_(next[1]),
+        safeText_(next[2]), movementType, stockDelta, beforeStock, afterStock, asNumber_(next[5]), safeText_(item.movementReference || "FICHA_PRODUCTO"), "",
+        new Date().toISOString(), safeText_(user.full_name || user.username)
+      ]]);
+    }
     appendAudit_("INVENTORY_UPSERT", item.productId, user.full_name || user.username, "OK", item.name || "Producto");
     return { item: inventoryRowToObject_(next), items: table.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
   });
@@ -496,7 +543,8 @@ function adjustInventory_(adjustment, user) {
       };
     }
     var now = String(adjustment.occurredAt || new Date().toISOString());
-    var movementType = delta < 0 ? "CONSUMO_MESA" : "DEVOLUCION_CONSUMO";
+    var requestedType = String(adjustment.movementType || "").trim().toUpperCase();
+    var movementType = requestedType || (delta < 0 ? "CONSUMO_MESA" : "DEVOLUCION_CONSUMO");
     currentRow[7] = after;
     currentRow[10] = now;
     currentRow[11] = movementType + " " + eventId;
@@ -505,7 +553,7 @@ function adjustInventory_(adjustment, user) {
     appendRows_(movementsSheet, [[
       safeText_(eventId), productId, safeText_(currentRow[1] || adjustment.code),
       safeText_(currentRow[2] || adjustment.name), movementType, delta, before, after,
-      asNumber_(currentRow[5]), "", safeText_(adjustment.sessionId), now,
+      asNumber_(currentRow[5]), safeText_(adjustment.reference), safeText_(adjustment.sessionId), now,
       safeText_(user.full_name || user.username)
     ]]);
     appendAudit_("INVENTORY_CONSUMPTION", eventId, user.full_name || user.username, "OK", movementType + " " + delta);
@@ -548,7 +596,7 @@ function recordSale_(invoice, user, authToken) {
     var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
     if (saleExists_(salesSheet, saleId, sessionId)) {
       updateDailyIncome_(spreadsheet.getSheetByName(APP.sheets.daily), invoice, invoiceCostFromInventory_(invoice), saleId);
-      archiveSupabaseSession_(sessionId, authToken);
+      if (invoice.saleChannel !== "walk_in") archiveSupabaseSession_(sessionId, authToken);
       return { duplicate: true, saleId: saleId, archivedSessionId: sessionId, items: getInventory_().items };
     }
 
@@ -559,7 +607,7 @@ function recordSale_(invoice, user, authToken) {
       safeText_(invoice.createdAt || now), safeText_(invoice.payerName), safeText_(invoice.waiterName),
       asNumber_(totals.subtotal), asNumber_(totals.discount), asNumber_(totals.tax),
       asNumber_(totals.serviceFee), asNumber_(totals.total), safeText_(invoice.paymentMethod),
-      safeText_(invoice.reference), "Supabase/Panel", now
+      safeText_(invoice.reference), invoice.saleChannel === "walk_in" ? "Venta individual/AppScript" : "Supabase/Panel", now
     ]];
 
     var inventoryTable = readInventoryTable_();
@@ -652,7 +700,7 @@ function recordSale_(invoice, user, authToken) {
     }
     appendRows_(salesSheet, saleRow);
     updateDailyIncome_(spreadsheet.getSheetByName(APP.sheets.daily), invoice, totalCost, saleId);
-    archiveSupabaseSession_(sessionId, authToken);
+    if (invoice.saleChannel !== "walk_in") archiveSupabaseSession_(sessionId, authToken);
     CacheService.getScriptCache().put("sale_" + hash_(saleId + "|" + sessionId), "1", 21600);
     appendAudit_("SALE", saleId, user.full_name || user.username, "OK", safeText_(invoice.number));
     return {
@@ -665,14 +713,125 @@ function recordSale_(invoice, user, authToken) {
   });
 }
 
+function writeDataRows_(sheet, rows, width) {
+  var previous = Math.max(0, sheet.getLastRow() - 1);
+  if (rows.length) sheet.getRange(2, 1, rows.length, width).setValues(rows);
+  if (previous > rows.length) sheet.getRange(rows.length + 2, 1, previous - rows.length, width).clearContent();
+}
+
+function editSale_(invoice, user) {
+  if (!invoice || !invoice.id || !invoice.totals || !Array.isArray(invoice.items) || !invoice.items.length) throw new Error("Correccion de venta incompleta.");
+  return withScriptLock_(function () {
+    var spreadsheet = getSpreadsheet_();
+    var saleId = safeText_(invoice.id);
+    var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
+    var detailsSheet = spreadsheet.getSheetByName(APP.sheets.details);
+    var paymentsSheet = spreadsheet.getSheetByName(APP.sheets.payments);
+    var movementsSheet = spreadsheet.getSheetByName(APP.sheets.movements);
+    var sales = readSheetRows_(salesSheet, HEADERS.sales.length);
+    var saleIndex = -1;
+    for (var index = 0; index < sales.length; index += 1) if (String(sales[index][0] || "") === saleId) { saleIndex = index; break; }
+    if (saleIndex < 0) throw new Error("No se encontro la venta que deseas corregir.");
+
+    var oldDetails = readSheetRows_(detailsSheet, HEADERS.details.length);
+    var oldSaleDetails = oldDetails.filter(function (row) { return String(row[0] || "") === saleId; });
+    var oldQuantityByProduct = {};
+    oldSaleDetails.forEach(function (row) {
+      var productId = String(row[3] || "");
+      if (productId) oldQuantityByProduct[productId] = asNumber_(oldQuantityByProduct[productId]) + asNumber_(row[5]);
+    });
+    var newQuantityByProduct = {};
+    invoice.items.forEach(function (line) {
+      var productId = safeText_(line.menu_item_id);
+      if (productId) newQuantityByProduct[productId] = asNumber_(newQuantityByProduct[productId]) + Math.max(0, asNumber_(line.quantity));
+    });
+
+    var inventory = readInventoryTable_();
+    var editMovements = [];
+    var productIds = {};
+    Object.keys(oldQuantityByProduct).concat(Object.keys(newQuantityByProduct)).forEach(function (id) { productIds[id] = true; });
+    Object.keys(productIds).forEach(function (productId) {
+      var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
+      if (inventoryIndex < 0) return;
+      var row = inventory.rows[inventoryIndex];
+      var delta = asNumber_(oldQuantityByProduct[productId]) - asNumber_(newQuantityByProduct[productId]);
+      if (!delta) return;
+      var before = asNumber_(row[7]);
+      var after = before + delta;
+      if (after < 0) throw new Error("La correccion requiere mas existencias de " + String(row[2] || "un producto") + " de las disponibles.");
+      row[7] = after;
+      row[10] = new Date().toISOString();
+      row[11] = "CORRECCION_VENTA " + saleId;
+      row[12] = asNumber_(row[12]) + 1;
+      inventory.rows[inventoryIndex] = row;
+      editMovements.push(["EDIT-" + saleId + "-" + productId + "-" + new Date().getTime(), productId, safeText_(row[1]), safeText_(row[2]), "CORRECCION_VENTA", delta, before, after, asNumber_(row[5]), safeText_(invoice.number), safeText_(invoice.sessionId), new Date().toISOString(), safeText_(user.full_name || user.username)]);
+    });
+    writeInventoryRows_(inventory.sheet, inventory.rows);
+    appendRows_(movementsSheet, editMovements);
+
+    var totals = invoice.totals || {};
+    var sale = sales[saleIndex];
+    sale[1] = safeText_(invoice.number || sale[1]);
+    sale[4] = safeText_(invoice.table);
+    sale[5] = safeText_(invoice.createdAt);
+    sale[6] = safeText_(invoice.payerName);
+    sale[7] = safeText_(invoice.waiterName);
+    sale[8] = asNumber_(totals.subtotal);
+    sale[9] = asNumber_(totals.discount);
+    sale[10] = asNumber_(totals.tax);
+    sale[11] = asNumber_(totals.serviceFee);
+    sale[12] = asNumber_(totals.total);
+    sale[13] = safeText_(invoice.paymentMethod);
+    sale[14] = safeText_(invoice.reference);
+    sale[16] = new Date().toISOString();
+    sales[saleIndex] = sale;
+    writeDataRows_(salesSheet, sales, HEADERS.sales.length);
+
+    var nextDetails = oldDetails.filter(function (row) { return String(row[0] || "") !== saleId; });
+    invoice.items.forEach(function (line) {
+      var inventoryIndex = findInventoryIndex_(inventory.rows, line.menu_item_id);
+      var cost = inventoryIndex >= 0 ? asNumber_(inventory.rows[inventoryIndex][5]) : 0;
+      var quantity = Math.max(0, asNumber_(line.quantity));
+      var price = Math.max(0, asNumber_(line.unit_price));
+      nextDetails.push([saleId, safeText_(invoice.number), safeText_(line.id), safeText_(line.menu_item_id), safeText_(line.item_name), quantity, price, quantity * price, cost, quantity * cost, quantity * (price - cost)]);
+    });
+    writeDataRows_(detailsSheet, nextDetails, HEADERS.details.length);
+
+    var oldPayments = readSheetRows_(paymentsSheet, HEADERS.payments.length).filter(function (row) { return String(row[0] || "") !== saleId; });
+    (invoice.payments || []).forEach(function (payment) { oldPayments.push([saleId, safeText_(invoice.number), safeText_(payment.method), asNumber_(payment.amount), safeText_(invoice.reference), safeText_(invoice.createdAt)]); });
+    writeDataRows_(paymentsSheet, oldPayments, HEADERS.payments.length);
+    rebuildDailyIncome_(spreadsheet);
+    appendAudit_("SALE_EDIT", saleId, user.full_name || user.username, "OK", "Venta corregida desde el panel");
+    return { saleId: saleId, corrected: true, items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
+  });
+}
+
+function rebuildDailyIncome_(spreadsheet) {
+  var dailySheet = spreadsheet.getSheetByName(APP.sheets.daily);
+  if (dailySheet.getLastRow() > 1) dailySheet.getRange(2, 1, dailySheet.getLastRow() - 1, HEADERS.daily.length).clearContent();
+  var sales = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.sales), HEADERS.sales.length);
+  var details = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length);
+  var payments = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length);
+  sales.forEach(function (row) {
+    var saleId = String(row[0] || "");
+    if (!saleId) return;
+    var invoice = { id: saleId, createdAt: row[5], totals: { subtotal: asNumber_(row[8]), discount: asNumber_(row[9]), tax: asNumber_(row[10]), serviceFee: asNumber_(row[11]), total: asNumber_(row[12]) }, payments: payments.filter(function (payment) { return String(payment[0] || "") === saleId; }).map(function (payment) { return { method: String(payment[2] || ""), amount: asNumber_(payment[3]) }; }) };
+    var cost = details.filter(function (detail) { return String(detail[0] || "") === saleId; }).reduce(function (sum, detail) { return sum + asNumber_(detail[9]); }, 0);
+    updateDailyIncome_(dailySheet, invoice, cost, saleId);
+  });
+}
+
 function archiveSupabaseSession_(sessionId, authToken) {
-  if (!sessionId) return;
+  // Las ventas individuales se originan y cierran en Apps Script. Solo las
+  // sesiones UUID de mesas necesitan la limpieza remota de Supabase.
+  if (!sessionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(sessionId))) return false;
   var config = getConfig_();
   var baseUrl = config.supabaseUrl.replace(/\/$/, "") + "/rest/v1/";
   var encodedSession = encodeURIComponent(sessionId);
   deleteSupabaseRows_(baseUrl + "service_requests?session_id=eq." + encodedSession, authToken, config);
   deleteSupabaseRows_(baseUrl + "session_items?session_id=eq." + encodedSession, authToken, config);
   deleteSupabaseRows_(baseUrl + "table_sessions?id=eq." + encodedSession + "&status=eq.closed", authToken, config);
+  return true;
 }
 
 function deleteSupabaseRows_(url, authToken, config) {
