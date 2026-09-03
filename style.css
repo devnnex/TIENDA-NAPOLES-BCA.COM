@@ -778,6 +778,8 @@ button:hover, .primary:hover, .ghost:hover, .icon-btn:hover, .chip:hover {
 
 .assistant-message.user {
   justify-self: end;
+  margin-right: 0;
+  margin-left: auto;
   color: #17191f;
   background: #fff;
   border-bottom-right-radius: 6px;
@@ -4014,7 +4016,13 @@ button:disabled {
 .typing-indicator i:nth-child(3) { animation-delay: .28s; }
 .typing-indicator span { margin-left: .3rem; }
 @keyframes typingDot { 0%, 60%, 100% { transform: translateY(0); opacity: .45; } 30% { transform: translateY(-4px); opacity: 1; } }
-.assistant-message.staff { margin-left: auto; color: #fff; background: #3f246f; }
+.assistant-message.staff {
+  margin-right: auto;
+  margin-left: 0;
+  color: #fff;
+  background: #3f246f;
+  border-bottom-left-radius: 6px;
+}
 .assistant-message.staff small { display: block; margin-bottom: .2rem; opacity: .72; font-size: .62rem; }
 .assistant-message.system {
   align-self: center;
