@@ -6452,40 +6452,52 @@ const App = (() => {
 
   const saveUser = async (form) => {
     const isEditing = Boolean(form.user_id.value);
+    const fullName = form.full_name.value.trim();
     const username = form.username.value.trim().toLowerCase();
     const pin = form.pin.value.trim();
-    if (!/^[a-z0-9._-]{3,40}$/.test(username) || (!isEditing && !/^\d{4,12}$/.test(pin)) || (pin && !/^\d{4,12}$/.test(pin))) {
+    if (!fullName || !/^[a-z0-9._-]{3,40}$/.test(username) || (!isEditing && !/^\d{4,12}$/.test(pin)) || (pin && !/^\d{4,12}$/.test(pin))) {
       toast("Revisa el usuario y usa un PIN numerico de 4 a 12 digitos.", "error", "invalid-user-fields");
       return;
     }
     const payload = {
       auth_token: state.authToken,
       id: form.user_id.value || uid(),
-      full_name: form.full_name.value.trim(),
+      full_name: fullName,
       username,
       pin,
       role: form.role.value,
       is_active: form.is_active.checked
     };
-    const temporaryId = payload.id;
-    const optimistic = { ...payload, id: temporaryId };
-    const original = [...state.users];
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    let saved = null;
+    let saveError = null;
+    try {
+      const result = await state.sb.rpc("saveUser", payload);
+      saved = result.data;
+      saveError = result.error;
+    } catch (error) {
+      saveError = error;
+    } finally {
+      if (submit) submit.disabled = false;
+    }
+    if (saveError || !saved?.id) {
+      toast(saveError?.message || "No se pudo guardar el usuario.", "error", "save-user-failed");
+      return;
+    }
     state.users = isEditing
-      ? state.users.map((user) => user.id === payload.id ? { ...user, ...optimistic } : user)
-      : [...state.users, optimistic];
+      ? state.users.map((user) => user.id === saved.id ? saved : user)
+      : [...state.users, saved].sort((left, right) => String(left.full_name).localeCompare(String(right.full_name), "es"));
+    if (String(saved.id) === String(state.currentUser?.id)) {
+      state.currentUser = saved;
+      localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(saved));
+      applyCurrentUser();
+    }
     form.reset();
     form.user_id.value = "";
     form.is_active.checked = true;
     renderUsers();
-    const saved = await retryQuiet(() => state.sb.rpc("saveUser", payload), 3);
-    if (!saved) {
-      state.users = original;
-      renderUsers();
-      toast("No se pudo guardar el usuario. Se restauro la lista.", "error", "save-user-failed");
-      return;
-    }
-    state.users = state.users.map((user) => user.id === temporaryId || user.id === saved.id ? saved : user);
-    renderUsers();
+    toast(isEditing ? `Usuario actualizado${pin ? " con nuevo PIN" : ""}.` : "Usuario creado correctamente.", "ok", `user-saved:${saved.id}`);
   };
 
   const editUser = (id) => {
@@ -6509,16 +6521,21 @@ const App = (() => {
       return;
     }
     if (!window.confirm(`¿Eliminar a ${user.full_name}?\n\nNo podrá volver a iniciar sesión; sus ventas anteriores conservarán el responsable.`)) return;
-    const original = [...state.users];
-    state.users = state.users.filter((entry) => entry.id !== id);
-    renderUsers();
-    const result = await retryQuiet(() => state.sb.rpc("deleteUser", { auth_token: state.authToken, user_id: id }), 3);
-    if (!result?.deleted) {
-      state.users = original;
-      renderUsers();
-      toast("No se pudo eliminar el usuario. La lista fue restaurada.", "error", `delete-user:${id}`);
+    let result = null;
+    let deleteError = null;
+    try {
+      const response = await state.sb.rpc("deleteUser", { auth_token: state.authToken, user_id: id });
+      result = response.data;
+      deleteError = response.error;
+    } catch (error) {
+      deleteError = error;
+    }
+    if (deleteError || !result?.deleted) {
+      toast(deleteError?.message || "No se pudo eliminar el usuario.", "error", `delete-user:${id}`);
       return;
     }
+    state.users = state.users.filter((entry) => entry.id !== id);
+    renderUsers();
     const form = $("#userForm");
     if (form?.user_id.value === id) {
       form.reset();
