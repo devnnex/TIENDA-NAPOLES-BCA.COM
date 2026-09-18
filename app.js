@@ -3600,6 +3600,13 @@ const App = (() => {
   const renderServicePoints = () => {
     const box = $("#servicePointsGrid");
     if (!box) return;
+    const otherZone = state.activeServiceZone === "bar" ? "planter" : "bar";
+    const hasActivePoints = state.tables.some((table) => table.is_active !== false && servicePointKind(table) === state.activeServiceZone);
+    const hasOtherPoints = state.tables.some((table) => table.is_active !== false && servicePointKind(table) === otherZone);
+    if (!hasActivePoints && hasOtherPoints) {
+      state.activeServiceZone = otherZone;
+      localStorage.setItem(SERVICE_ZONE_STORAGE_KEY, state.activeServiceZone);
+    }
     $$('[data-service-zone]').forEach((button) => {
       const active = button.dataset.serviceZone === state.activeServiceZone;
       button.classList.toggle("is-active", active);
