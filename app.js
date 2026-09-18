@@ -6099,11 +6099,7 @@ const App = (() => {
     $("#paymentDialog")?.close();
     renderInventory();
     renderTips();
-    if (shouldPrint) {
-      if (!printThermalReceipt(session, invoice, receiptWindow)) openReceiptResult(session, invoice);
-    } else {
-      openReceiptResult(session, invoice);
-    }
+    if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
   };
