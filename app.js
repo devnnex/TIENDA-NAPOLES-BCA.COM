@@ -1,15 +1,18 @@
 const SYNC_INTERVAL_MS = 5000;
+const CHAT_SYNC_INTERVAL_MS = 1200;
 
 const SUPABASE_CONFIG = {
   url: "https://izvcbkwgtciuoampunba.supabase.co",
   anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml6dmNia3dndGNpdW9hbXB1bmJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc0MzEzMzIsImV4cCI6MjEwMzAwNzMzMn0.cA7GCGeA-140TginBpEHPULKJrEDkpt3ixAMuAwzoPY"
 };
 
+// Al duplicar una instalación se pega a veces la URL REST completa. supabase-js
+// necesita solo el origen del proyecto y construye internamente /rest/v1.
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbwggVntPjHXjdQgwOLPjlIjzgKVE7DGBfq6M8GCdDPLdvnJkN-nQBS190xnOE_gFtGi/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbzG7bSHYEjNAV0hXgTUX43ydzDFufw8IAJ31ZneZWcTbpDktI8lSli4YqeGxhWn9SjWtA/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.3.1";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.6.0";
 
 const SupabaseDb = (() => {
   let authToken = "";
@@ -81,6 +84,11 @@ const App = (() => {
   const INVENTORY_MOVEMENTS_STORAGE_KEY = "tienda_napoles_inventory_movements_v1";
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
+  const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
+  const TIP_SETTINGS_STORAGE_KEY = "tienda_napoles_tip_settings_v1";
+  const TIP_SPLIT_STORAGE_KEY = "tienda_napoles_tip_split_people_v1";
+  const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
+  const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
   const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
   const REQUEST_IMAGES = {
     waiter: "images/mesero.png",
@@ -269,7 +277,14 @@ const App = (() => {
     incomeRangePreset: "today",
     incomeSearchTimer: null,
     productPickerMatches: [],
+    consumptionDrafts: [],
     activePaymentTotal: 0,
+    activePaymentBase: 0,
+    activePaymentTip: 0,
+    tipSettings: { enabled: false, percentage: 10 },
+    tipSplitPeople: 1,
+    paymentProcessing: false,
+    lastPaidReceipt: null,
     appsScriptOutboxBusy: false,
     appsScriptOutboxTimer: null,
     alertFilter: "all",
@@ -288,6 +303,7 @@ const App = (() => {
     speechFinish: null,
     alertRenderSignature: null,
     accountsRenderSignature: null,
+    activeAccountDetailId: "",
     adminSnapshotSignature: "",
     clientSnapshotSignature: "",
     visibleToastKeys: new Set(),
@@ -297,8 +313,14 @@ const App = (() => {
     adminPollTimer: null,
     adminSyncBusy: false,
     activeAdminSection: "dashboard",
+    pwaBrandSignature: "",
+    pwaBrandSyncToken: 0,
+    pwaManifestObjectUrl: "",
+    pwaIconObjectUrls: [],
+    pwaRegistrationPromise: null,
     qrCache: new Map(),
     selectedTableQrIds: new Set(),
+    activeServiceZone: localStorage.getItem(SERVICE_ZONE_STORAGE_KEY) === "planter" ? "planter" : "bar",
     tableRenderSignature: "",
     assistantMessages: [],
     assistantThreads: { bar: [], song: [] },
@@ -520,6 +542,17 @@ const App = (() => {
 
   const tableLabel = (table) => table?.table_name || `Mesa ${table?.table_number || ""}`.trim();
 
+  const servicePointKind = (table) => {
+    const name = normalizeText(table?.table_name || "");
+    if (/^barra\s+\d+$/.test(name)) return "bar";
+    if (/^matera\s+\d+$/.test(name)) return "planter";
+    return "";
+  };
+
+  const isServicePoint = (table) => Boolean(servicePointKind(table));
+
+  const normalTables = () => state.tables.filter((table) => !isServicePoint(table));
+
   const sessionLabel = (session) => session?.sale_channel === "walk_in" || !session?.table_id
     ? "Venta individual"
     : tableLabel(session?.restaurant_tables);
@@ -603,7 +636,8 @@ const App = (() => {
   };
 
   const showAdminSection = (section = "dashboard") => {
-    if (state.currentUser?.role === "waiter" && ["brand", "menu", "inventory", "movements", "income", "assistant", "users"].includes(section)) section = "service";
+    if (section === "tips" && !tipsEnabled()) section = state.currentUser?.role === "waiter" ? "service" : "accounts";
+    if (state.currentUser?.role === "waiter" && !["service", "accounts", "tips"].includes(section)) section = "service";
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -612,29 +646,33 @@ const App = (() => {
       const target = link.getAttribute("href")?.replace("#", "");
       link.classList.toggle("active", target === section);
     });
-    if (section === "dashboard") {
-      renderAlerts();
-      renderTables();
-    }
-    if (section === "accounts") renderAccounts();
-    if (section === "service") renderServiceTables();
-    if (section === "menu") {
-      renderTableManager();
-      renderTableFormQr();
-    }
-    if (section === "inventory") renderInventory();
-    if (section === "movements") {
-      renderInventoryMovements();
-      void loadInventoryMovements();
-    }
-    if (section === "income") {
-      initializeIncomeFilters();
-      renderIncomeReport();
-      void loadIncomeReport();
-    }
-    if (section === "users") renderUsers();
-    if (section === "assistant") renderAdminAi();
-    refreshIcons();
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      if (state.activeAdminSection !== section) return;
+      if (section === "dashboard") {
+        renderAlerts();
+        renderTables();
+      }
+      if (section === "accounts") renderAccounts();
+      if (section === "tips") renderTips();
+      if (section === "service") renderServiceTables();
+      if (section === "menu") {
+        renderTableManager();
+        renderTableFormQr();
+      }
+      if (section === "inventory") renderInventory();
+      if (section === "movements") {
+        renderInventoryMovements();
+        void loadInventoryMovements();
+      }
+      if (section === "income") {
+        initializeIncomeFilters();
+        renderIncomeReport();
+        void loadIncomeReport();
+      }
+      if (section === "users") renderUsers();
+      if (section === "assistant") renderAdminAi();
+      refreshIcons();
+    }));
   };
 
   const findTableFromUrl = () => {
@@ -643,9 +681,11 @@ const App = (() => {
     if (!raw) return null;
     const table = state.tables.find(
       (table) =>
-        String(table.table_number) === String(raw) ||
-        String(table.qr_code).toLowerCase() === String(raw).toLowerCase() ||
-        String(table.id) === String(raw)
+        !isServicePoint(table) && (
+          String(table.table_number) === String(raw) ||
+          String(table.qr_code).toLowerCase() === String(raw).toLowerCase() ||
+          String(table.id) === String(raw)
+        )
     );
     state.qrLocked = Boolean(table);
     state.tableLocked = state.qrLocked;
@@ -875,6 +915,168 @@ const App = (() => {
     return true;
   };
 
+  const pwaAssetUrl = (name) => new URL(name, document.baseURI).href;
+
+  const pwaBrandVersion = (value) => Array.from(String(value || "")).reduce(
+    (hash, character) => ((hash << 5) - hash + character.charCodeAt(0)) | 0,
+    0
+  ).toString(36).replace("-", "n");
+
+  const registerPwa = () => {
+    if (state.pwaRegistrationPromise) return state.pwaRegistrationPromise;
+    const localHost = ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+    if (!("serviceWorker" in navigator) || (location.protocol !== "https:" && !localHost)) {
+      state.pwaRegistrationPromise = Promise.resolve(null);
+      return state.pwaRegistrationPromise;
+    }
+    state.pwaRegistrationPromise = navigator.serviceWorker.register("./service-worker.js", { scope: "./" })
+      .catch(() => null);
+    return state.pwaRegistrationPromise;
+  };
+
+  const waitForPwaController = async () => {
+    if (!("serviceWorker" in navigator)) return false;
+    if (navigator.serviceWorker.controller) return true;
+    await new Promise((resolve) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        navigator.serviceWorker.removeEventListener("controllerchange", finish);
+        resolve();
+      };
+      navigator.serviceWorker.addEventListener("controllerchange", finish, { once: true });
+      window.setTimeout(finish, 2500);
+    });
+    return Boolean(navigator.serviceWorker.controller);
+  };
+
+  const loadPwaLogo = (url) => new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("No se pudo preparar el logo para la instalación."));
+    image.src = url;
+  });
+
+  const pwaIconBlob = async (logoUrl, size) => {
+    const image = await loadPwaLogo(logoUrl);
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("El navegador no puede generar el icono de instalación.");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, size, size);
+    const safeArea = size * .76;
+    const scale = Math.min(safeArea / image.naturalWidth, safeArea / image.naturalHeight);
+    const width = image.naturalWidth * scale;
+    const height = image.naturalHeight * scale;
+    context.drawImage(image, (size - width) / 2, (size - height) / 2, width, height);
+    return new Promise((resolve, reject) => canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error("No se pudo convertir el logo en icono.")),
+      "image/png"
+    ));
+  };
+
+  const replacePwaManifestLink = (href) => {
+    const current = $("#appManifest");
+    if (!current || current.href === href) return;
+    current.href = href;
+  };
+
+  const syncPwaBranding = async () => {
+    if (!state.business) return;
+    const name = String(state.business.business_name || "Tienda Nápoles").trim() || "Tienda Nápoles";
+    const logoUrl = String(state.business.logo_url || "").trim();
+    const themeColor = String(state.business.accent_color || "#f05a28");
+    const signature = `${name}|${logoUrl}|${themeColor}`;
+    if (signature === state.pwaBrandSignature) return;
+    state.pwaBrandSignature = signature;
+    const syncToken = ++state.pwaBrandSyncToken;
+    const version = pwaBrandVersion(signature);
+    const themeMeta = $("#pwaThemeColor");
+    if (themeMeta) themeMeta.content = themeColor;
+
+    state.pwaIconObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+    state.pwaIconObjectUrls = [];
+    let icon192 = null;
+    let icon512 = null;
+    if (logoUrl) {
+      try {
+        [icon192, icon512] = await Promise.all([pwaIconBlob(logoUrl, 192), pwaIconBlob(logoUrl, 512)]);
+      } catch (error) {
+        icon192 = null;
+        icon512 = null;
+      }
+    }
+    if (syncToken !== state.pwaBrandSyncToken) return;
+
+    let iconEntries = [
+      { src: "./pwa-icon.svg", sizes: "192x192", type: "image/svg+xml", purpose: "any maskable" },
+      { src: "./pwa-icon.svg", sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" }
+    ];
+    if (icon192 && icon512) {
+      const faviconUrl = URL.createObjectURL(icon192);
+      const largeIconUrl = URL.createObjectURL(icon512);
+      state.pwaIconObjectUrls = [faviconUrl, largeIconUrl];
+      if ($("#appFavicon")) {
+        $("#appFavicon").href = faviconUrl;
+        $("#appFavicon").type = "image/png";
+      }
+      if ($("#appleTouchIcon")) $("#appleTouchIcon").href = faviconUrl;
+      if ("caches" in window) {
+        const cache = await caches.open(PWA_BRAND_CACHE);
+        await Promise.all([
+          cache.put(pwaAssetUrl("pwa-icon-192.png"), new Response(icon192, { headers: { "Content-Type": "image/png", "Cache-Control": "no-store" } })),
+          cache.put(pwaAssetUrl("pwa-icon-512.png"), new Response(icon512, { headers: { "Content-Type": "image/png", "Cache-Control": "no-store" } }))
+        ]);
+      }
+      iconEntries = [
+        { src: `./pwa-icon-192.png?v=${version}`, sizes: "192x192", type: "image/png", purpose: "any maskable" },
+        { src: `./pwa-icon-512.png?v=${version}`, sizes: "512x512", type: "image/png", purpose: "any maskable" }
+      ];
+    } else if (logoUrl) {
+      if ($("#appFavicon")) $("#appFavicon").href = logoUrl;
+      if ($("#appleTouchIcon")) $("#appleTouchIcon").href = logoUrl;
+      iconEntries = [{ src: logoUrl, sizes: "any", purpose: "any maskable" }];
+    }
+
+    const manifest = {
+      id: "./admin.html",
+      name,
+      short_name: Array.from(name).slice(0, 15).join(""),
+      description: "Administración y servicio a la mesa",
+      lang: "es-CO",
+      start_url: "./admin.html",
+      scope: "./",
+      display: "standalone",
+      background_color: "#ffffff",
+      theme_color: themeColor,
+      prefer_related_applications: false,
+      icons: iconEntries
+    };
+    const manifestText = JSON.stringify(manifest);
+    if ("caches" in window) {
+      const cache = await caches.open(PWA_BRAND_CACHE);
+      await cache.put(pwaAssetUrl("pwa-manifest.webmanifest"), new Response(manifestText, {
+        headers: { "Content-Type": "application/manifest+json", "Cache-Control": "no-store" }
+      }));
+    }
+    if (syncToken !== state.pwaBrandSyncToken) return;
+    await registerPwa();
+    const controlled = await waitForPwaController();
+    if (syncToken !== state.pwaBrandSyncToken) return;
+    if (controlled) {
+      replacePwaManifestLink(`${pwaAssetUrl("pwa-manifest.webmanifest")}?v=${version}`);
+      return;
+    }
+    if (state.pwaManifestObjectUrl) URL.revokeObjectURL(state.pwaManifestObjectUrl);
+    state.pwaManifestObjectUrl = URL.createObjectURL(new Blob([manifestText], { type: "application/manifest+json" }));
+    replacePwaManifestLink(state.pwaManifestObjectUrl);
+  };
+
   const renderBrand = () => {
     const logo = state.business?.logo_url
       ? `<img src="${escapeHTML(state.business.logo_url)}" alt="${escapeHTML(state.business.business_name)}" class="brand-logo">`
@@ -892,6 +1094,7 @@ const App = (() => {
     if (cover && state.business?.cover_url) {
       cover.style.backgroundImage = `linear-gradient(180deg, rgba(12,13,17,.40), rgba(12,13,17,.88)), url('${state.business.cover_url}')`;
     }
+    if (state.business) void syncPwaBranding();
   };
 
   const renderTablePicker = () => {
@@ -921,7 +1124,7 @@ const App = (() => {
       <label for="tableSelect">Selecciona tu mesa</label>
       <select id="tableSelect">
         <option value="">Mesa</option>
-        ${state.tables
+        ${normalTables()
           .filter((table) => table.is_active)
           .map((table) => `<option value="${escapeHTML(table.id)}">${escapeHTML(tableLabel(table))}</option>`)
           .join("")}
@@ -1006,7 +1209,8 @@ const App = (() => {
           <strong>${money(subtotal)}</strong>
         </div>
         <div class="account-list">
-          ${state.sessionItems
+          ${[...state.sessionItems]
+            .sort((left, right) => new Date(right.created_at || right.updated_at || 0) - new Date(left.created_at || left.updated_at || 0))
             .map(
               (item) => `
                 <div class="account-row">
@@ -1209,6 +1413,17 @@ const App = (() => {
     }
   };
 
+  const playAdminChatReceipt = async () => {
+    if (!state.soundEnabled) return;
+    const audio = new Audio(RECEIPT_SOUND);
+    audio.volume = 1;
+    try {
+      await audio.play();
+    } catch (error) {
+      // El navegador puede bloquear el sonido hasta que se active la alarma.
+    }
+  };
+
   const latestClientBill = () =>
     state.clientRequests.find(
       (request) =>
@@ -1387,6 +1602,10 @@ const App = (() => {
     state.invoiceHistory = Array.isArray(invoices) ? invoices : [];
     const movements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, []);
     state.inventoryMovements = Array.isArray(movements) ? movements : [];
+    const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
+    const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
+    state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
+    state.tipSplitPeople = Math.min(100, Math.max(1, Number(localStorage.getItem(TIP_SPLIT_STORAGE_KEY) || 1)));
     if (state.page === "admin") loadWalkInDrafts();
   };
 
@@ -1433,6 +1652,14 @@ const App = (() => {
       localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(state.invoiceHistory.slice(-1000)));
     } catch (error) {
       toast("La venta se cerro, pero no se pudo guardar el historial local.", "error", "invoice-storage-failed");
+    }
+  };
+
+  const persistTipSettings = () => {
+    try {
+      localStorage.setItem(TIP_SETTINGS_STORAGE_KEY, JSON.stringify(state.tipSettings));
+    } catch (error) {
+      toast("No se pudo guardar la configuración de propina en este equipo.", "error", "tip-settings-storage-failed");
     }
   };
 
@@ -1515,6 +1742,27 @@ const App = (() => {
     breb: "Bre-B",
     mixed: "Pago mixto"
   }[method] || "Pago");
+
+  const openCashDrawer = async () => {
+    const bridge = window.posCashDrawer;
+    const status = $("#cashDrawerStatus");
+    if (!bridge || typeof bridge.open !== "function") {
+      if (status) status.textContent = "No se detecto un puente local compatible con el cajon.";
+      toast("El cajón no está configurado en este equipo. Revisa la conexión del cajón con el punto de venta.", "error", "cash-drawer-unavailable");
+      return false;
+    }
+    try {
+      const result = await bridge.open({ source: "tienda-napoles-pos", requestedAt: new Date().toISOString() });
+      if (result === false) throw new Error("El controlador rechazo la apertura.");
+      if (status) status.textContent = "Orden de apertura enviada correctamente.";
+      toast("Orden de apertura enviada al cajon.", "ok", "cash-drawer-opened");
+      return true;
+    } catch (error) {
+      if (status) status.textContent = "El controlador no pudo abrir el cajon.";
+      toast(String(error?.message || "No se pudo abrir el cajon."), "error", "cash-drawer-failed");
+      return false;
+    }
+  };
 
   const getAppsScriptUrl = () => String(APPS_SCRIPT_CONFIG.webAppUrl || "").trim();
 
@@ -1630,7 +1878,7 @@ const App = (() => {
       createdAt: new Date().toISOString()
     };
     const existingIndex = jobs.findIndex((entry) => entry.dedupeKey === dedupeKey);
-    if (existingIndex >= 0 && action === "upsert_inventory") jobs[existingIndex] = job;
+    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock"].includes(action)) jobs[existingIndex] = job;
     else if (existingIndex < 0) jobs.push(job);
     writeAppsScriptOutbox(jobs);
     if (isAppsScriptConfigured()) void flushAppsScriptOutbox();
@@ -1658,6 +1906,8 @@ const App = (() => {
             ? entry.payload?.item?.productId
             : entry.action === "adjust_inventory"
               ? entry.payload?.adjustment?.productId
+              : entry.action === "set_inventory_stock"
+                ? entry.payload?.productId
               : ""
         ).filter(Boolean));
         const applyFreshRemoteInventory = () => {
@@ -1728,7 +1978,7 @@ const App = (() => {
       });
       if (!result?.ok) throw new Error(result?.error || "No fue posible inicializar el respaldo remoto.");
       if (String(result.version || "") !== APPS_SCRIPT_REQUIRED_VERSION) {
-        toast(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para activar movimientos y correccion de ventas cerradas.`, "error", "appscript-version-required");
+        toast(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para activar movimientos, correcciones y reinicios completos.`, "error", "appscript-version-required");
       }
       setInventorySyncStatus("Respaldo remoto listo", "synced", "cloud-check");
       await syncInventoryWithAppsScript();
@@ -2120,7 +2370,10 @@ const App = (() => {
     const result = await dbQuiet(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)), null);
     const messages = Array.isArray(result) ? result : result?.messages;
     if (!Array.isArray(messages)) return false;
-    const sortedMessages = messages.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+    const currentMessages = state.page === "client"
+      ? state.chatMessages
+      : state.adminChats.get(String(sessionId))?.messages || [];
+    const sortedMessages = mergeChatMessageList(currentMessages, messages);
     if (state.page === "client") {
       const currentSessionId = String(sessionId);
       if (state.clientChatSoundSessionId !== currentSessionId) {
@@ -2147,7 +2400,17 @@ const App = (() => {
     } else {
       const chat = state.adminChats.get(String(sessionId));
       if (!chat) return false;
+      const knownIds = new Set(currentMessages.map((message) => message.id));
+      const incomingClientMessages = sortedMessages.filter((message) => message.sender_type === "client" && !knownIds.has(message.id));
       chat.messages = sortedMessages;
+      if (chat.initialized && incomingClientMessages.length) {
+        if (chat.minimized) {
+          if (!chat.unreadBoundaryId) chat.unreadBoundaryId = incomingClientMessages[0].id;
+          chat.unreadCount += incomingClientMessages.length;
+        }
+        void playAdminChatReceipt();
+      }
+      chat.initialized = true;
       renderAdminChat(sessionId);
     }
     return true;
@@ -2156,19 +2419,44 @@ const App = (() => {
   const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable } = {}) => {
     const clean = String(body || "").trim().replace(/\s+/g, " ").slice(0, 600);
     if (!clean || !sessionId) return null;
+    const messageId = uid();
     const payload = {
       ...chatRpcPayload(sessionId, table),
-      p_message_id: uid(),
+      p_message_id: messageId,
       p_sender_type: senderType,
       p_body: clean
     };
+    mergeChatMessages([{
+      id: messageId,
+      session_id: sessionId,
+      sender_type: senderType,
+      body: clean,
+      created_at: new Date().toISOString(),
+      pending: true
+    }], sessionId);
+    if (state.page === "client") renderAssistant();
+    else renderAdminChat(sessionId);
     const result = await retryQuiet(() => state.sb.rpc("sendChatMessage", payload), 3);
     const message = result?.message || result;
     if (message?.id) {
+      if (state.page === "client") state.chatMessages = state.chatMessages.filter((entry) => entry.id !== messageId);
+      else {
+        const chat = state.adminChats.get(String(sessionId));
+        if (chat) chat.messages = chat.messages.filter((entry) => entry.id !== messageId);
+      }
       mergeChatMessages([message], sessionId);
       if (state.page === "client") renderAssistant();
       else renderAdminChat(sessionId);
       return message;
+    }
+    await loadChatMessages(sessionId, table);
+    if (state.page === "client") {
+      state.chatMessages = state.chatMessages.filter((entry) => entry.id !== messageId || !entry.pending);
+      renderAssistant();
+    } else {
+      const chat = state.adminChats.get(String(sessionId));
+      if (chat) chat.messages = chat.messages.filter((entry) => entry.id !== messageId || !entry.pending);
+      renderAdminChat(sessionId);
     }
     return null;
   };
@@ -2211,7 +2499,13 @@ const App = (() => {
     const chat = state.adminChats.get(String(sessionId || ""));
     const target = chat?.element?.querySelector("[data-admin-chat-messages]");
     if (!chat || !target) return;
-    target.innerHTML = chat.messages.length ? chat.messages.map((message) => `<div class="live-chat-message ${escapeHTML(message.sender_type || "system")}"><span>${escapeHTML(message.sender_name || (message.sender_type === "staff" ? "Equipo" : message.sender_type === "client" ? "Cliente" : "Sistema"))}</span><p>${escapeHTML(message.body || "")}</p><small>${escapeHTML(prettyDateTime(message.created_at))}</small></div>`).join("") : emptyState("Conversacion nueva", "Los mensajes apareceran aqui en tiempo real.", "messages-square");
+    target.innerHTML = chat.messages.length ? chat.messages.map((message) => `${message.id === chat.unreadBoundaryId ? `<div class="admin-chat-unread-divider"><span>Mensajes no leídos</span></div>` : ""}<div class="live-chat-message ${escapeHTML(message.sender_type || "system")}${message.pending ? " is-pending" : ""}"><span>${escapeHTML(message.sender_name || (message.sender_type === "staff" ? "Equipo" : message.sender_type === "client" ? "Cliente" : "Sistema"))}</span><p>${escapeHTML(message.body || "")}</p><small>${message.pending ? "Enviando..." : escapeHTML(prettyDateTime(message.created_at))}</small></div>`).join("") : emptyState("Conversacion nueva", "Los mensajes apareceran aqui en tiempo real.", "messages-square");
+    const unreadBadge = chat.element.querySelector("[data-admin-chat-unread]");
+    if (unreadBadge) {
+      unreadBadge.hidden = !chat.unreadCount;
+      unreadBadge.textContent = chat.unreadCount > 99 ? "99+" : String(chat.unreadCount);
+      unreadBadge.setAttribute("aria-label", `${chat.unreadCount} mensaje${chat.unreadCount === 1 ? "" : "s"} no leído${chat.unreadCount === 1 ? "" : "s"}`);
+    }
     const dot = chat.element.querySelector("[data-admin-chat-online-dot]");
     const presence = chat.element.querySelector("[data-admin-chat-presence]");
     dot?.classList.toggle("is-online", Boolean(chat.connected));
@@ -2226,11 +2520,45 @@ const App = (() => {
     const windowElement = document.createElement("article");
     windowElement.className = "admin-chat-window";
     windowElement.dataset.adminChatWindow = chat.sessionId;
-    windowElement.innerHTML = `<header class="admin-chat-window-head"><div><span class="eyebrow">Conversacion en vivo</span><h2><span class="admin-chat-online-dot" data-admin-chat-online-dot aria-hidden="true"></span>${escapeHTML(tableLabel(chat.table))}</h2><small data-admin-chat-presence>Conectando...</small></div><button class="icon-btn" type="button" data-finish-admin-chat="${escapeHTML(chat.sessionId)}" aria-label="Finalizar y borrar chat"><i data-lucide="x"></i></button></header><div class="live-chat-thread" data-admin-chat-messages></div><div class="typing-indicator" data-admin-chat-typing hidden><i></i><i></i><i></i><span>El cliente esta escribiendo</span></div><form class="admin-chat-form" data-admin-chat-form="${escapeHTML(chat.sessionId)}"><div class="admin-chat-composer"><input name="message" type="text" maxlength="600" autocomplete="off" placeholder="Escribe una respuesta..." required><button class="primary" type="submit" aria-label="Enviar"><i data-lucide="send"></i></button></div></form><button class="ghost danger-text admin-chat-finish" type="button" data-finish-admin-chat="${escapeHTML(chat.sessionId)}"><i data-lucide="log-out"></i> Finalizar y borrar chat</button>`;
+    windowElement.innerHTML = `<header class="admin-chat-window-head" data-restore-admin-chat="${escapeHTML(chat.sessionId)}"><div><span class="eyebrow">Conversacion en vivo</span><h2><span class="admin-chat-online-dot" data-admin-chat-online-dot aria-hidden="true"></span>${escapeHTML(tableLabel(chat.table))}<span class="admin-chat-unread-badge" data-admin-chat-unread hidden>0</span></h2><small data-admin-chat-presence>Conectando...</small></div><div class="admin-chat-head-actions"><button class="icon-btn" type="button" data-minimize-admin-chat="${escapeHTML(chat.sessionId)}" aria-label="Minimizar chat" title="Minimizar"><i data-lucide="minus"></i></button><button class="icon-btn" type="button" data-finish-admin-chat="${escapeHTML(chat.sessionId)}" aria-label="Finalizar y borrar chat" title="Finalizar"><i data-lucide="x"></i></button></div></header><div class="live-chat-thread" data-admin-chat-messages></div><div class="typing-indicator" data-admin-chat-typing hidden><i></i><i></i><i></i><span>El cliente esta escribiendo</span></div><form class="admin-chat-form" data-admin-chat-form="${escapeHTML(chat.sessionId)}"><div class="admin-chat-composer"><input name="message" type="text" maxlength="600" autocomplete="off" placeholder="Escribe una respuesta..." required><button class="primary" type="submit" aria-label="Enviar"><i data-lucide="send"></i></button></div></form><button class="ghost danger-text admin-chat-finish" type="button" data-finish-admin-chat="${escapeHTML(chat.sessionId)}"><i data-lucide="log-out"></i> Finalizar y borrar chat</button>`;
     dock.prepend(windowElement);
     chat.element = windowElement;
     refreshIcons();
     return windowElement;
+  };
+
+  const setAdminChatMinimized = (sessionId, minimized) => {
+    const chat = state.adminChats.get(String(sessionId || ""));
+    if (!chat?.element) return;
+    chat.minimized = Boolean(minimized);
+    if (chat.minimized) {
+      chat.unreadCount = 0;
+      chat.unreadBoundaryId = "";
+    } else {
+      chat.unreadCount = 0;
+    }
+    chat.element.classList.toggle("is-minimized", chat.minimized);
+    if (chat.minimized) {
+      chat.element.setAttribute("role", "button");
+      chat.element.setAttribute("tabindex", "0");
+      chat.element.setAttribute("aria-label", `Abrir chat de ${tableLabel(chat.table)}`);
+    } else {
+      chat.element.removeAttribute("role");
+      chat.element.removeAttribute("tabindex");
+      chat.element.removeAttribute("aria-label");
+    }
+    const button = chat.element.querySelector("[data-minimize-admin-chat]");
+    if (button) {
+      button.innerHTML = icon(chat.minimized ? "maximize-2" : "minus", 18);
+      button.setAttribute("aria-label", chat.minimized ? "Restaurar chat" : "Minimizar chat");
+      button.title = chat.minimized ? "Restaurar" : "Minimizar";
+    }
+    if (!chat.minimized) {
+      renderAdminChat(chat.sessionId);
+      chat.element.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+      window.requestAnimationFrame(() => chat.element?.querySelector('input[name="message"]')?.focus({ preventScroll: true }));
+    }
+    refreshIcons();
   };
 
   const subscribeAdminChat = (chat, joinNotice) => {
@@ -2246,6 +2574,8 @@ const App = (() => {
         renderAdminChat(chat.sessionId);
         if (chat.connected) broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice }, chat.sessionId);
       });
+    window.clearInterval(chat.pollTimer);
+    chat.pollTimer = window.setInterval(() => void loadChatMessages(chat.sessionId, chat.table), CHAT_SYNC_INTERVAL_MS);
   };
 
   const openAdminChat = async (requestIds) => {
@@ -2260,13 +2590,14 @@ const App = (() => {
     let chat = state.adminChats.get(sessionId);
     if (chat) {
       ids.forEach((id) => chat.requestIds.add(id));
+      setAdminChatMinimized(sessionId, false);
       chat.element?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
       chat.element?.querySelector('input[name="message"]')?.focus();
       await loadChatMessages(sessionId, chat.table);
       acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
       return;
     }
-    chat = { sessionId, tableId: request.table_id, table, requestIds: new Set(ids), messages: [], channel: null, element: null, connected: false, peerTyping: false, closing: false };
+    chat = { sessionId, tableId: request.table_id, table, requestIds: new Set(ids), messages: [], channel: null, pollTimer: null, element: null, connected: false, peerTyping: false, closing: false, confirming: false, minimized: false, initialized: false, unreadCount: 0, unreadBoundaryId: "" };
     state.adminChats.set(sessionId, chat);
     createAdminChatWindow(chat);
     renderAdminChat(sessionId);
@@ -2299,6 +2630,7 @@ const App = (() => {
       await broadcastChatEvent("chat-closed", {}, targetSessionId);
       state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
       if (chat.channel) state.sb.removeChannel(chat.channel);
+      window.clearInterval(chat.pollTimer);
       window.clearTimeout(state.adminChatTypingTimers.get(targetSessionId));
       state.adminChatTypingTimers.delete(targetSessionId);
       chat.element?.remove();
@@ -2314,6 +2646,22 @@ const App = (() => {
       chat.closing = false;
       closeButtons.forEach((button) => { button.disabled = false; });
     }
+  };
+
+  const requestFinishAdminChat = async (sessionId) => {
+    const targetSessionId = String(sessionId || "");
+    const chat = state.adminChats.get(targetSessionId);
+    if (!chat || chat.closing || chat.confirming) return;
+    chat.confirming = true;
+    const confirmed = await askForConfirmation({
+      eyebrow: "Cerrar conversación",
+      title: `¿Cerrar el chat de ${tableLabel(chat.table)}?`,
+      message: "La conversación se cerrará y sus mensajes se borrarán. Confirma solo si ya terminaste de atenderla.",
+      accept: "Sí, cerrar chat",
+      cancel: "Seguir conversando"
+    });
+    chat.confirming = false;
+    if (confirmed) await finishAdminChat(targetSessionId);
   };
 
   const describeAssistantItem = (item) =>
@@ -2338,11 +2686,12 @@ const App = (() => {
         void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable }).then((saved) => {
           if (saved) broadcastChatEvent("chat-refresh");
         });
-        // La cola durable avisa desde el primer mensaje, incluso si es un saludo.
-        await createServiceNotification(
-          "other",
-          `${tableLabel(state.currentTable)} escribió en el chat: ${polishGuestText(text)}`
-        );
+        if (!state.adminChatActive) {
+          await createServiceNotification(
+            "other",
+            `${tableLabel(state.currentTable)} escribió en el chat: ${polishGuestText(text)}`
+          );
+        }
       }
     }
     if (state.adminChatActive) return;
@@ -2613,6 +2962,7 @@ const App = (() => {
     }
     clearInterval(state.clientPollTimer);
     if (state.clientChannel) state.sb.removeChannel(state.clientChannel);
+    clearInterval(state.chatPollTimer);
     const refresh = async () => {
       if (state.clientSyncBusy || !state.currentSession) return;
       state.clientSyncBusy = true;
@@ -2653,6 +3003,7 @@ const App = (() => {
       })
       .subscribe();
     state.clientPollTimer = setInterval(refresh, SYNC_INTERVAL_MS);
+    state.chatPollTimer = setInterval(() => void loadChatMessages(), CHAT_SYNC_INTERVAL_MS);
     void loadChatMessages();
   };
 
@@ -2720,8 +3071,10 @@ const App = (() => {
         if (!serverSession) state.optimisticSessionStates.delete(sessionId);
         return;
       }
-      const expectedItemConfirmed = !overlay.expectedItem ||
-        (serverSession?.session_items || []).some((item) => sessionItemMatches(item, overlay.expectedItem));
+      const expectedItems = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
+      const expectedItemConfirmed = !expectedItems.length || expectedItems.every((expectedItem) =>
+        (serverSession?.session_items || []).some((item) => sessionItemMatches(item, expectedItem))
+      );
       const expectedSessionConfirmed = !overlay.expectedSession || (
         String(serverSession?.payer_name || "") === String(overlay.expectedSession.payer_name || "") &&
         String(serverSession?.assigned_waiter_id || "") === String(overlay.expectedSession.assigned_waiter_id || "")
@@ -2915,7 +3268,21 @@ const App = (() => {
 
   const confirmDisableAlarm = () => {
     const dialog = $("#alarmConfirmDialog");
-    if (!dialog) return Promise.resolve(window.confirm("¿Deseas desactivar la alarma?"));
+    if (!dialog) return Promise.resolve(false);
+    dialog.returnValue = "";
+    dialog.showModal();
+    refreshIcons();
+    return new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true }));
+  };
+
+  const askForConfirmation = ({ eyebrow = "Confirmación", title = "¿Continuar?", message = "", accept = "Sí, continuar", cancel = "Cancelar" } = {}) => {
+    const dialog = $("#actionConfirmDialog");
+    if (!dialog) return Promise.resolve(false);
+    $("#actionConfirmEyebrow").textContent = eyebrow;
+    $("#actionConfirmTitle").textContent = title;
+    $("#actionConfirmMessage").textContent = message;
+    $("#actionConfirmAccept").textContent = accept;
+    $("#actionConfirmCancel").textContent = cancel;
     dialog.returnValue = "";
     dialog.showModal();
     refreshIcons();
@@ -3060,9 +3427,10 @@ const App = (() => {
 
   const renderAdminShell = () => {
     renderBrand();
+    syncTipFeatureVisibility();
     const tableSessions = state.sessions.filter((session) => !isLocalWalkInSession(session));
     const totals = {
-      tables: state.tables.filter((table) => table.is_active).length,
+      tables: normalTables().filter((table) => table.is_active).length,
       alerts: activeRequests().length,
       open: tableSessions.length,
       sales: tableSessions.reduce((sum, session) => sum + sessionTotal(session), 0)
@@ -3076,6 +3444,24 @@ const App = (() => {
 
   const integerMoney = (value) => Math.max(0, Math.round(Number(value || 0)));
 
+  const tipsEnabled = () => state.tipSettings?.enabled === true
+    && Number(state.tipSettings?.percentage) >= 1
+    && Number(state.tipSettings?.percentage) <= 100;
+
+  const tipAmountFor = (baseTotal, percentage = state.tipSettings?.percentage) =>
+    integerMoney(Number(baseTotal || 0) * Number(percentage || 0) / 100);
+
+  const localDateKey = (value) => {
+    const date = new Date(value || Date.now());
+    if (Number.isNaN(date.getTime())) return "";
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  };
+
+  const syncTipFeatureVisibility = () => {
+    const enabled = tipsEnabled();
+    $$('[data-tip-feature]').forEach((element) => { element.hidden = !enabled; });
+  };
+
   const sessionTotals = (session) => {
     const subtotal = (session?.session_items || [])
       .filter((item) => item.status !== "cancelled")
@@ -3085,6 +3471,14 @@ const App = (() => {
   };
 
   const sessionTotal = (session) => sessionTotals(session).total;
+
+  const newestSessionItems = (session) => [...(session?.session_items || [])]
+    .filter((item) => item.status !== "cancelled")
+    .sort((left, right) => {
+      const leftTime = new Date(left.created_at || left.updated_at || 0).getTime();
+      const rightTime = new Date(right.created_at || right.updated_at || 0).getTime();
+      return rightTime - leftTime;
+    });
 
   const tablesSignature = () =>
     JSON.stringify({
@@ -3177,7 +3571,7 @@ const App = (() => {
     refreshIcons();
   };
 
-  const compactTableTiles = () => state.tables
+  const compactTableTiles = () => normalTables()
     .filter((table) => table.is_active !== false)
     .map((table) => {
       const session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
@@ -3199,7 +3593,67 @@ const App = (() => {
     const box = $("#waiterTablesGrid");
     if (!box) return;
     box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea una mesa activa para atenderla.", "armchair");
+    renderServicePoints();
     refreshIcons();
+  };
+
+  const renderServicePoints = () => {
+    const box = $("#servicePointsGrid");
+    if (!box) return;
+    $$('[data-service-zone]').forEach((button) => {
+      const active = button.dataset.serviceZone === state.activeServiceZone;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    const points = state.tables
+      .filter((table) => table.is_active !== false && servicePointKind(table) === state.activeServiceZone)
+      .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+    const kindLabel = state.activeServiceZone === "bar" ? "barra" : "matera";
+    box.innerHTML = points.length ? points.map((table) => {
+      const session = state.sessions.find((entry) => String(entry.table_id) === String(table.id) && entry.status === "open");
+      const occupied = Boolean(session);
+      return `<article class="service-point-tile ${occupied ? "occupied" : "free"}">
+        <button type="button" data-open-table="${escapeHTML(table.id)}" title="Atender ${escapeHTML(tableLabel(table))}">
+          ${icon(state.activeServiceZone === "bar" ? "wine" : "flower-2", 22)}
+          <span><strong>${escapeHTML(tableLabel(table))}</strong><small>${occupied ? money(sessionTotal(session)) : "Libre"}</small></span>
+        </button>
+        ${state.currentUser?.role === "admin" ? `<button class="icon-btn danger" type="button" data-delete-service-point="${escapeHTML(table.id)}" aria-label="Eliminar ${escapeHTML(tableLabel(table))}">${icon("trash-2", 15)}</button>` : ""}
+      </article>`;
+    }).join("") : emptyState(`Sin ${kindLabel}s`, `Agrega un puesto de ${kindLabel} para atender clientes aquí.`, state.activeServiceZone === "bar" ? "wine" : "flower-2");
+    const addButton = $("#addServicePoint");
+    if (addButton) addButton.innerHTML = `${icon("plus", 17)} Agregar ${kindLabel}`;
+    refreshIcons();
+  };
+
+  const addServicePoint = () => {
+    if (state.currentUser?.role !== "admin") return;
+    const kind = state.activeServiceZone;
+    const sameKind = state.tables.filter((table) => servicePointKind(table) === kind);
+    const sequence = sameKind.reduce((largest, table) => {
+      const match = String(table.table_name || "").match(/(\d+)$/);
+      return Math.max(largest, Number(match?.[1] || 0));
+    }, 0) + 1;
+    const id = uid();
+    const tableNumber = state.tables.reduce((largest, table) => Math.max(largest, Number(table.table_number || 0)), 0) + 1;
+    const label = kind === "bar" ? `Barra ${sequence}` : `Matera ${sequence}`;
+    const point = { id, table_number: tableNumber, table_name: label, qr_code: `interno-${kind}-${id.slice(0, 8)}`, qr_image_url: null, is_active: true };
+    const original = [...state.tables];
+    state.tables = [...state.tables, point].sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+    persistBootstrapCache();
+    renderServicePoints();
+    toast(`${label} lista para atender.`, "ok", `service-point:${id}`);
+    void (async () => {
+      const saved = await retryQuiet(() => state.sb.from("restaurant_tables").insert(point).select("*").single(), 4);
+      if (saved) {
+        state.tables = state.tables.map((table) => table.id === id ? saved : table);
+        persistBootstrapCache();
+        return;
+      }
+      state.tables = original;
+      persistBootstrapCache();
+      renderServicePoints();
+      toast(`No se pudo guardar ${label}. Se retiró del listado.`, "error", `service-point-failed:${id}`);
+    })();
   };
 
   const renderBusinessForm = () => {
@@ -3209,6 +3663,14 @@ const App = (() => {
     form.subtitle.value = state.business?.subtitle || "";
     form.accent_color.value = state.business?.accent_color || "#f05a28";
     form.currency.value = DEFAULT_CURRENCY;
+    form.tips_enabled.checked = tipsEnabled();
+    form.tip_percentage.value = String(state.tipSettings?.percentage || 10);
+    form.tip_percentage.readOnly = tipsEnabled();
+    form.tip_percentage.closest(".tip-percentage-field")?.classList.toggle("is-locked", tipsEnabled());
+    const tipStatus = $("#tipSettingStatus");
+    if (tipStatus) tipStatus.textContent = tipsEnabled()
+      ? `Activa: ${state.tipSettings.percentage}% de propina voluntaria. Apágala para cambiar el porcentaje.`
+      : "Configura el porcentaje y enciende el switch para aplicarlo.";
     form.logo_url.value = state.business?.logo_url || "";
     form.cover_url.value = state.business?.cover_url || "";
     ["logo_url", "cover_url"].forEach((field) => {
@@ -3223,12 +3685,13 @@ const App = (() => {
   const renderTableManager = () => {
     const list = $("#tableManagerList");
     if (!list) return;
-    const validIds = new Set(state.tables.map((table) => String(table.id)));
+    const qrTables = normalTables();
+    const validIds = new Set(qrTables.map((table) => String(table.id)));
     state.selectedTableQrIds = new Set(
       [...state.selectedTableQrIds].filter((id) => validIds.has(String(id)))
     );
     const query = normalizeText($("#tableManagerSearch")?.value || "");
-    const visibleTables = state.tables.filter((table) => !query || normalizeText(`${table.table_number} ${table.table_name || ""}`).includes(query));
+    const visibleTables = qrTables.filter((table) => !query || normalizeText(`${table.table_number} ${table.table_name || ""}`).includes(query));
     list.innerHTML = visibleTables.length
       ? visibleTables
           .map(
@@ -3244,16 +3707,16 @@ const App = (() => {
                   <span>${qrTextForTable(table)}</span>
                 </div>
                 <div class="row-actions">
-                  <button class="icon-btn" data-edit-table="${table.id}" aria-label="Editar mesa">${icon("pencil", 17)}</button>
-                  <button class="icon-btn" data-download-qr="${table.id}" aria-label="Descargar QR en PDF de 6 por 6 centimetros">${icon("file-down", 17)}</button>
-                  <button class="icon-btn" data-regenerate-qr="${table.id}" aria-label="Rehacer QR">${icon("refresh-cw", 17)}</button>
-                  <button class="icon-btn danger" data-delete-table="${table.id}" aria-label="Eliminar mesa">${icon("trash-2", 17)}</button>
+                  <button class="icon-btn" data-edit-table="${table.id}" title="Editar" aria-label="Editar mesa">${icon("pencil", 17)}</button>
+                  <button class="icon-btn" data-download-qr="${table.id}" title="Descargar" aria-label="Descargar QR en PDF de 9 por 9 centimetros">${icon("file-down", 17)}</button>
+                  <button class="icon-btn" data-regenerate-qr="${table.id}" title="Regenerar" aria-label="Rehacer QR">${icon("refresh-cw", 17)}</button>
+                  <button class="icon-btn danger" data-delete-table="${table.id}" title="Eliminar" aria-label="Eliminar mesa">${icon("trash-2", 17)}</button>
                 </div>
               </div>
             `
           )
           .join("")
-      : emptyState(state.tables.length ? "Sin coincidencias" : "Sin mesas", state.tables.length ? "Prueba con otro numero o nombre." : "Agrega una mesa para generar su QR.", "qr-code");
+      : emptyState(qrTables.length ? "Sin coincidencias" : "Sin mesas", qrTables.length ? "Prueba con otro numero o nombre." : "Agrega una mesa para generar su QR.", "qr-code");
     renderQrBatchControls();
     refreshIcons();
     renderGeneratedTableQrs();
@@ -3270,9 +3733,20 @@ const App = (() => {
       downloadButton.disabled = count === 0;
       downloadButton.innerHTML = `${icon("file-down", 18)} Descargar PDF${count ? ` (${count})` : ""}`;
     }
-    if (selectAllButton) selectAllButton.disabled = !state.tables.length || count === state.tables.length;
+    const qrTableCount = normalTables().length;
+    if (selectAllButton) selectAllButton.disabled = !qrTableCount || count === qrTableCount;
     if (clearButton) clearButton.disabled = count === 0;
     refreshIcons();
+  };
+
+  const setAllQrSelections = (selected) => {
+    const ids = normalTables().map((table) => String(table.id));
+    state.selectedTableQrIds = selected ? new Set(ids) : new Set();
+    $$('[data-select-table-qr]').forEach((checkbox) => {
+      checkbox.checked = selected;
+      checkbox.closest(".table-manager-row")?.classList.toggle("is-selected", selected);
+    });
+    renderQrBatchControls();
   };
 
   const normalizeTableLookup = (value = "") =>
@@ -3299,7 +3773,7 @@ const App = (() => {
     const search = $("#waiterTableSearch");
     const status = $("#waiterTableSearchStatus");
     const query = normalizeTableLookup(searchValue === undefined ? search?.value : searchValue);
-    const scoredTables = state.tables
+    const scoredTables = normalTables()
       .filter((table) => table.is_active !== false)
       .map((table) => ({ table, score: waiterTableSearchScore(table, query) }))
       .filter((entry) => Number.isFinite(entry.score));
@@ -3307,7 +3781,7 @@ const App = (() => {
     const activeTables = (exactMatches.length ? exactMatches : scoredTables)
       .sort((a, b) => a.score - b.score || Number(a.table.table_number || 0) - Number(b.table.table_number || 0))
       .map((entry) => entry.table);
-    const allActiveCount = state.tables.filter((table) => table.is_active !== false).length;
+    const allActiveCount = normalTables().filter((table) => table.is_active !== false).length;
     const autoSelectedTable = query && (exactMatches.length === 1 || activeTables.length === 1)
       ? (exactMatches[0]?.table || activeTables[0])
       : null;
@@ -3663,8 +4137,7 @@ const App = (() => {
                 <span class="inventory-profit"><small>Utilidad</small><strong>${money(profit)}</strong><em>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% margen</em></span>
               </div>
               <div class="inventory-row-actions">
-                <button class="ghost small" type="button" data-inventory-adjust="${escapeHTML(item.id)}" data-adjustment="-1" ${inventory.stock <= 0 ? "disabled" : ""}>−1</button>
-                <button class="ghost small" type="button" data-inventory-adjust="${escapeHTML(item.id)}" data-adjustment="1">+1</button>
+                <button class="ghost small inventory-adjust-trigger" type="button" data-inventory-adjust="${escapeHTML(item.id)}">${icon("package-plus", 16)} Unidades</button>
                 <button class="icon-btn" type="button" data-edit-inventory="${escapeHTML(item.id)}" aria-label="Editar ${escapeHTML(item.name)}">${icon("pencil", 17)}</button>
                 <button class="icon-btn danger" type="button" data-delete-item="${escapeHTML(item.id)}" aria-label="Eliminar ${escapeHTML(item.name)}">${icon("trash-2", 17)}</button>
               </div>
@@ -3764,6 +4237,15 @@ const App = (() => {
       return;
     }
     const id = form.product_id.value;
+    if (!id && costPrice === salePrice) {
+      const dialog = $("#zeroProfitDialog");
+      if (!dialog) return;
+      dialog.returnValue = "";
+      dialog.showModal();
+      refreshIcons();
+      const confirmed = await new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true }));
+      if (!confirmed) return;
+    }
     const previousInventory = id ? inventoryFor(state.items.find((item) => item.id === id)) : null;
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
@@ -3827,11 +4309,49 @@ const App = (() => {
     toast(id ? "Producto e inventario actualizados." : "Producto agregado al inventario.");
   };
 
-  const adjustInventory = (id, adjustment) => {
+  const renderInventoryAdjustmentPreview = () => {
+    const form = $("#inventoryAdjustForm");
+    const target = $("#inventoryAdjustResult");
+    if (!form || !target) return;
+    const item = state.items.find((entry) => entry.id === form.product_id.value);
+    if (!item) return;
+    const current = inventoryFor(item).stock;
+    const quantity = Math.max(0, Number(form.quantity.value || 0));
+    const subtract = form.operation.value === "subtract";
+    const next = subtract ? current - quantity : current + quantity;
+    target.classList.toggle("is-invalid", next < 0);
+    target.innerHTML = `<span>Quedará en</span><strong>${Math.max(0, next).toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${escapeHTML(inventoryFor(item).unit)}${next === 1 ? "" : "s"}</strong>${next < 0 ? "<small>No puedes retirar más de lo disponible.</small>" : "<small>Este ajuste no se agrega a Movimientos.</small>"}`;
+  };
+
+  const openInventoryAdjustment = (id) => {
+    const item = state.items.find((entry) => entry.id === id);
+    const form = $("#inventoryAdjustForm");
+    if (!item || !form) return;
+    const current = inventoryFor(item);
+    form.reset();
+    form.product_id.value = item.id;
+    form.operation.value = "add";
+    form.quantity.value = "1";
+    $("#inventoryAdjustTitle").textContent = item.name;
+    $("#inventoryAdjustCurrent").textContent = `Existencia actual: ${current.stock.toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${current.unit}${current.stock === 1 ? "" : "s"}.`;
+    renderInventoryAdjustmentPreview();
+    $("#inventoryAdjustDialog")?.showModal();
+    window.setTimeout(() => form.quantity.select(), 0);
+    refreshIcons();
+  };
+
+  const saveInventoryAdjustment = (form) => {
+    const id = form.product_id.value;
     const item = state.items.find((entry) => entry.id === id);
     if (!item) return;
     const current = inventoryFor(item);
-    const nextStock = Math.max(0, current.stock + Number(adjustment || 0));
+    const quantity = Number(form.quantity.value || 0);
+    const delta = form.operation.value === "subtract" ? -quantity : quantity;
+    const nextStock = current.stock + delta;
+    if (!Number.isFinite(quantity) || quantity <= 0 || nextStock < 0) {
+      toast(nextStock < 0 ? "No puedes retirar más unidades de las disponibles." : "Escribe una cantidad mayor que cero.", "error", `invalid-stock-adjustment:${id}`);
+      return;
+    }
     state.inventoryMeta[id] = {
       ...current,
       code: current.code,
@@ -3839,10 +4359,10 @@ const App = (() => {
       updatedAt: new Date().toISOString()
     };
     persistInventoryStore();
-    const eventId = `manual:${uid()}`;
-    recordLocalInventoryMovement({ eventId, item, delta: nextStock - current.stock, before: current.stock, after: nextStock, type: adjustment > 0 ? "ENTRADA_MANUAL" : "SALIDA_MANUAL", reference: "Ajuste rapido" });
-    enqueueAppsScriptJob("adjust_inventory", { adjustment: { eventId, productId: item.id, code: current.code, name: item.name, delta: nextStock - current.stock, reference: "AJUSTE_MANUAL", movementType: adjustment > 0 ? "ENTRADA_MANUAL" : "SALIDA_MANUAL", occurredAt: new Date().toISOString() } }, `inventory-adjust:${eventId}`);
+    enqueueAppsScriptJob("set_inventory_stock", { productId: item.id, stock: nextStock, updatedAt: state.inventoryMeta[id].updatedAt }, `inventory-stock:${item.id}`);
+    $("#inventoryAdjustDialog")?.close();
     renderInventory();
+    toast(`Existencia de ${item.name} actualizada a ${nextStock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}.`, "ok", `stock-adjusted:${id}:${nextStock}`);
   };
 
   const dateInputValue = (date) => {
@@ -3954,7 +4474,7 @@ const App = (() => {
       const items = (invoice.items || []).map((line) => {
         const quantity = Number(line.quantity || 0);
         const unitPrice = Number(line.unit_price || 0);
-        const unitCost = Number(state.inventoryMeta[line.menu_item_id]?.costPrice || 0);
+        const unitCost = Number(line.unit_cost ?? state.inventoryMeta[line.menu_item_id]?.costPrice ?? 0);
         return {
           lineId: line.id || "",
           menuItemId: line.menu_item_id || null,
@@ -4097,14 +4617,14 @@ const App = (() => {
       const top = Array.from(totals).sort((a, b) => b[1] - a[1])[0];
       answer = top ? `El producto mas vendido en el rango actual es ${top[0]}, con ${top[1].toLocaleString("es-CO", { maximumFractionDigits: 2 })} unidades.` : "No hay productos vendidos en el rango seleccionado.";
     } else if (includesAny(normalized, ["utilidad", "ganancia"])) {
-      answer = `La utilidad estimada del rango seleccionado es ${money(state.incomeReport?.totals?.profit || 0)}, sobre ingresos de ${money(state.incomeReport?.totals?.income || 0)}.`;
+      answer = `La ganancia aproximada del periodo es ${money(state.incomeReport?.totals?.profit || 0)}, sobre ventas de ${money(state.incomeReport?.totals?.income || 0)}.`;
     } else if (includesAny(normalized, ["quien", "responsable", "vendedor", "mesero"])) {
       const sellers = new Map();
       records.forEach((record) => sellers.set(record.waiter || "Sin asignar", Number(sellers.get(record.waiter || "Sin asignar") || 0) + Number(record.total || 0)));
       answer = sellers.size ? Array.from(sellers).sort((a, b) => b[1] - a[1]).map(([name, total]) => `${name}: ${money(total)}`).join("; ") : "No hay ventas con responsable en el rango seleccionado.";
     } else if (includesAny(normalized, ["venta", "vendio", "ingreso", "facturo", "cuanto"])) {
       const totals = state.incomeReport?.totals || {};
-      answer = `En el rango seleccionado se registraron ${Number(totals.sales || 0)} ventas por ${money(totals.income || 0)}. El ticket promedio fue ${money(totals.averageTicket || 0)}.`;
+      answer = `En el periodo seleccionado se registraron ${Number(totals.sales || 0)} ventas por ${money(totals.income || 0)}. El promedio por venta fue ${money(totals.averageTicket || 0)}.`;
     }
     state.adminAiMessages.push({ role: "bot", text: answer });
     state.adminAiMessages = state.adminAiMessages.slice(-30);
@@ -4125,7 +4645,7 @@ const App = (() => {
     if (!kpis || !payments || !recordsTarget) return;
     const report = state.incomeReport;
     if (!report) {
-      kpis.innerHTML = Array.from({ length: 6 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
+      kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
       payments.innerHTML = "";
       recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
       setIncomeReportStatus("Consultando ingresos", "loading", "loader-circle");
@@ -4133,15 +4653,18 @@ const App = (() => {
     }
     const totals = report.totals || {};
     const margin = Number(totals.income || 0) > 0 ? Number(totals.profit || 0) / Number(totals.income) * 100 : 0;
-    kpis.innerHTML = `
-      <article class="income-kpi is-primary"><span>${icon("circle-dollar-sign", 19)} Total facturado</span><strong>${money(totals.income)}</strong><small>Ticket promedio ${money(totals.averageTicket)}</small></article>
-      <article class="income-kpi is-profit"><span>${icon("trending-up", 19)} Utilidad estimada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% sobre ingresos</small></article>
-      <article class="income-kpi"><span>${icon("package-search", 19)} Costo vendido</span><strong>${money(totals.cost)}</strong><small>Costo registrado en inventario</small></article>`;
+    const infoButton = (label, explanation) => `<button class="income-kpi-info" type="button" aria-label="Qué significa ${escapeHTML(label)}" data-tooltip="${escapeHTML(explanation)}">${icon("info", 15)}</button>`;
+    kpis.innerHTML = state.incomeLoading
+      ? Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("")
+      : `
+        <article class="income-kpi is-primary">${infoButton("Dinero vendido", "Todo el dinero cobrado en las ventas de este periodo.")}<span>${icon("circle-dollar-sign", 19)} Dinero vendido</span><strong>${money(totals.income)}</strong><small>Total vendido en el periodo seleccionado</small></article>
+        <article class="income-kpi is-profit">${infoButton("Ganancia aproximada", "Lo que queda al restar del dinero vendido el costo de los productos.")}<span>${icon("trending-up", 19)} Ganancia aproximada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% del dinero vendido</small></article>
+        <article class="income-kpi">${infoButton("Costo de los productos", "Lo que el negocio pagó por los productos que ya vendió.")}<span>${icon("package-search", 19)} Costo de los productos</span><strong>${money(totals.cost)}</strong><small>Valor de compra de lo que se vendió</small></article>`;
     payments.innerHTML = [
       ["cash", "banknote", "Efectivo"],
       ["transfer", "landmark", "Transferencia"],
       ["breb", "scan-line", "Bre-B"]
-    ].map(([key, iconName, label]) => `<article><span>${icon(iconName, 18)} ${label}</span><strong>${money(totals[key])}</strong><small>${Number(totals.income || 0) ? (Number(totals[key] || 0) / Number(totals.income) * 100).toLocaleString("es-CO", { maximumFractionDigits: 1 }) : "0"}% del total</small></article>`).join("");
+    ].map(([key, iconName, label]) => `<article><span>${icon(iconName, 18)} ${label}</span><strong>${money(totals[key])}</strong><small><b>${Number(totals.income || 0) ? (Number(totals[key] || 0) / Number(totals.income) * 100).toLocaleString("es-CO", { maximumFractionDigits: 1 }) : "0"}% del total</b></small></article>`).join("");
     const filters = report.filters || incomeFiltersFromForm();
     if (summaryTarget) {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
@@ -4153,10 +4676,10 @@ const App = (() => {
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
             <div class="income-record-main">
-              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button></div>
+              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><div class="income-record-actions"><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div></div>
               <div><small>Mesa / responsable</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
               <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
-              <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span>Utilidad ${money(record.profit)}</span></div>
+              <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span class="income-record-profit">Ganancia ${money(record.profit)}</span></div>
             </div>
             <div class="income-payment-badges">${paymentBadges || "<span>Medio no registrado</span>"}</div>
             <details>
@@ -4184,23 +4707,197 @@ const App = (() => {
     }
     const requestId = ++state.incomeRequestId;
     state.incomeLoading = true;
+    state.incomeReport = localIncomeReport(filters);
+    renderIncomeReport();
     setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
       const result = await appsScriptRequest("get_income_report", { filters }, 40000);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (requestId !== state.incomeRequestId) return false;
+      state.incomeLoading = false;
       state.incomeReport = mergeIncomeReport(result, filters);
       renderIncomeReport();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;
+      state.incomeLoading = false;
       state.incomeReport = localIncomeReport(filters, String(error?.message || error));
       renderIncomeReport();
       setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
       return false;
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
+    }
+  };
+
+  const waitForRemoteQueue = async () => {
+    const deadline = Date.now() + 30000;
+    while (state.appsScriptOutboxBusy && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    if (state.appsScriptOutboxBusy) throw new Error("Hay cambios anteriores que todavía se están guardando. Intenta nuevamente en unos segundos.");
+    if (!readAppsScriptOutbox().length) return;
+    const synced = await flushAppsScriptOutbox();
+    if (!synced || readAppsScriptOutbox().length) throw new Error("No fue posible terminar de guardar los cambios anteriores.");
+  };
+
+  const resetSectionData = async (section) => {
+    if (state.currentUser?.role !== "admin") return;
+    const settings = {
+      inventory: {
+        eyebrow: "Reiniciar inventario",
+        title: "¿Eliminar todo el inventario?",
+        message: "Se eliminarán todos los productos y sus existencias. Ingresos y movimientos conservarán su información.",
+        action: "clear_inventory",
+        success: "Inventario eliminado. Ya puedes empezar desde cero."
+      },
+      movements: {
+        eyebrow: "Reiniciar movimientos",
+        title: "¿Eliminar todos los movimientos?",
+        message: "Se borrará todo el historial de entradas y salidas. Las existencias actuales no cambiarán.",
+        action: "clear_inventory_movements",
+        success: "Movimientos eliminados. El historial quedó en cero."
+      },
+      income: {
+        eyebrow: "Reiniciar ingresos",
+        title: "¿Eliminar todos los ingresos?",
+        message: "Se borrarán todas las ventas, pagos y totales históricos. El inventario actual no cambiará.",
+        action: "clear_income",
+        success: "Ingresos eliminados. Todos los valores quedaron en cero."
+      }
+    }[section];
+    if (!settings) return;
+
+    if (section === "inventory") {
+      const hasOpenProductAccounts = state.sessions.some((session) => session.status === "open" && (session.session_items || []).some((item) => item.status !== "cancelled" && item.menu_item_id));
+      if (hasOpenProductAccounts) {
+        toast("Cobra o elimina los productos de las cuentas abiertas antes de reiniciar el inventario.", "error", "inventory-reset-open-accounts");
+        return;
+      }
+    }
+
+    const confirmed = await askForConfirmation({
+      eyebrow: settings.eyebrow,
+      title: settings.title,
+      message: settings.message,
+      accept: "Sí, eliminar todo",
+      cancel: "Conservar información"
+    });
+    if (!confirmed) return;
+
+    const button = $(`[data-reset-section="${section}"]`);
+    const buttonMarkup = button?.innerHTML || "";
+    if (button) {
+      button.disabled = true;
+      button.classList.add("is-resetting");
+      button.innerHTML = `${icon("loader-circle", 17)} Eliminando...`;
+    }
+
+    const snapshot = {
+      items: state.items.map((item) => ({ ...item })),
+      inventoryMeta: JSON.parse(JSON.stringify(state.inventoryMeta)),
+      inventoryMovements: state.inventoryMovements.map((movement) => ({ ...movement })),
+      invoiceHistory: state.invoiceHistory.map((invoice) => ({ ...invoice })),
+      incomeReport: state.incomeReport,
+      lastPaidReceipt: state.lastPaidReceipt
+    };
+
+    try {
+      if (section === "inventory") {
+        state.items = [];
+        state.inventoryMeta = {};
+        state.inventorySearch = "";
+        state.inventoryStatusFilter = "all";
+        state.productPickerMatches = [];
+        if ($("#inventorySearch")) $("#inventorySearch").value = "";
+        if ($("#inventoryStatusFilter")) $("#inventoryStatusFilter").value = "all";
+        persistInventoryStore();
+        persistBootstrapCache();
+        resetInventoryForm();
+        $("#inventoryDialog")?.close();
+        renderInventory();
+        renderMenuManager();
+      }
+      if (section === "movements") {
+        state.inventoryMovements = [];
+        state.movementSearch = "";
+        state.movementTypeFilter = "all";
+        if ($("#movementSearch")) $("#movementSearch").value = "";
+        if ($("#movementTypeFilter")) $("#movementTypeFilter").value = "all";
+        persistInventoryMovements();
+        renderInventoryMovements();
+      }
+      if (section === "income") {
+        state.incomeRequestId += 1;
+        state.incomeLoading = false;
+        state.invoiceHistory = [];
+        state.lastPaidReceipt = null;
+        persistInvoiceHistory();
+        state.incomeReport = localIncomeReport(incomeFiltersFromForm());
+        $("#incomeEditDialog")?.close();
+        $("#deleteIncomeDialog")?.close();
+        $("#receiptResultDialog")?.close();
+        renderIncomeReport();
+      }
+
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no está configurado.");
+      await waitForRemoteQueue();
+      const result = await appsScriptRequest(settings.action, {}, 40000);
+      if (!result?.ok || result.cleared !== true) throw new Error(result?.error || "No fue posible completar el reinicio.");
+      if (section === "inventory") {
+        state.items = [];
+        state.inventoryMeta = {};
+        persistInventoryStore();
+        persistBootstrapCache();
+        renderInventory();
+        renderMenuManager();
+        setInventorySyncStatus("Inventario vacío y sincronizado", "synced", "cloud-check");
+      }
+      if (section === "movements") {
+        state.inventoryMovements = [];
+        persistInventoryMovements();
+        renderInventoryMovements();
+      }
+      if (section === "income") {
+        state.invoiceHistory = [];
+        state.lastPaidReceipt = null;
+        persistInvoiceHistory();
+        state.incomeReport = localIncomeReport(incomeFiltersFromForm());
+        renderIncomeReport();
+        setIncomeReportStatus("0 facturas", "ready", "badge-check");
+      }
+      toast(settings.success, "ok", `reset-complete:${section}`);
+    } catch (error) {
+      if (section === "inventory") {
+        state.items = snapshot.items;
+        state.inventoryMeta = snapshot.inventoryMeta;
+        persistInventoryStore();
+        persistBootstrapCache();
+        renderInventory();
+        renderMenuManager();
+      }
+      if (section === "movements") {
+        state.inventoryMovements = snapshot.inventoryMovements;
+        persistInventoryMovements();
+        renderInventoryMovements();
+      }
+      if (section === "income") {
+        state.invoiceHistory = snapshot.invoiceHistory;
+        state.incomeReport = snapshot.incomeReport;
+        state.lastPaidReceipt = snapshot.lastPaidReceipt;
+        persistInvoiceHistory();
+        renderIncomeReport();
+      }
+      toast(String(error?.message || "No fue posible eliminar la información."), "error", `reset-failed:${section}`);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.classList.remove("is-resetting");
+        button.innerHTML = buttonMarkup;
+      }
+      refreshIcons();
     }
   };
 
@@ -4229,6 +4926,76 @@ const App = (() => {
     refreshIcons();
   };
 
+  const openDeleteIncomeDialog = (saleId) => {
+    const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
+    const form = $("#deleteIncomeForm");
+    if (!record || !form) return;
+    form.sale_id.value = record.saleId;
+    $("#deleteIncomeTitle").textContent = "¿Eliminar esta venta?";
+    $("#deleteIncomeMessage").textContent = `Se borrará la venta completa de ${money(record.total)} y las unidades de sus productos volverán al inventario.`;
+    $("#deleteIncomeDialog")?.showModal();
+    refreshIcons();
+  };
+
+  const deleteIncomeSale = async (form) => {
+    const saleId = form.sale_id.value;
+    const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
+    if (!record) return;
+    const reportBefore = state.incomeReport;
+    const invoicesBefore = [...state.invoiceHistory];
+    const inventoryBefore = JSON.parse(JSON.stringify(state.inventoryMeta));
+    const outboxBefore = readAppsScriptOutbox();
+    const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
+    const updatedTotals = { ...(reportBefore.totals || {}) };
+    updatedTotals.income = Math.max(0, Number(updatedTotals.income || 0) - Number(record.total || 0));
+    updatedTotals.sales = Math.max(0, Number(updatedTotals.sales || 0) - 1);
+    updatedTotals.subtotal = Math.max(0, Number(updatedTotals.subtotal || 0) - Number(record.subtotal || 0));
+    updatedTotals.discount = Math.max(0, Number(updatedTotals.discount || 0) - Number(record.discount || 0));
+    updatedTotals.tax = Math.max(0, Number(updatedTotals.tax || 0) - Number(record.tax || 0));
+    updatedTotals.service = Math.max(0, Number(updatedTotals.service || 0) - Number(record.service || 0));
+    updatedTotals.cost = Math.max(0, Number(updatedTotals.cost || 0) - Number(record.cost || 0));
+    updatedTotals.profit = Number(updatedTotals.profit || 0) - Number(record.profit || 0);
+    (record.payments || []).forEach((payment) => {
+      const method = ["cash", "transfer", "breb"].includes(payment.method) ? payment.method : "other";
+      updatedTotals[method] = Math.max(0, Number(updatedTotals[method] || 0) - Number(payment.amount || 0));
+    });
+    updatedTotals.averageTicket = updatedTotals.sales ? updatedTotals.income / updatedTotals.sales : 0;
+    state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordKeys: (reportBefore.recordKeys || []).filter((key) => String(key) !== String(saleId)) };
+    state.invoiceHistory = state.invoiceHistory.filter((invoice) => String(invoice.id || invoice.sessionId) !== String(saleId));
+    (record.items || []).forEach((line) => {
+      const productId = line.menuItemId || line.menu_item_id;
+      const item = state.items.find((entry) => String(entry.id) === String(productId));
+      if (!item || !Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id)) return;
+      const current = inventoryFor(item);
+      state.inventoryMeta[item.id] = { ...current, stock: current.stock + Number(line.quantity || 0), updatedAt: new Date().toISOString() };
+    });
+    const hadPendingSale = outboxBefore.some((job) => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId));
+    writeAppsScriptOutbox(outboxBefore.filter((job) => !(job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId))));
+    persistInvoiceHistory();
+    persistInventoryStore();
+    $("#deleteIncomeDialog")?.close();
+    renderIncomeReport();
+    renderInventory();
+    try {
+      if (!hadPendingSale || isAppsScriptConfigured()) {
+        const result = await appsScriptRequest("delete_sale", { saleId }, 40000);
+        if (!result?.ok) throw new Error(result?.error || "No se pudo eliminar la venta.");
+        if (Array.isArray(result?.items)) applyRemoteInventoryItems(result.items);
+      }
+      toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
+    } catch (error) {
+      state.incomeReport = reportBefore;
+      state.invoiceHistory = invoicesBefore;
+      state.inventoryMeta = inventoryBefore;
+      writeAppsScriptOutbox(outboxBefore);
+      persistInvoiceHistory();
+      persistInventoryStore();
+      renderIncomeReport();
+      renderInventory();
+      toast(String(error?.message || error), "error", `income-delete-failed:${saleId}`);
+    }
+  };
+
   const saveIncomeEdit = async (form) => {
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(form.sale_id.value));
     if (!record) return;
@@ -4237,7 +5004,8 @@ const App = (() => {
       menu_item_id: row.dataset.menuItemId || null,
       item_name: row.querySelector('[data-line-field="name"]')?.value.trim() || "",
       quantity: Number(row.querySelector('[data-line-field="quantity"]')?.value || 0),
-      unit_price: currencyInputNumber(row.querySelector('[data-line-field="price"]'))
+      unit_price: currencyInputNumber(row.querySelector('[data-line-field="price"]')),
+      unit_cost: Number(record.items?.[Number(row.dataset.incomeLine)]?.cost || 0) / Math.max(1, Number(record.items?.[Number(row.dataset.incomeLine)]?.quantity || 1))
     })).filter((item) => item.item_name && item.quantity > 0);
     if (!items.length || items.some((item) => !Number.isInteger(item.quantity) || item.quantity < 1 || item.unit_price < 0)) {
       toast("La venta debe conservar al menos un producto con cantidad y precio validos.", "error", "invalid-income-edit");
@@ -4306,7 +5074,7 @@ const App = (() => {
       if (/^[=+\-@]/.test(text)) text = `'${text}`;
       return `"${text.replace(/"/g, '""')}"`;
     };
-    const rows = [["Factura", "Fecha", "Mesa", "Responsable", "Mesero", "Medios de pago", "Subtotal", "Descuento", "Impuestos", "Servicio", "Costo", "Utilidad", "Total", "Referencia"]];
+    const rows = [["Factura", "Fecha", "Mesa", "Responsable", "Mesero", "Medios de pago", "Subtotal", "Descuento", "Impuestos", "Servicio", "Costo", "Ganancia", "Total", "Referencia"]];
     records.forEach((record) => rows.push([
       record.invoice, record.date, record.table, record.payer, record.waiter,
       (record.payments || []).map((payment) => `${incomePaymentLabel(payment.method)}: ${payment.amount}`).join(" + "),
@@ -4348,6 +5116,74 @@ const App = (() => {
     renderQrImage(preview, url, `QR ${tableLabel(table)}`);
   };
 
+  const accountDateParts = (session) => {
+    const opened = new Date(session.opened_at || session.created_at);
+    return {
+      date: opened.toLocaleDateString("es-CO", { day: "2-digit", month: "short", year: "numeric" }),
+      time: opened.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    };
+  };
+
+  const renderAccountDetail = () => {
+    const dialog = $("#accountDetailDialog");
+    const target = $("#accountDetailContent");
+    if (!dialog || !target || !state.activeAccountDetailId) return;
+    const session = state.sessions.find((entry) => entry.id === state.activeAccountDetailId);
+    if (!session) {
+      if (dialog.open) dialog.close();
+      state.activeAccountDetailId = "";
+      return;
+    }
+    const items = newestSessionItems(session);
+    const total = sessionTotal(session);
+    const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(total) : 0;
+    const suggestedTotal = total + suggestedTip;
+    const opened = accountDateParts(session);
+    const billRequest = state.requests.find((request) => request.session_id === session.id && request.request_type === "bill");
+    target.innerHTML = `
+      <div class="section-head account-detail-head">
+        <div><span class="eyebrow">Cuenta abierta</span><h2>Desglose de ${escapeHTML(sessionLabel(session))}</h2><p>#${sessionReference(session)} · ${opened.date}, ${opened.time}</p></div>
+        <button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar desglose">${icon("x", 18)}</button>
+      </div>
+      <div class="account-detail-overview">
+        <div><small>Total actual</small><strong>${money(total)}</strong></div>
+        <div><small>Consumos</small><strong>${items.length}</strong></div>
+        <div><small>Negocio</small><strong>${escapeHTML(state.business?.business_name || "Restaurante")}</strong></div>
+        <div><small>Responsable</small><strong>${escapeHTML(session.payer_name || "Por definir")}</strong></div>
+        <div><small>Mesero</small><strong>${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</strong></div>
+      </div>
+      <div class="account-detail-breakdown">
+        <div class="account-detail-breakdown-head"><strong>Productos y desglose</strong><span>${items.length} ${items.length === 1 ? "consumo" : "consumos"}</span></div>
+        <div class="account-detail-lines">
+          ${items.map((item) => `
+            <div class="account-detail-line">
+              <div><strong>${escapeHTML(item.item_name)}</strong><span>${Number(item.quantity || 0)} × ${money(item.unit_price)}</span><small>${escapeHTML(item.created_by_user?.full_name || "Cliente")}${item.created_at ? ` · ${new Date(item.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : ""}${item.notes ? ` · ${escapeHTML(item.notes)}` : ""}</small></div>
+              <strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong>
+              <button class="icon-btn" type="button" data-edit-consumption="${item.id}" data-session-id="${session.id}" aria-label="Editar consumo">${icon("pencil", 15)}</button>
+              <button class="icon-btn danger" type="button" data-delete-consumption="${item.id}" data-session-id="${session.id}" aria-label="Eliminar consumo">${icon("trash-2", 15)}</button>
+            </div>`).join("") || `<div class="invoice-empty">${icon("clipboard-list", 18)} Sin consumos registrados</div>`}
+        </div>
+        ${suggestedTip ? `<div class="account-detail-tip"><span><small>Propina voluntaria (${state.tipSettings.percentage}%)</small><strong>${money(suggestedTip)}</strong></span><span><small>Total sugerido con propina</small><strong>${money(suggestedTotal)}</strong></span></div>` : ""}
+        <div class="account-detail-total"><span>Total del consumo</span><strong>${money(total)}</strong></div>
+      </div>
+      <div class="invoice-actions account-detail-actions">
+        ${items.length ? `<button class="ghost small" type="button" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>` : `<button class="ghost small danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 15)} Liberar mesa</button>`}
+        ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" type="button" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
+        ${items.length ? `<button class="ghost small" type="button" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>` : ""}
+        ${billRequest ? `<button class="ghost small" type="button" data-send-bill="${billRequest.id}">${icon("send", 15)} ${billRequest.status === "acknowledged" ? "Reenviar" : "Enviar cuenta"}</button>` : ""}
+        ${items.length ? `<button class="primary small invoice-close" type="button" data-charge-session="${session.id}">${icon("badge-dollar-sign", 18)} Cobrar y facturar</button>` : ""}
+      </div>`;
+    refreshIcons();
+  };
+
+  const openAccountDetailDialog = (sessionId) => {
+    const dialog = $("#accountDetailDialog");
+    if (!dialog) return;
+    state.activeAccountDetailId = String(sessionId || "");
+    renderAccountDetail();
+    if (!dialog.open) dialog.showModal();
+  };
+
   const renderAccounts = () => {
     const box = $("#accountsPanel");
     if (!box) return;
@@ -4355,6 +5191,8 @@ const App = (() => {
     const renderSignature = JSON.stringify([
       state.business?.tax_rate,
       state.business?.service_fee,
+      state.tipSettings?.enabled,
+      state.tipSettings?.percentage,
       accountSessions.map((session) => [
         session.id,
         session.status,
@@ -4371,86 +5209,64 @@ const App = (() => {
     box.innerHTML = accountSessions.length
       ? accountSessions
           .map((session) => {
-            const billRequest = state.requests.find(
-              (request) => request.session_id === session.id && request.request_type === "bill"
-            );
-            const items = (session.session_items || []).filter((item) => item.status !== "cancelled");
+            const items = newestSessionItems(session);
             const total = sessionTotal(session);
-            const openedAt = new Date(session.opened_at || session.created_at).toLocaleTimeString("es-CO", {
-              hour: "2-digit",
-              minute: "2-digit",
-              second: "2-digit"
-            });
-            const openedDate = new Date(session.opened_at || session.created_at).toLocaleDateString("es-CO", {
-              day: "2-digit",
-              month: "short",
-              year: "numeric"
-            });
+            const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(total) : 0;
+            const opened = accountDateParts(session);
             return `
-              <article class="account-card invoice-ticket ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
-                ${items.length ? "" : `<button class="icon-btn danger empty-account-close" type="button" data-close-session="${session.id}" aria-label="Quitar cuenta vacia" title="Quitar cuenta vacia">${icon("x", 18)}</button>`}
-                <div class="invoice-total-block">
-                  <span>Total actual</span>
-                  <strong>${money(total)}</strong>
-                </div>
-
-                <div class="invoice-identity">
-                  <span>${escapeHTML(sessionLabel(session))}</span>
-                  <strong>#${sessionReference(session)}</strong>
-                </div>
-
-                <div class="invoice-meta-grid">
-                  <span>Negocio</span>
-                  <strong>${escapeHTML(state.business?.business_name || "Restaurante")}</strong>
-                  <span>Fecha</span>
-                  <strong>${openedDate}</strong>
-                  <span>Hora</span>
-                  <strong>${openedAt}</strong>
-                  <span>Consumos</span>
-                  <strong>${items.length}</strong>
-                  <span>Responsable</span>
-                  <strong>${escapeHTML(session.payer_name || "Por definir")}</strong>
-                  <span>Mesero</span>
-                  <strong>${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</strong>
-                </div>
-
-                <div class="invoice-lines">
-                  ${items
-                    .map(
-                      (item) => `
-                        <div class="invoice-line">
-                          <div>
-                            <strong>${escapeHTML(item.item_name)}</strong>
-                            <span>${item.quantity} x ${money(item.unit_price)}</span>
-                            <small>${escapeHTML(item.created_by_user?.full_name || "Cliente")}${item.created_at ? ` · ${new Date(item.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : ""}</small>
-                          </div>
-                          <strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong>
-                          <button class="icon-btn" data-edit-consumption="${item.id}" data-session-id="${session.id}" aria-label="Editar consumo">${icon("pencil", 15)}</button>
-                          <button class="icon-btn danger" data-delete-consumption="${item.id}" data-session-id="${session.id}" aria-label="Eliminar consumo">${icon("trash-2", 15)}</button>
-                        </div>
-                      `
-                    )
-                    .join("") || `<div class="invoice-empty">${icon("clipboard-list", 18)} Sin consumos registrados</div>`}
-                </div>
-
-                <div class="invoice-actions">
-                  <button class="ghost small" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>
-                  ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
-                  <button class="ghost small" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>
-                  ${
-                    billRequest
-                      ? `<button class="ghost small" data-send-bill="${billRequest.id}">${icon("send", 15)} ${
-                          billRequest.status === "acknowledged" ? "Reenviar" : "Enviar cuenta"
-                        }</button>`
-                      : ""
-                  }
-                  <button class="primary small invoice-close" data-charge-session="${session.id}">Cobrar y facturar ${icon("arrow-right", 15)}</button>
+              <article class="account-summary-card ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
+                <div class="account-summary-head"><div><span>${escapeHTML(sessionLabel(session))}</span><small>#${sessionReference(session)}</small></div><span class="account-summary-status">${items.length ? `${items.length} ${items.length === 1 ? "consumo" : "consumos"}` : "Cuenta en $0"}</span></div>
+                <div class="account-summary-total"><small>Total actual</small><strong>${money(total)}</strong></div>
+                ${suggestedTip ? `<div class="account-summary-tip"><span>Propina voluntaria (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong><small>Total sugerido: ${money(total + suggestedTip)}</small></div>` : ""}
+                <div class="account-summary-meta"><span>${icon("user-round", 15)} ${escapeHTML(session.payer_name || "Por definir")}</span><span>${icon("contact", 15)} ${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</span><span>${icon("clock-3", 15)} ${opened.date} · ${opened.time}</span></div>
+                <div class="account-summary-actions">
+                  <button class="ghost" type="button" data-view-account="${session.id}">${icon("list-collapse", 16)} Ver desglose</button>
+                  ${items.length ? `<button class="primary" type="button" data-charge-session="${session.id}">${icon("badge-dollar-sign", 16)} Cobrar</button>` : `<button class="ghost danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 16)} Liberar mesa</button>`}
                 </div>
               </article>
             `;
           })
           .join("")
       : emptyState("No hay cuentas abiertas", "Las mesas con consumos apareceran aqui.", "receipt-text");
+    if (state.activeAccountDetailId) renderAccountDetail();
+    refreshIcons();
+  };
+
+  const renderTips = () => {
+    syncTipFeatureVisibility();
+    if (!tipsEnabled()) return;
+    const kpis = $("#tipsKpis");
+    const recordsBox = $("#tipsRecords");
+    const peopleInput = $("#tipSplitPeople");
+    const splitResult = $("#tipSplitResult");
+    if (!kpis || !recordsBox || !peopleInput || !splitResult) return;
+    const tipInvoices = state.invoiceHistory
+      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0)
+      .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+    const todayKey = localDateKey();
+    const todayInvoices = tipInvoices.filter((invoice) => localDateKey(invoice.createdAt) === todayKey);
+    const todayTotal = todayInvoices.reduce((sum, invoice) => sum + Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0), 0);
+    const people = Math.min(100, Math.max(1, Number(state.tipSplitPeople || 1)));
+    state.tipSplitPeople = people;
+    peopleInput.value = String(people);
+    kpis.innerHTML = `
+      <article><span>${icon("hand-coins", 20)} Total de hoy</span><strong>${money(todayTotal)}</strong><small>${todayInvoices.length} ${todayInvoices.length === 1 ? "cuenta con propina" : "cuentas con propina"}</small></article>
+      <article><span>${icon("percent", 20)} Porcentaje activo</span><strong>${state.tipSettings.percentage}%</strong><small>Aplicado solo cuando el cliente lo acepta</small></article>
+      <article><span>${icon("users-round", 20)} Por persona</span><strong>${money(todayTotal / people)}</strong><small>Dividido entre ${people} ${people === 1 ? "persona" : "personas"}</small></article>`;
+    splitResult.innerHTML = `<span>A cada persona le corresponde</span><strong>${money(todayTotal / people)}</strong><small>${money(todayTotal)} ÷ ${people}</small>`;
+    recordsBox.innerHTML = tipInvoices.length
+      ? tipInvoices.map((invoice) => {
+          const date = new Date(invoice.createdAt || Date.now());
+          const tip = Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0);
+          const chargedTotal = Number(invoice.totals?.total || 0);
+          const baseTotal = Number(invoice.baseTotal ?? invoice.totals?.baseTotal ?? chargedTotal - tip);
+          return `<article class="tip-record">
+            <span class="tip-record-icon">${icon("receipt-text", 18)}</span>
+            <div><strong>${escapeHTML(invoice.table || "Venta")}</strong><span>${escapeHTML(invoice.number || "Factura")}</span><small>${date.toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long", year: "numeric" })} · ${date.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}</small><small>${escapeHTML(invoice.waiterName || "Equipo")} · Consumo ${money(baseTotal)} · Cobrado ${money(chargedTotal)}</small></div>
+            <strong>+${money(tip)}</strong>
+          </article>`;
+        }).join("")
+      : emptyState("Aún no hay propinas facturadas", "Cuando cobres una cuenta con propina aparecerá aquí con todos sus detalles.", "hand-coins");
     refreshIcons();
   };
 
@@ -4467,6 +5283,7 @@ const App = (() => {
     renderInventoryMovements();
     renderIncomeReport();
     renderAccounts();
+    renderTips();
     renderAdminAi();
   };
 
@@ -4476,9 +5293,37 @@ const App = (() => {
     if (state.activeAdminSection === "dashboard" && tablesSignature() !== state.tableRenderSignature) renderTables();
     if (state.activeAdminSection === "service") renderServiceTables();
     if (state.activeAdminSection === "accounts") renderAccounts();
+    if (state.activeAdminSection === "tips") renderTips();
+  };
+
+  const updateTipSettingsFromForm = (form, { toggleChanged = false, renderForm = true } = {}) => {
+    if (!form?.tips_enabled || !form?.tip_percentage) return false;
+    const percentage = Number(form.tip_percentage.value);
+    if (!Number.isInteger(percentage) || percentage < 1 || percentage > 100) {
+      if (toggleChanged) form.tips_enabled.checked = false;
+      toast("El porcentaje de propina debe ser un número entero entre 1 y 100.", "error", "invalid-tip-percentage");
+      form.tip_percentage.focus({ preventScroll: true });
+      return false;
+    }
+    state.tipSettings = { enabled: form.tips_enabled.checked, percentage };
+    persistTipSettings();
+    state.accountsRenderSignature = "";
+    if (renderForm) renderBusinessForm();
+    syncTipFeatureVisibility();
+    renderAccounts();
+    if (state.activeAccountDetailId) renderAccountDetail();
+    if (state.activeAdminSection === "tips") {
+      if (tipsEnabled()) renderTips();
+      else {
+        history.replaceState(null, "", "#accounts");
+        showAdminSection("accounts");
+      }
+    }
+    return true;
   };
 
   const saveBusiness = async (form) => {
+    if (!updateTipSettingsFromForm(form, { renderForm: false })) return;
     const payload = {
       is_primary: true,
       business_name: form.business_name.value.trim() || "Tu restaurante",
@@ -4839,18 +5684,23 @@ const App = (() => {
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
     state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
     renderAdminLive();
-    const saved = await retryQuiet(
+    const closedAt = new Date().toISOString();
+    let saved = await retryQuiet(
       () => state.sb.from("table_sessions").update({
         status: "closed",
-        closed_at: new Date().toISOString(),
+        closed_at: closedAt,
         subtotal: totals.subtotal,
         discount: totals.discount,
         tax: totals.tax,
         service_fee: totals.serviceFee,
         total: totals.total
-      }).eq("id", id).select("*").single(),
+      }).eq("id", id).eq("status", "open").select("*").single(),
       4
     );
+    if (!saved) {
+      const confirmed = await dbQuiet(state.sb.from("table_sessions").select("*").eq("id", id).maybeSingle(), null);
+      if (confirmed?.status === "closed" && String(confirmed.closed_at || "") === closedAt) saved = confirmed;
+    }
     if (!saved) {
       state.optimisticSessionStates.delete(id);
       state.sessions = originalSessions;
@@ -4865,10 +5715,17 @@ const App = (() => {
   };
 
   const thermalReceiptHtml = (session, invoice = null) => {
+    const businessName = String(state.business?.business_name || "Tu restaurante").trim() || "Tu restaurante";
     const totals = invoice?.totals || sessionTotals(session);
+    const chargedTip = invoice ? Number(invoice.tipAmount ?? totals.tip ?? 0) : 0;
+    const baseTotal = invoice
+      ? Number(invoice.baseTotal ?? totals.baseTotal ?? Number(totals.total || 0) - chargedTip)
+      : Number(totals.total || 0);
+    const suggestedTip = !invoice && tipsEnabled() ? tipAmountFor(baseTotal) : 0;
+    const receiptTotal = invoice ? Number(totals.total || baseTotal + chargedTip) : baseTotal + suggestedTip;
     const items = (invoice?.items || session.session_items || []).filter((item) => item.status !== "cancelled");
     const isPaid = Boolean(invoice);
-    const receiptNumber = invoice?.number || `PRE-${sessionReference(session)}`;
+    const receiptNumber = invoice?.number || `FACT-${sessionReference(session)}`;
     const issuedAt = new Date(invoice?.createdAt || Date.now());
     const payments = invoice?.payments || [];
     return `<!doctype html>
@@ -4890,8 +5747,8 @@ const App = (() => {
         .footer { margin-top: 3mm; text-align: center; }
         @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
       </style></head><body>
-        <div class="logo">TIENDA NÁPOLES</div>
-        <div class="subtitle">${isPaid ? "FACTURA DE VENTA" : "PRE-CUENTA · NO ES FACTURA"}</div>
+        <div class="logo">${escapeHTML(businessName)}</div>
+        <div class="subtitle">FACTURA DE VENTA</div>
         <div class="rule"></div>
         <div class="meta">
           <span>Documento:</span><strong>${escapeHTML(receiptNumber)}</strong>
@@ -4911,11 +5768,14 @@ const App = (() => {
           ${totals.discount ? `<span>Descuento</span><strong>-${money(totals.discount)}</strong>` : ""}
           ${totals.tax ? `<span>Impuestos</span><strong>${money(totals.tax)}</strong>` : ""}
           ${totals.serviceFee ? `<span>Servicio</span><strong>${money(totals.serviceFee)}</strong>` : ""}
-          <span class="total">TOTAL</span><strong class="total">${money(totals.total)}</strong>
+          ${chargedTip ? `<span>Propina voluntaria (${Number(invoice.tipPercentage || 0)}%)</span><strong>${money(chargedTip)}</strong>` : ""}
+          ${suggestedTip ? `<span>Propina voluntaria sugerida (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong>` : ""}
+          <span class="total">${suggestedTip ? "TOTAL SUGERIDO" : "TOTAL"}</span><strong class="total">${money(receiptTotal)}</strong>
         </div>
-        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
+        ${suggestedTip ? `<p class="center"><strong>La propina es voluntaria.</strong><br>El cliente puede pagar el consumo sin propina: ${money(baseTotal)}.</p>` : ""}
+        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
-        <div class="footer">Gracias por su compra<br><strong>TIENDA NÁPOLES</strong></div>
+        <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
         <script>window.onload=function(){setTimeout(function(){window.print()},250)}<\/script>
       </body></html>`;
   };
@@ -4951,11 +5811,50 @@ const App = (() => {
     refreshIcons();
   };
 
+  const updateCashChange = () => {
+    const form = $("#paymentForm");
+    const box = $("#cashChange");
+    if (!form || !box) return;
+    const total = integerMoney(state.activePaymentTotal);
+    const received = currencyInputNumber(form.cash_received);
+    const change = received - total;
+    box.className = `cash-change ${received >= total ? "is-sufficient" : "is-insufficient"}`;
+    box.innerHTML = `<span>Vueltas / cambio</span><strong>${money(Math.max(0, change))}</strong><small>${received >= total ? `Recibido ${money(received)}` : `Faltan ${money(total - received)}`}</small>`;
+  };
+
   const syncMixedMethods = (changedName) => {
     const form = $("#paymentForm");
     if (!form || form.mixed_method_one.value !== form.mixed_method_two.value) return;
     const other = changedName === "mixed_method_one" ? form.mixed_method_two : form.mixed_method_one;
     other.value = ["cash", "transfer", "breb"].find((method) => method !== form[changedName].value) || "cash";
+  };
+
+  const updatePaymentTipChoice = () => {
+    const form = $("#paymentForm");
+    if (!form) return;
+    const baseTotal = integerMoney(state.activePaymentBase);
+    const enabled = tipsEnabled();
+    const choice = form.tip_choice?.value || "";
+    const tip = enabled && choice === "with" ? tipAmountFor(baseTotal) : 0;
+    const total = baseTotal + tip;
+    state.activePaymentTip = tip;
+    state.activePaymentTotal = total;
+    if ($("#paymentTotal")) $("#paymentTotal").textContent = money(total);
+    if ($("#paymentTotalHint")) $("#paymentTotalHint").textContent = enabled && !choice
+      ? "Selecciona si el cliente paga con o sin propina para continuar."
+      : tip
+        ? `Incluye ${money(tip)} de propina voluntaria.`
+        : "Total del consumo sin propina.";
+    if ($("#paymentWithoutTipAmount")) $("#paymentWithoutTipAmount").textContent = money(baseTotal);
+    if ($("#paymentWithTipLabel")) $("#paymentWithTipLabel").textContent = `Con propina (${state.tipSettings.percentage}%)`;
+    if ($("#paymentWithTipAmount")) $("#paymentWithTipAmount").textContent = `${money(tipAmountFor(baseTotal))} · Total ${money(baseTotal + tipAmountFor(baseTotal))}`;
+    setCurrencyInputValue(form.cash_received, total);
+    setCurrencyInputValue(form.mixed_amount_one, total);
+    setCurrencyInputValue(form.mixed_amount_two, 0);
+    const canSubmit = form.dataset.hasItems === "1" && (!enabled || Boolean(choice));
+    $$('button[type="submit"]', form).forEach((button) => { button.disabled = !canSubmit; });
+    updateMixedPayment("mixed_amount_one");
+    updateCashChange();
   };
 
   const openPaymentDialog = (sessionId) => {
@@ -4975,8 +5874,12 @@ const App = (() => {
     form.payment_method.value = "cash";
     form.mixed_method_one.value = "cash";
     form.mixed_method_two.value = "transfer";
+    form.dataset.hasItems = activeItems.length ? "1" : "0";
+    state.activePaymentBase = total;
+    state.activePaymentTip = 0;
     setCurrencyInputValue(form.mixed_amount_one, total);
     setCurrencyInputValue(form.mixed_amount_two, 0);
+    setCurrencyInputValue(form.cash_received, total);
     state.activePaymentTotal = total;
     $("#paymentTableLabel").textContent = sessionLabel(session);
     $("#paymentTotal").textContent = money(total);
@@ -4989,10 +5892,12 @@ const App = (() => {
       addItemButton.hidden = !quickSale;
       addItemButton.innerHTML = `<i data-lucide="plus"></i> ${activeItems.length ? "Agregar otro producto" : "Agregar producto"}`;
     }
-    $$('button[type="submit"]', form).forEach((button) => { button.disabled = !activeItems.length; });
+    const tipChoice = $("#paymentTipChoice");
+    if (tipChoice) tipChoice.hidden = !tipsEnabled();
     if ($("#paymentDialogTitle")) $("#paymentDialogTitle").textContent = quickSale ? "Cobrar venta individual" : "Cobrar mesa";
     $("#mixedPaymentFields").hidden = true;
-    updateMixedPayment("mixed_amount_one");
+    $("#cashReceivedFields").hidden = false;
+    updatePaymentTipChoice();
     dialog.showModal();
     refreshIcons();
   };
@@ -5000,15 +5905,6 @@ const App = (() => {
   const discardLocalWalkInSession = (sessionId) => {
     const session = state.sessions.find((entry) => entry.id === sessionId);
     if (!isLocalWalkInSession(session)) return;
-    (session.session_items || []).filter((item) => item.status !== "cancelled").forEach((line, index) => {
-      const product = state.items.find((entry) => entry.id === line.menu_item_id);
-      if (product) applyConsumptionInventoryDelta(product, Number(line.quantity || 0), {
-        eventId: `cancel-walk-in:${session.id}:${line.id}:${index}`,
-        sessionId: session.id,
-        reference: "CANCELAR_VENTA_INDIVIDUAL",
-        movementType: "DEVOLUCION_CONSUMO"
-      });
-    });
     state.sessions = state.sessions.filter((entry) => entry.id !== session.id);
     state.optimisticSessionStates.delete(session.id);
     persistWalkInDrafts();
@@ -5021,7 +5917,7 @@ const App = (() => {
     $("#paymentDialog")?.close();
     if (isLocalWalkInSession(session)) {
       discardLocalWalkInSession(sessionId);
-      toast("Venta individual cancelada. El inventario fue restaurado.", "ok", `walk-in-cancelled:${sessionId}`);
+      toast("Venta individual cancelada. El inventario no fue modificado.", "ok", `walk-in-cancelled:${sessionId}`);
     }
   };
 
@@ -5038,14 +5934,75 @@ const App = (() => {
   };
 
   const applyInvoiceToInventory = (invoice) => {
-    if (state.invoiceHistory.some((entry) => entry.sessionId === invoice.sessionId)) return;
+    if (state.invoiceHistory.some((entry) => entry.sessionId === invoice.sessionId)) return false;
     state.invoiceHistory.push(invoice);
     persistInvoiceHistory();
     state.incomeReport = null;
     enqueueAppsScriptJob("record_sale", { invoice }, `sale:${invoice.sessionId}`);
+    return true;
+  };
+
+  const paidInventoryPlan = (session) => {
+    const quantities = new Map();
+    newestSessionItems(session).forEach((line) => {
+      if (!line.menu_item_id || !Object.prototype.hasOwnProperty.call(state.inventoryMeta, line.menu_item_id)) return;
+      quantities.set(line.menu_item_id, Number(quantities.get(line.menu_item_id) || 0) + Number(line.quantity || 0));
+    });
+    const legacyAdjusted = new Map();
+    state.inventoryMovements.forEach((movement) => {
+      if (String(movement.sessionId || "") !== String(session.id)) return;
+      if (!["CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(String(movement.type || "").toUpperCase())) return;
+      legacyAdjusted.set(movement.productId, Number(legacyAdjusted.get(movement.productId) || 0) - Number(movement.delta || 0));
+    });
+    return Array.from(quantities.entries()).map(([productId, quantity]) => {
+      const item = state.items.find((entry) => entry.id === productId);
+      const alreadyAdjusted = Math.max(0, Number(legacyAdjusted.get(productId) || 0));
+      return { item, quantity: Math.max(0, quantity - alreadyAdjusted) };
+    }).filter((entry) => entry.item && entry.quantity > 0);
+  };
+
+  const validatePaidInventory = (plan) => {
+    const insufficient = plan.find((entry) => inventoryFor(entry.item).stock < entry.quantity);
+    if (!insufficient) return true;
+    const available = inventoryFor(insufficient.item).stock;
+    toast(`${insufficient.item.name} requiere ${insufficient.quantity} y solo hay ${available}. Corrige la cuenta o el inventario antes de cobrar.`, "error", `payment-stock:${insufficient.item.id}`);
+    return false;
+  };
+
+  const applyPaidInventoryLocally = (invoice, plan) => {
+    plan.forEach(({ item, quantity }) => {
+      const eventId = `SALE-${invoice.id}-${item.id}`;
+      if (state.inventoryMovements.some((movement) => movement.movementId === eventId)) return;
+      const current = inventoryFor(item);
+      const nextStock = Math.max(0, current.stock - quantity);
+      state.inventoryMeta[item.id] = { ...current, stock: nextStock, updatedAt: invoice.createdAt };
+      recordLocalInventoryMovement({ eventId, item, delta: -quantity, before: current.stock, after: nextStock, type: "SALIDA_VENTA", reference: invoice.number, occurredAt: invoice.createdAt });
+      const movement = state.inventoryMovements.find((entry) => entry.movementId === eventId);
+      if (movement) movement.sessionId = invoice.sessionId;
+    });
+    persistInventoryStore();
+    persistInventoryMovements();
+  };
+
+  const openReceiptResult = (session, invoice) => {
+    state.lastPaidReceipt = { session, invoice };
+    if ($("#receiptResultTitle")) $("#receiptResultTitle").textContent = `Factura ${invoice.number}`;
+    if ($("#receiptResultMessage")) $("#receiptResultMessage").textContent = `${sessionLabel(session)} · ${money(invoice.totals.total)} · ${paymentMethodLabel(invoice.paymentMethod)}.`;
+    $("#receiptResultDialog")?.showModal();
+    refreshIcons();
+  };
+
+  const printLastPaidReceipt = () => {
+    const receipt = state.lastPaidReceipt;
+    if (!receipt) {
+      toast("No hay una factura reciente disponible para imprimir.", "error", "receipt-missing");
+      return false;
+    }
+    return printThermalReceipt(receipt.session, receipt.invoice);
   };
 
   const processPayment = async (form, submitter) => {
+    if (state.paymentProcessing) return;
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
     if (!session) {
       toast("La cuenta ya no esta abierta.", "error", "payment-session-missing");
@@ -5055,23 +6012,49 @@ const App = (() => {
       toast("Agrega al menos un producto antes de cobrar.", "error", `empty-payment:${session.id}`);
       return;
     }
+    if (tipsEnabled() && !form.tip_choice?.value) {
+      toast("Selecciona si el cliente paga con o sin propina.", "error", "tip-choice-required");
+      form.querySelector('input[name="tip_choice"]')?.focus({ preventScroll: true });
+      return;
+    }
     const payment = paymentFromForm(form);
     if (!payment) {
       toast("En pago mixto usa dos medios diferentes y distribuye exactamente el total.", "error", "invalid-mixed-payment");
       return;
     }
+    if (payment.method === "cash" && currencyInputNumber(form.cash_received) < integerMoney(state.activePaymentTotal)) {
+      toast("El dinero recibido no alcanza para cubrir el total.", "error", "insufficient-cash");
+      form.cash_received.focus({ preventScroll: true });
+      return;
+    }
     const shouldPrint = submitter?.value === "print";
     const receiptWindow = shouldPrint ? window.open("", "_blank", "width=420,height=720") : null;
-    if (receiptWindow) receiptWindow.document.write("<p style='font-family:sans-serif'>Procesando pago...</p>");
     const buttons = $$('button[type="submit"]', form);
     buttons.forEach((button) => { button.disabled = true; });
+    state.paymentProcessing = true;
+    const inventoryPlan = paidInventoryPlan(session);
+    if (!validatePaidInventory(inventoryPlan)) {
+      receiptWindow?.close();
+      buttons.forEach((button) => { button.disabled = false; });
+      state.paymentProcessing = false;
+      return;
+    }
     const closed = await closeSession(session.id);
     buttons.forEach((button) => { button.disabled = false; });
     if (!closed) {
       receiptWindow?.close();
+      state.paymentProcessing = false;
       return;
     }
     const createdAt = closed.saved.closed_at || new Date().toISOString();
+    const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" ? Number(state.tipSettings.percentage) : 0;
+    const tipAmount = tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0;
+    const invoiceTotals = {
+      ...closed.totals,
+      baseTotal: integerMoney(closed.totals.total),
+      tip: tipAmount,
+      total: integerMoney(closed.totals.total) + tipAmount
+    };
     const invoice = {
       id: uid(),
       number: `TN-${new Date(createdAt).toISOString().slice(0, 10).replace(/-/g, "")}-${sessionReference(session)}`,
@@ -5085,23 +6068,372 @@ const App = (() => {
       waiterName: state.currentUser?.full_name || session.assigned_waiter?.full_name || "",
       paymentMethod: payment.method,
       payments: payment.payments,
+      withTip: tipAmount > 0,
+      tipPercentage,
+      tipAmount,
+      baseTotal: integerMoney(closed.totals.total),
       reference: form.payment_reference.value.trim(),
-      inventoryAdjustedOnConsumption: true,
-      totals: closed.totals,
+      cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
+      changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - invoiceTotals.total : 0,
+      inventoryAdjustedOnConsumption: false,
+      totals: invoiceTotals,
       items: (session.session_items || []).filter((item) => item.status !== "cancelled").map((item) => ({
         id: item.id,
         menu_item_id: item.menu_item_id || null,
         item_name: item.item_name,
         quantity: Number(item.quantity || 0),
         unit_price: Number(item.unit_price || 0),
+        unit_cost: Number(state.inventoryMeta[item.menu_item_id]?.costPrice || 0),
         status: item.status
       }))
     };
+    applyPaidInventoryLocally(invoice, inventoryPlan);
     applyInvoiceToInventory(invoice);
     $("#paymentDialog")?.close();
-    if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     renderInventory();
+    renderTips();
+    if (shouldPrint) {
+      if (!printThermalReceipt(session, invoice, receiptWindow)) openReceiptResult(session, invoice);
+    } else {
+      openReceiptResult(session, invoice);
+    }
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
+    state.paymentProcessing = false;
+  };
+
+  const renderConsumptionSelection = () => {
+    const box = $("#consumptionSelection");
+    const lines = $("#consumptionSelectionLines");
+    const count = $("#consumptionSelectionCount");
+    const total = $("#consumptionSelectionTotal");
+    if (!box || !lines || !count || !total) return;
+    const drafts = state.consumptionDrafts;
+    box.hidden = drafts.length === 0;
+    count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
+    total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
+    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
+    const form = $("#consumptionForm");
+    if (form) form.quantity.required = drafts.length === 0;
+    refreshIcons();
+  };
+
+  const currentConsumptionDraft = (form, { quiet = false } = {}) => {
+    const selectedItem = state.items.find((item) => item.id === form.menu_item_id.value);
+    const itemName = form.item_name.value.trim() || selectedItem?.name || "";
+    const quantity = Number(String(form.quantity.value || "").trim());
+    const unitPrice = form.unit_price.value.trim() ? currencyInputNumber(form.unit_price) : Number(selectedItem?.price || 0);
+    if (!itemName || !Number.isInteger(quantity) || quantity < 1 || quantity > 100 || !Number.isFinite(unitPrice) || unitPrice < 0) {
+      if (!quiet) toast("Selecciona un producto y revisa su cantidad antes de añadirlo.", "error", "invalid-consumption-draft");
+      return null;
+    }
+    return {
+      menuItemId: selectedItem?.id || null,
+      itemName,
+      quantity,
+      unitPrice,
+      notes: form.notes.value.trim(),
+      payerName: form.payer_name.value.trim()
+    };
+  };
+
+  const clearConsumptionEntry = (form) => {
+    form.menu_item_id.value = "";
+    form.item_name.value = "";
+    form.quantity.value = "";
+    form.notes.value = "";
+    setCurrencyInputValue(form.unit_price, 0);
+    if ($("#consumptionProductSearch")) $("#consumptionProductSearch").value = "";
+    renderConsumptionProductOptions("");
+    closeConsumptionProductOptions();
+  };
+
+  const queueConsumptionDraft = () => {
+    const form = $("#consumptionForm");
+    if (!form || form.session_item_id.value) return false;
+    const draft = currentConsumptionDraft(form);
+    if (!draft) return false;
+    state.consumptionDrafts.push(draft);
+    clearConsumptionEntry(form);
+    renderConsumptionSelection();
+    window.requestAnimationFrame(() => $("#consumptionProductSearch")?.focus({ preventScroll: true }));
+    return true;
+  };
+
+  const applyConsumptionRoleRestrictions = (form) => {
+    if (!form) return;
+    const waiter = state.currentUser?.role === "waiter";
+    [form.item_name, form.unit_price].forEach((field) => {
+      if (!field) return;
+      field.readOnly = waiter;
+      field.setAttribute("aria-readonly", String(waiter));
+      field.title = waiter ? "Solo un administrador puede cambiar este dato." : "";
+    });
+  };
+
+  const setTableConsumptionPreviewVisible = (visible) => {
+    const preview = $("#tableConsumptionPreview");
+    const button = $("#viewTableConsumption");
+    if (!preview || !button || button.hidden) return;
+    preview.hidden = !visible;
+    button.innerHTML = visible
+      ? `${icon("list-x", 17)} Esconder lista`
+      : `${icon("receipt-text", 17)} Ver consumo`;
+    button.setAttribute("aria-expanded", String(visible));
+    refreshIcons();
+  };
+
+  const renderTableConsumptionPreview = (session) => {
+    const preview = $("#tableConsumptionPreview");
+    const actions = $("#tableSessionActions");
+    if (!preview || !actions) return;
+    const items = session ? newestSessionItems(session) : [];
+    const emptyAccount = Boolean(session) && !items.length && sessionTotal(session) <= 0;
+    actions.hidden = !session || isLocalWalkInSession(session);
+    const viewButton = $("#viewTableConsumption");
+    const chargeButton = $("#chargeTableAccount");
+    const releaseButton = $("#releaseEmptyTable");
+    if (viewButton) viewButton.hidden = emptyAccount;
+    if (chargeButton) chargeButton.hidden = emptyAccount;
+    if (releaseButton) releaseButton.hidden = !emptyAccount;
+    actions.classList.toggle("is-single", emptyAccount);
+    preview.hidden = true;
+    if (!session) {
+      preview.innerHTML = "";
+      return;
+    }
+    preview.innerHTML = `<div class="table-consumption-preview-head"><span>Consumo actual</span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => `<div><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    setTableConsumptionPreviewVisible(false);
+  };
+
+  const addConsumptionBatch = async (form, drafts) => {
+    let sessionId = form.session_id.value;
+    let session = state.sessions.find((entry) => entry.id === sessionId);
+    const pendingTableId = form.pending_table_id.value;
+    const table = state.tables.find((entry) => String(entry.id) === String(pendingTableId || session?.table_id));
+    if (!session && !table) return null;
+
+    const originalSession = session || null;
+    const optimisticSessionId = session?.id || uid();
+    const openedAt = new Date().toISOString();
+    if (!session) {
+      session = {
+        id: optimisticSessionId,
+        table_id: table.id,
+        status: "open",
+        sale_channel: "table",
+        payer_name: "",
+        assigned_waiter_id: state.currentUser?.id || null,
+        assigned_waiter: state.currentUser,
+        restaurant_tables: table,
+        session_items: [],
+        opened_at: openedAt,
+        created_at: openedAt,
+        updated_at: openedAt
+      };
+      state.sessions = [session, ...state.sessions];
+    }
+
+    const payerName = [...drafts].reverse().find((draft) => draft.payerName)?.payerName || form.payer_name.value.trim() || session.payer_name || "";
+    const optimisticItems = drafts.map((draft, index) => ({
+      id: `local-batch-${uid()}`,
+      session_id: optimisticSessionId,
+      table_id: session.table_id,
+      menu_item_id: draft.menuItemId || null,
+      item_name: draft.itemName,
+      unit_price: Number(draft.unitPrice || 0),
+      quantity: Number(draft.quantity || 0),
+      notes: draft.notes || "",
+      status: "served",
+      created_by_user_id: state.currentUser?.id || null,
+      updated_by_user_id: state.currentUser?.id || null,
+      created_by_user: state.currentUser,
+      created_at: new Date(Date.now() + index).toISOString(),
+      updated_at: new Date().toISOString()
+    }));
+    const optimisticSession = {
+      ...session,
+      payer_name: payerName,
+      assigned_waiter_id: state.currentUser?.id || session.assigned_waiter_id,
+      assigned_waiter: state.currentUser || session.assigned_waiter,
+      session_items: [...(session.session_items || []), ...optimisticItems]
+    };
+    state.sessions = state.sessions.map((entry) => entry.id === optimisticSessionId ? optimisticSession : entry);
+    state.optimisticSessionStates.set(optimisticSessionId, {
+      mode: "upsert",
+      session: optimisticSession,
+      expectedItems: optimisticItems,
+      expectedSession: {
+        payer_name: optimisticSession.payer_name || "",
+        assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
+      }
+    });
+    form.session_id.value = optimisticSessionId;
+    form.pending_table_id.value = "";
+    state.accountsRenderSignature = "";
+    renderAdminLive();
+    toast(`${drafts.length} ${drafts.length === 1 ? "producto agregado" : "productos agregados"} a la cuenta.`, "ok", `consumption-batch-optimistic:${optimisticSessionId}`);
+
+    if (isLocalWalkInSession(session)) {
+      state.optimisticSessionStates.set(optimisticSessionId, { mode: "upsert", localOnly: true, session: optimisticSession });
+      persistWalkInDrafts();
+      return { sessionId: optimisticSessionId, items: optimisticItems };
+    }
+
+    let savedSession = null;
+    let persistedSessionId = optimisticSessionId;
+    if (!originalSession) {
+      savedSession = await retryQuiet(
+        () => state.sb.from("table_sessions").insert({
+          id: optimisticSessionId,
+          table_id: session.table_id,
+          status: "open",
+          sale_channel: "table",
+          payer_name: payerName,
+          assigned_waiter_id: state.currentUser?.id || null
+        }).select("*").single(),
+        4
+      );
+      if (!savedSession) {
+        savedSession = await dbQuiet(
+          state.sb.from("table_sessions").select("*, session_items(*)")
+            .eq("table_id", session.table_id).eq("status", "open")
+            .order("opened_at", { ascending: false }).limit(1).maybeSingle(),
+          null
+        );
+      }
+      if (savedSession?.id && savedSession.id !== optimisticSessionId) {
+        persistedSessionId = savedSession.id;
+        const remappedItems = optimisticItems.map((item) => ({ ...item, session_id: persistedSessionId }));
+        const remappedSession = {
+          ...optimisticSession,
+          ...savedSession,
+          assigned_waiter: state.currentUser || optimisticSession.assigned_waiter,
+          restaurant_tables: table,
+          session_items: [...(savedSession.session_items || []), ...remappedItems]
+        };
+        state.sessions = state.sessions.map((entry) => entry.id === optimisticSessionId ? remappedSession : entry);
+        state.optimisticSessionStates.delete(optimisticSessionId);
+        state.optimisticSessionStates.set(persistedSessionId, {
+          mode: "upsert",
+          session: remappedSession,
+          expectedItems: remappedItems,
+          expectedSession: { payer_name: payerName, assigned_waiter_id: state.currentUser?.id || "" }
+        });
+        form.session_id.value = persistedSessionId;
+      }
+    }
+
+    if (!originalSession && !savedSession) {
+      state.optimisticSessionStates.delete(optimisticSessionId);
+      state.sessions = state.sessions.filter((entry) => entry.id !== optimisticSessionId);
+      form.session_id.value = "";
+      form.pending_table_id.value = table.id;
+      state.accountsRenderSignature = "";
+      renderAdminLive();
+      toast("No fue posible abrir la cuenta de la mesa. La selección fue restaurada.", "error", `batch-session-failed:${optimisticSessionId}`);
+      return null;
+    }
+
+    const payloads = drafts.map((draft) => ({
+      session_id: persistedSessionId,
+      table_id: session.table_id,
+      menu_item_id: draft.menuItemId || null,
+      item_name: draft.itemName,
+      unit_price: Number(draft.unitPrice || 0),
+      quantity: Number(draft.quantity || 0),
+      notes: draft.notes || "",
+      status: "served",
+      created_by_user_id: state.currentUser?.id || null,
+      updated_by_user_id: state.currentUser?.id || null
+    }));
+    const sessionUpdatePromise = originalSession
+      ? retryQuiet(() => state.sb.from("table_sessions").update({
+          payer_name: payerName,
+          assigned_waiter_id: state.currentUser?.id || originalSession.assigned_waiter_id || null
+        }).eq("id", persistedSessionId).select("*").single(), 4)
+      : Promise.resolve(savedSession);
+    const itemsPromise = retryQuiet(() => state.sb.from("session_items").insert(payloads).select("*"), 4);
+    const [sessionSaved, savedItems] = await Promise.all([sessionUpdatePromise, itemsPromise]);
+    if (!Array.isArray(savedItems) || savedItems.length !== drafts.length) {
+      state.optimisticSessionStates.delete(optimisticSessionId);
+      state.optimisticSessionStates.delete(persistedSessionId);
+      if (originalSession) {
+        state.sessions = state.sessions.map((entry) => entry.id === persistedSessionId ? originalSession : entry);
+      } else {
+        state.sessions = state.sessions.filter((entry) => ![optimisticSessionId, persistedSessionId].includes(entry.id));
+        form.session_id.value = "";
+        form.pending_table_id.value = table.id;
+        void dbQuiet(state.sb.from("table_sessions").update({ status: "closed", closed_at: new Date().toISOString() }).eq("id", persistedSessionId), null);
+      }
+      state.accountsRenderSignature = "";
+      renderAdminLive();
+      toast("No se pudo guardar la selección. La cuenta volvió a su valor anterior.", "error", `consumption-batch-failed:${persistedSessionId}`);
+      return null;
+    }
+
+    const temporaryIds = new Set(optimisticItems.map((item) => item.id));
+    let confirmedSession = null;
+    state.sessions = state.sessions.map((entry) => entry.id === persistedSessionId
+      ? (confirmedSession = {
+          ...entry,
+          ...(sessionSaved || {}),
+          restaurant_tables: entry.restaurant_tables || table,
+          assigned_waiter: state.currentUser || entry.assigned_waiter,
+          session_items: [
+            ...(entry.session_items || []).filter((item) => !temporaryIds.has(item.id)),
+            ...savedItems.map((item) => ({ ...item, created_by_user: state.currentUser }))
+          ]
+        })
+      : entry);
+    state.optimisticSessionStates.set(persistedSessionId, {
+      mode: "upsert",
+      session: confirmedSession,
+      expectedItems: savedItems,
+      expectedSession: sessionSaved ? {
+        payer_name: sessionSaved.payer_name || "",
+        assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
+      } : null
+    });
+    return { sessionId: persistedSessionId, items: savedItems };
+  };
+
+  const confirmConsumptionSelection = async (form) => {
+    if (form.session_item_id.value) return addManualConsumption(form);
+    const hasPendingEntry = Boolean(form.menu_item_id.value || form.item_name.value.trim() || form.quantity.value || $("#consumptionProductSearch")?.value.trim());
+    const pendingEntry = currentConsumptionDraft(form, { quiet: true });
+    if (hasPendingEntry && !pendingEntry) {
+      currentConsumptionDraft(form);
+      return null;
+    }
+    if (pendingEntry) state.consumptionDrafts.push(pendingEntry);
+    if (!state.consumptionDrafts.length) {
+      toast("Añade al menos un producto a la selección.", "error", "empty-consumption-selection");
+      return null;
+    }
+    const drafts = [...state.consumptionDrafts];
+    const quickCheckout = form.quick_checkout.value === "1";
+    const submit = $("#consumptionSubmitButton");
+    const queue = $("#consumptionQueueButton");
+    if (submit) submit.disabled = true;
+    if (queue) queue.disabled = true;
+    $("#consumptionDialog")?.close();
+    const result = await addConsumptionBatch(form, drafts);
+    if (submit) submit.disabled = false;
+    if (queue) queue.disabled = false;
+    if (!result) {
+      state.consumptionDrafts = drafts;
+      clearConsumptionEntry(form);
+      renderConsumptionSelection();
+      $("#consumptionDialog")?.showModal();
+      return null;
+    }
+    state.consumptionDrafts = [];
+    renderConsumptionSelection();
+    const sessionId = result.sessionId;
+    $("#consumptionDialog")?.close();
+    clearConsumptionEntry(form);
+    if (quickCheckout) openPaymentDialog(sessionId);
+    return sessionId;
   };
 
   const openConsumptionDialog = (sessionId = "", { pendingTableId = "", quickCheckout = false } = {}) => {
@@ -5113,6 +6445,9 @@ const App = (() => {
     form.session_item_id.value = "";
     form.pending_table_id.value = pendingTableId;
     form.quick_checkout.value = quickCheckout ? "1" : "0";
+    form.quantity.required = true;
+    applyConsumptionRoleRestrictions(form);
+    state.consumptionDrafts = [];
     const session = state.sessions.find((entry) => entry.id === sessionId);
     form.payer_name.value = session?.payer_name || "";
     form.quantity.value = "";
@@ -5125,7 +6460,10 @@ const App = (() => {
     if ($("#consumptionEyebrow")) $("#consumptionEyebrow").textContent = quickCheckout ? "Venta individual" : "Consumo";
     if ($("#consumptionDialogTitle")) $("#consumptionDialogTitle").textContent = quickCheckout ? "Agregar producto y cobrar" : `Agregar a ${table ? tableLabel(table) : "la cuenta"}`;
     const submitLabel = $("#consumptionSubmitButton span");
-    if (submitLabel) submitLabel.textContent = quickCheckout ? "Agregar y continuar al cobro" : "Agregar";
+    if (submitLabel) submitLabel.textContent = quickCheckout ? "Confirmar y cobrar" : "Confirmar selección";
+    if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = false;
+    renderConsumptionSelection();
+    renderTableConsumptionPreview(session);
     closeConsumptionProductOptions();
     dialog.showModal();
     window.setTimeout(() => {
@@ -5138,6 +6476,8 @@ const App = (() => {
     if (!form) return;
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
     const quickCheckout = form.quick_checkout.value === "1";
+    state.consumptionDrafts = [];
+    renderConsumptionSelection();
     $("#consumptionDialog")?.close();
     if (!quickCheckout || !isLocalWalkInSession(session)) return;
     const hasItems = (session.session_items || []).some((item) => item.status !== "cancelled");
@@ -5159,6 +6499,13 @@ const App = (() => {
     form.session_item_id.value = item.id;
     form.pending_table_id.value = "";
     form.quick_checkout.value = "0";
+    form.quantity.required = true;
+    applyConsumptionRoleRestrictions(form);
+    state.consumptionDrafts = [];
+    renderConsumptionSelection();
+    if ($("#tableSessionActions")) $("#tableSessionActions").hidden = true;
+    if ($("#tableConsumptionPreview")) $("#tableConsumptionPreview").hidden = true;
+    if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = true;
     if ($("#consumptionEyebrow")) $("#consumptionEyebrow").textContent = "Consumo";
     if ($("#consumptionDialogTitle")) $("#consumptionDialogTitle").textContent = "Editar consumo";
     const submitLabel = $("#consumptionSubmitButton span");
@@ -5184,14 +6531,13 @@ const App = (() => {
     const session = state.sessions.find((entry) => entry.id === sessionId);
     const item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
     if (!session || !item) return;
-    if (!window.confirm(`¿Eliminar “${item.item_name}” de esta cuenta?\n\nSi controla inventario, las unidades se devolveran automaticamente.`)) return;
-    const product = state.items.find((entry) => entry.id === item.menu_item_id);
-    const stockAdjustment = product ? applyConsumptionInventoryDelta(product, Number(item.quantity || 0), {
-      eventId: `delete-consumption:${uid()}`,
-      sessionId,
-      reference: "ELIMINAR_CONSUMO",
-      movementType: "DEVOLUCION_CONSUMO"
-    }) : null;
+    if (!await askForConfirmation({
+      eyebrow: "Cuenta abierta",
+      title: `¿Quitar ${item.item_name}?`,
+      message: "El producto se retirará de esta cuenta. El inventario no cambia porque todavía no se ha cobrado.",
+      accept: "Sí, quitar producto",
+      cancel: "Conservar producto"
+    })) return;
     const originalSession = session;
     state.sessions = state.sessions.map((entry) => entry.id === sessionId
       ? { ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) }
@@ -5202,19 +6548,18 @@ const App = (() => {
       const updatedSession = state.sessions.find((entry) => entry.id === sessionId);
       state.optimisticSessionStates.set(sessionId, { mode: "upsert", localOnly: true, session: updatedSession });
       persistWalkInDrafts();
-      toast("Consumo eliminado y existencias corregidas.", "ok", `consumption-deleted:${itemId}`);
+      toast("Consumo eliminado. El inventario permanece sin cambios.", "ok", `consumption-deleted:${itemId}`);
       return;
     }
     const saved = await retryQuiet(() => state.sb.from("session_items").update({ status: "cancelled", updated_by_user_id: state.currentUser?.id || null }).eq("id", itemId).select("*").single(), 4);
     if (!saved) {
-      if (stockAdjustment) applyConsumptionInventoryDelta(product, -stockAdjustment.delta, { eventId: `${stockAdjustment.eventId}:rollback`, reversesEventId: stockAdjustment.eventId, sessionId, reference: "REVERSION_ELIMINACION" });
       state.sessions = state.sessions.map((entry) => entry.id === sessionId ? originalSession : entry);
       state.accountsRenderSignature = "";
       renderAdminLive();
       toast("No se pudo eliminar el consumo. La cuenta fue restaurada.", "error", `delete-consumption:${itemId}`);
       return;
     }
-    toast("Consumo eliminado y existencias corregidas.", "ok", `consumption-deleted:${itemId}`);
+    toast("Consumo eliminado. El inventario permanece sin cambios.", "ok", `consumption-deleted:${itemId}`);
   };
 
   const showStockWarning = ({ item, current, change, remaining, minimum, insufficient = false }) => {
@@ -5240,7 +6585,7 @@ const App = (() => {
     });
   };
 
-  const addManualConsumption = async (form) => {
+  const addManualConsumption = async (form, { keepOpen = false, silent = false, openPaymentAfter = form.quick_checkout.value === "1" } = {}) => {
     let sessionId = form.session_id.value;
     let session = state.sessions.find((entry) => entry.id === sessionId);
     const pendingTableId = form.pending_table_id.value;
@@ -5252,7 +6597,6 @@ const App = (() => {
     const itemId = form.session_item_id.value || "";
     const payerName = form.payer_name.value.trim();
     const previousLine = itemId ? session?.session_items?.find((item) => item.id === itemId) : null;
-    const previousItem = state.items.find((item) => item.id === previousLine?.menu_item_id);
     if (!name) {
       toast("El consumo necesita nombre o producto.", "error");
       return;
@@ -5263,50 +6607,6 @@ const App = (() => {
       return;
     }
     if (!session && !pendingTableId) return;
-    const stockDeltaByProduct = new Map();
-    if (previousItem && Object.prototype.hasOwnProperty.call(state.inventoryMeta, previousItem.id)) {
-      stockDeltaByProduct.set(previousItem.id, Number(previousLine.quantity || 0));
-    }
-    if (selectedItem && Object.prototype.hasOwnProperty.call(state.inventoryMeta, selectedItem.id)) {
-      stockDeltaByProduct.set(selectedItem.id, Number(stockDeltaByProduct.get(selectedItem.id) || 0) - quantity);
-    }
-    const stockPlan = Array.from(stockDeltaByProduct.entries()).map(([productId, delta]) => ({
-      item: state.items.find((item) => item.id === productId),
-      delta
-    })).filter((entry) => entry.item && entry.delta !== 0);
-    const insufficient = stockPlan.find((entry) => inventoryFor(entry.item).stock + entry.delta < 0);
-    if (insufficient) {
-      const inventory = inventoryFor(insufficient.item);
-      await showStockWarning({
-        item: insufficient.item,
-        current: inventory.stock,
-        change: Math.abs(insufficient.delta),
-        remaining: inventory.stock + insufficient.delta,
-        minimum: inventory.minStock,
-        insufficient: true
-      });
-      form.quantity.focus({ preventScroll: true });
-      return;
-    }
-    const lowStock = stockPlan.find((entry) => {
-      if (entry.delta >= 0) return false;
-      const inventory = inventoryFor(entry.item);
-      return inventory.stock + entry.delta <= inventory.minStock;
-    });
-    if (lowStock) {
-      const inventory = inventoryFor(lowStock.item);
-      const proceed = await showStockWarning({
-        item: lowStock.item,
-        current: inventory.stock,
-        change: Math.abs(lowStock.delta),
-        remaining: inventory.stock + lowStock.delta,
-        minimum: inventory.minStock
-      });
-      if (!proceed) {
-        form.quantity.focus({ preventScroll: true });
-        return;
-      }
-    }
     if (!session && pendingTableId) {
       const table = state.tables.find((entry) => String(entry.id) === String(pendingTableId) && entry.is_active !== false);
       session = await ensureAdminTableSession(table);
@@ -5318,12 +6618,6 @@ const App = (() => {
       form.session_id.value = sessionId;
       form.pending_table_id.value = "";
     }
-    const stockOperationId = uid();
-    const appliedStockAdjustments = stockPlan.map((entry, index) => applyConsumptionInventoryDelta(entry.item, entry.delta, {
-      eventId: `consumption:${stockOperationId}:${index}`,
-      sessionId,
-      reference: itemId ? "EDICION_CONSUMO" : "NUEVO_CONSUMO"
-    })).filter(Boolean);
     const payload = {
       session_id: sessionId,
       table_id: session.table_id,
@@ -5365,7 +6659,7 @@ const App = (() => {
         assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
       }
     });
-    $("#consumptionDialog")?.close();
+    if (!keepOpen) $("#consumptionDialog")?.close();
     renderAdminLive();
     if (isLocalWalkInSession(session)) {
       state.optimisticSessionStates.set(sessionId, {
@@ -5374,44 +6668,33 @@ const App = (() => {
         session: optimisticSession
       });
       persistWalkInDrafts();
-      toast(itemId ? "Consumo actualizado." : "Producto agregado a la venta individual.", "ok", `walk-in-consumption:${temporaryId}`);
-      if (form.quick_checkout.value === "1") openPaymentDialog(sessionId);
-      return;
+      if (!silent) toast(itemId ? "Consumo actualizado." : "Producto agregado a la venta individual.", "ok", `walk-in-consumption:${temporaryId}`);
+      if (openPaymentAfter) openPaymentDialog(sessionId);
+      return { sessionId, item: optimisticItem };
     }
-    void (async () => {
-      const sessionSaved = await retryQuiet(
+    const sessionSaved = await retryQuiet(
         () => state.sb.from("table_sessions").update({
           payer_name: payerName || session.payer_name || "",
           assigned_waiter_id: state.currentUser?.id || session.assigned_waiter_id || null
         }).eq("id", sessionId).select("*").single(),
         4
-      );
-      const cleanPayload = Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
-      const saved = await retryQuiet(
+    );
+    const cleanPayload = Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
+    const saved = await retryQuiet(
         () => itemId
           ? state.sb.from("session_items").update(cleanPayload).eq("id", itemId).select("*").single()
           : state.sb.from("session_items").insert(cleanPayload).select("*").single(),
         4
-      );
-      if (!saved) {
-        appliedStockAdjustments.forEach((adjustment, index) => {
-          applyConsumptionInventoryDelta(adjustment.item, -adjustment.delta, {
-            eventId: `${adjustment.eventId}:rollback:${index}`,
-            reversesEventId: adjustment.eventId,
-            sessionId,
-            reference: "REVERSION_CONSUMO_NO_GUARDADO"
-          });
-        });
-        state.optimisticSessionStates.delete(sessionId);
-        state.sessions = state.sessions.map((entry) => entry.id === sessionId
-          ? session
-          : entry);
-        renderAdmin();
-        toast("No se pudo guardar el consumo. Se revirtio el cambio.", "error", `consumption-failed:${temporaryId}`);
-        return;
-      }
-      let confirmedSession = null;
-      state.sessions = state.sessions.map((entry) => entry.id === sessionId
+    );
+    if (!saved) {
+      state.optimisticSessionStates.delete(sessionId);
+      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? session : entry);
+      renderAdmin();
+      toast("No se pudo guardar el consumo. La cuenta fue restaurada y el inventario no cambio.", "error", `consumption-failed:${temporaryId}`);
+      return null;
+    }
+    let confirmedSession = null;
+    state.sessions = state.sessions.map((entry) => entry.id === sessionId
         ? (confirmedSession = {
             ...entry,
             ...(sessionSaved || {}),
@@ -5420,17 +6703,19 @@ const App = (() => {
               ? { ...saved, created_by_user: item.created_by_user || state.currentUser }
               : item)
           })
-        : entry);
-      state.optimisticSessionStates.set(sessionId, {
-        mode: "upsert",
-        session: confirmedSession,
-        expectedItem: saved,
-        expectedSession: sessionSaved ? {
-          payer_name: sessionSaved.payer_name || "",
-          assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
-        } : null
-      });
-    })();
+      : entry);
+    state.optimisticSessionStates.set(sessionId, {
+      mode: "upsert",
+      session: confirmedSession,
+      expectedItem: saved,
+      expectedSession: sessionSaved ? {
+        payer_name: sessionSaved.payer_name || "",
+        assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
+      } : null
+    });
+    if (!silent) toast(itemId ? "Consumo actualizado." : "Producto agregado a la cuenta.", "ok", `consumption-saved:${saved.id}`);
+    if (openPaymentAfter) openPaymentDialog(sessionId);
+    return { sessionId, item: saved };
   };
 
   const copyQr = async (code) => {
@@ -5439,7 +6724,7 @@ const App = (() => {
       await navigator.clipboard.writeText(url);
       toast("Enlace de QR copiado.");
     } catch (error) {
-      window.prompt("Enlace para generar o validar el QR de esta mesa:", url);
+      toast("No fue posible copiar el enlace del QR en este navegador.", "error", "qr-copy-failed");
     }
   };
 
@@ -5507,8 +6792,8 @@ const App = (() => {
     });
   };
 
-  const drawQrPdfCard = async (pdf, table, x, y) => {
-    const cardSize = 60;
+  const drawQrPdfCard = async (pdf, table, x, y, preparedQrDataUrl = "") => {
+    const cardSize = 90;
     const [red, green, blue] = pdfAccentColor();
     const rawName = pdfSafeText(table.table_name);
     const fallbackName = `MESA ${table.table_number}`;
@@ -5517,7 +6802,7 @@ const App = (() => {
     const normalizedFallback = fallbackName.replace(/\s+/g, "");
     const secondaryName = normalizedPrimary === normalizedFallback ? "ESCANEA EL CODIGO" : fallbackName;
     const businessName = pdfSafeText(state.business?.business_name || "Servicio a la mesa").toUpperCase();
-    const qrDataUrl = await cachedQrDataUrl(qrTextForTable(table), 1000);
+    const qrDataUrl = preparedQrDataUrl || await cachedQrDataUrl(qrTextForTable(table), 1000);
 
     pdf.setFillColor(255, 255, 255);
     pdf.setDrawColor(30, 35, 43);
@@ -5528,24 +6813,25 @@ const App = (() => {
 
     pdf.setTextColor(92, 99, 112);
     pdf.setFont("helvetica", "bold");
-    fitPdfText(pdf, businessName, 43, 6, 3.8);
-    pdf.text(businessName, x + cardSize / 2, y + 5.1, { align: "center" });
+    fitPdfText(pdf, businessName, 76, 12.5, 8);
+    pdf.text(businessName, x + cardSize / 2, y + 8.4, { align: "center" });
 
     pdf.setTextColor(20, 23, 29);
-    fitPdfText(pdf, primaryName, 52, 12.5, 7.5);
-    pdf.text(primaryName, x + cardSize / 2, y + 10.1, { align: "center" });
+    fitPdfText(pdf, primaryName, 78, 17, 10);
+    pdf.text(primaryName, x + cardSize / 2, y + 15.2, { align: "center" });
 
     pdf.setTextColor(red, green, blue);
     pdf.setFont("helvetica", "bold");
-    fitPdfText(pdf, secondaryName, 48, 5.7, 4.8);
-    pdf.text(secondaryName, x + cardSize / 2, y + 12.8, { align: "center" });
+    fitPdfText(pdf, secondaryName, 72, 8.2, 6.5);
+    pdf.text(secondaryName, x + cardSize / 2, y + 19.2, { align: "center" });
 
-    pdf.addImage(qrDataUrl, "PNG", x + 10.2, y + 14.2, 39.6, 39.6, undefined, "FAST");
+    pdf.addImage(qrDataUrl, "PNG", x + 15.3, y + 21.3, 59.4, 59.4, undefined, "FAST");
 
     pdf.setTextColor(74, 81, 92);
-    pdf.setFont("helvetica", "normal");
-    pdf.setFontSize(5.5);
-    pdf.text("ORDENA Y SOLICITA ATENCION DESDE TU MESA", x + cardSize / 2, y + 57.2, { align: "center" });
+    pdf.setFont("helvetica", "bold");
+    const footerText = "ORDENA Y SOLICITA ATENCION DESDE TU MESA";
+    fitPdfText(pdf, footerText, 82, 10.5, 8.5);
+    pdf.text(footerText, x + cardSize / 2, y + 86.5, { align: "center" });
     drawQrCutMarks(pdf, x, y, cardSize);
   };
 
@@ -5567,26 +6853,27 @@ const App = (() => {
       refreshIcons();
     }
     try {
+      const preparedQrs = await Promise.all(printableTables.map((table) => cachedQrDataUrl(qrTextForTable(table), 1000)));
       const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
-      const columns = 3;
-      const rows = 4;
+      const columns = 2;
+      const rows = 3;
       const cardsPerPage = columns * rows;
-      const cardSize = 60;
-      const gap = 5;
-      const startX = 10;
-      const startY = 21;
+      const cardSize = 90;
+      const gap = 8;
+      const startX = 11;
+      const startY = 8;
       for (let index = 0; index < printableTables.length; index += 1) {
         if (index > 0 && index % cardsPerPage === 0) pdf.addPage("a4", "portrait");
         const pageIndex = index % cardsPerPage;
         const column = pageIndex % columns;
         const row = Math.floor(pageIndex / columns);
-        await drawQrPdfCard(pdf, printableTables[index], startX + column * (cardSize + gap), startY + row * (cardSize + gap));
+        await drawQrPdfCard(pdf, printableTables[index], startX + column * (cardSize + gap), startY + row * (cardSize + gap), preparedQrs[index]);
       }
       const filename = printableTables.length === 1
-        ? `qr-mesa-${printableTables[0].table_number}-6x6.pdf`
-        : `qr-${printableTables.length}-mesas-6x6.pdf`;
+        ? `qr-mesa-${printableTables[0].table_number}-9x9.pdf`
+        : `qr-${printableTables.length}-mesas-9x9.pdf`;
       pdf.save(filename);
-      toast(`${printableTables.length} ${printableTables.length === 1 ? "QR listo" : "QR listos"} en PDF de 6 x 6 cm.`);
+      toast(`${printableTables.length} ${printableTables.length === 1 ? "QR listo" : "QR listos"} en PDF de 9 x 9 cm.`);
     } catch (error) {
       console.error(error);
       toast("No se pudo generar el PDF de los QR. Intenta de nuevo.", "error", "qr-pdf-failed");
@@ -5601,14 +6888,20 @@ const App = (() => {
   };
 
   const downloadSelectedQrs = async () => {
-    const tables = state.tables.filter((table) => state.selectedTableQrIds.has(String(table.id)));
+    const tables = normalTables().filter((table) => state.selectedTableQrIds.has(String(table.id)));
     await downloadQrPdf(tables);
   };
 
   const regenerateQr = async (id) => {
     const table = state.tables.find((entry) => entry.id === id);
     if (!table) return;
-    if (!confirm(`Rehacer el QR de ${tableLabel(table)}? El QR impreso anterior dejara de funcionar.`)) return;
+    if (!await askForConfirmation({
+      eyebrow: "Cambiar código QR",
+      title: `¿Rehacer el QR de ${tableLabel(table)}?`,
+      message: "El QR que ya esté impreso dejará de funcionar y tendrás que imprimir el nuevo.",
+      accept: "Sí, crear QR nuevo",
+      cancel: "Conservar el actual"
+    })) return;
     const nextCode = `mesa-${table.table_number}-${uid().slice(0, 8)}`;
     const saved = await db(
       state.sb
@@ -5672,6 +6965,8 @@ const App = (() => {
   };
 
   const deleteRow = async (table, id, label) => {
+    const rowBeforeDelete = table === "restaurant_tables" ? state.tables.find((entry) => entry.id === id) : null;
+    const quickServicePointDelete = Boolean(rowBeforeDelete && isServicePoint(rowBeforeDelete));
     if (table === "menu_items") {
       const product = state.items.find((entry) => entry.id === id);
       const unitsInOpenTables = state.sessions.reduce((sum, session) => sum + (session.session_items || [])
@@ -5681,8 +6976,8 @@ const App = (() => {
         toast(`No puedes eliminar ${product?.name || "este producto"}: tiene ${unitsInOpenTables} unidad${unitsInOpenTables === 1 ? "" : "es"} en mesas abiertas.`, "error", `product-in-open-table:${id}`);
         return;
       }
-      if (!confirm(`¿Eliminar “${product?.name || "este producto"}”?\n\nSe retirará del menú y del inventario. Las ventas históricas conservarán su detalle.`)) return;
-    } else if (!confirm(`Eliminar ${label}?`)) return;
+      if (!await askForConfirmation({ eyebrow: "Eliminar producto", title: `¿Eliminar ${product?.name || "este producto"}?`, message: "Se retirará del menú y del inventario. Las ventas anteriores conservarán su detalle.", accept: "Sí, eliminar producto", cancel: "Conservar producto" })) return;
+    } else if (!await askForConfirmation({ eyebrow: "Eliminar registro", title: `¿Eliminar ${label}?`, message: "Esta acción retirará el registro del sistema.", accept: "Sí, eliminar", cancel: "Cancelar" })) return;
     const property = {
       restaurant_tables: "tables",
       menu_categories: "categories",
@@ -5691,7 +6986,8 @@ const App = (() => {
     const original = property ? state[property] : null;
     if (property) state[property] = state[property].filter((entry) => entry.id !== id);
     if (property) persistBootstrapCache();
-    renderAdmin();
+    if (quickServicePointDelete) renderServicePoints();
+    else renderAdmin();
     void (async () => {
       const removed = await retryQuiet(
         () => state.sb.from(table).delete().eq("id", id).select("*").single(),
@@ -5710,7 +7006,8 @@ const App = (() => {
       }
       if (property) state[property] = original;
       if (property) persistBootstrapCache();
-      renderAdmin();
+      if (quickServicePointDelete) renderServicePoints();
+      else renderAdmin();
       toast("No se pudo eliminar. Se restauro el registro.", "error", `delete-failed:${table}:${id}`);
     })();
   };
@@ -5720,6 +7017,23 @@ const App = (() => {
     $("#businessForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveBusiness(event.currentTarget);
+    });
+    $("#businessForm")?.addEventListener("change", (event) => {
+      if (event.target.name === "tips_enabled") {
+        if (updateTipSettingsFromForm(event.currentTarget, { toggleChanged: true })) {
+          toast(state.tipSettings.enabled ? `Propina voluntaria activada al ${state.tipSettings.percentage}%.` : "Propina voluntaria desactivada.");
+        }
+      }
+      if (event.target.name === "tip_percentage" && !event.currentTarget.tips_enabled.checked) {
+        updateTipSettingsFromForm(event.currentTarget);
+      }
+    });
+    $("#tipSplitPeople")?.addEventListener("input", (event) => {
+      if (!event.currentTarget.value) return;
+      const people = Math.min(100, Math.max(1, Number(event.currentTarget.value || 1)));
+      state.tipSplitPeople = people;
+      localStorage.setItem(TIP_SPLIT_STORAGE_KEY, String(people));
+      renderTips();
     });
     $("#tableForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -5748,6 +7062,12 @@ const App = (() => {
       await saveInventoryProduct(event.currentTarget);
     });
     $("#inventoryForm")?.addEventListener("input", renderInventoryLiveCalculation);
+    $("#inventoryAdjustForm")?.addEventListener("input", renderInventoryAdjustmentPreview);
+    $("#inventoryAdjustForm")?.addEventListener("change", renderInventoryAdjustmentPreview);
+    $("#inventoryAdjustForm")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      saveInventoryAdjustment(event.currentTarget);
+    });
     $("#incomeFilterForm")?.addEventListener("submit", (event) => {
       event.preventDefault();
       state.incomeRangePreset = "custom";
@@ -5758,6 +7078,10 @@ const App = (() => {
       event.preventDefault();
       await saveIncomeEdit(event.currentTarget);
     });
+    $("#deleteIncomeForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await deleteIncomeSale(event.currentTarget);
+    });
     $("#moveTableForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const targetTableId = new FormData(event.currentTarget).get("target_table_id");
@@ -5765,7 +7089,7 @@ const App = (() => {
     });
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
-      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 350);
+      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 120);
     });
     $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
     [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
@@ -5791,42 +7115,64 @@ const App = (() => {
     });
     $("#consumptionForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
-      await addManualConsumption(event.currentTarget);
+      await confirmConsumptionSelection(event.currentTarget);
     });
     $("#consumptionForm")?.elements.quantity?.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
-      event.currentTarget.form?.requestSubmit();
+      if (event.currentTarget.form?.session_item_id.value) event.currentTarget.form.requestSubmit();
+      else queueConsumptionDraft();
     });
+    $("#consumptionQueueButton")?.addEventListener("click", queueConsumptionDraft);
     $("#paymentForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await processPayment(event.currentTarget, event.submitter);
     });
     $("#paymentForm")?.addEventListener("change", (event) => {
+      if (event.target.name === "tip_choice") updatePaymentTipChoice();
       if (event.target.name === "payment_method") {
         const mixed = event.target.value === "mixed";
         $("#mixedPaymentFields").hidden = !mixed;
+        $("#cashReceivedFields").hidden = event.target.value !== "cash";
         if (mixed) updateMixedPayment("mixed_amount_one");
+        if (event.target.value === "cash") updateCashChange();
       }
       if (event.target.name === "mixed_method_one" || event.target.name === "mixed_method_two") syncMixedMethods(event.target.name);
     });
     $("#paymentForm")?.addEventListener("input", (event) => {
       if (event.target.name === "mixed_amount_one" || event.target.name === "mixed_amount_two") updateMixedPayment(event.target.name);
+      if (event.target.name === "cash_received") updateCashChange();
+    });
+    $("#paymentPrintPreview")?.addEventListener("click", () => {
+      const sessionId = $("#paymentForm")?.session_id?.value || "";
+      const session = state.sessions.find((entry) => entry.id === sessionId);
+      if (session) printThermalReceipt(session);
+    });
+    $("#receiptPrintButton")?.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      printLastPaidReceipt();
     });
     $("#consumptionDialog")?.addEventListener("cancel", (event) => {
       event.preventDefault();
       cancelConsumption();
     });
+    $("#accountDetailDialog")?.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      event.currentTarget.close();
+    });
+    $("#accountDetailDialog")?.addEventListener("close", () => {
+      state.activeAccountDetailId = "";
+    });
     $("#paymentDialog")?.addEventListener("cancel", (event) => {
       event.preventDefault();
       cancelPayment();
     });
-    $("#consumptionDialog")?.addEventListener("click", (event) => {
-      if (event.target === event.currentTarget) cancelConsumption();
-    });
-    $("#paymentDialog")?.addEventListener("click", (event) => {
-      if (event.target === event.currentTarget) cancelPayment();
-    });
+    $$("dialog.modal").forEach((dialog) => dialog.addEventListener("click", (event) => {
+      if (event.target !== dialog || !dialog.open) return;
+      if (dialog.id === "consumptionDialog") cancelConsumption();
+      else if (dialog.id === "paymentDialog") cancelPayment();
+      else dialog.close("cancel");
+    }));
     const productSearch = $("#consumptionProductSearch");
     productSearch?.addEventListener("input", (event) => {
       const form = event.currentTarget.form;
@@ -5885,6 +7231,12 @@ const App = (() => {
       const form = event.target.closest("[data-admin-chat-form]");
       if (form && event.target.name === "message") broadcastTyping("staff", form.dataset.adminChatForm);
     });
+    $("#adminChatDock")?.addEventListener("keydown", (event) => {
+      const minimizedChat = event.target.closest(".admin-chat-window.is-minimized");
+      if (!minimizedChat || event.target.closest("button") || !["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      setAdminChatMinimized(minimizedChat.dataset.adminChatWindow, false);
+    });
     $("#adminAiForm")?.addEventListener("submit", (event) => {
       event.preventDefault();
       askAdminAi(event.currentTarget.question.value);
@@ -5942,6 +7294,10 @@ const App = (() => {
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
     document.addEventListener("change", async (event) => {
+      if (event.target.matches("[data-user-access]")) {
+        await toggleUserAccess(event.target.dataset.userAccess, event.target.checked, event.target);
+        return;
+      }
       if (event.target.matches("[data-select-table-qr]")) {
         const id = String(event.target.dataset.selectTableQr);
         if (event.target.checked) state.selectedTableQrIds.add(id);
@@ -5976,11 +7332,24 @@ const App = (() => {
         if (section === "users" && state.currentUser?.role === "admin") {
           void loadUsers().then(renderUsers);
         }
-        window.scrollTo({ top: 0, behavior: "smooth" });
+        document.documentElement.scrollTop = 0;
+        document.body.scrollTop = 0;
         return;
       }
 
       if (event.target.closest("[data-alert-card]")) stopAlarm();
+
+      const finishChatButton = event.target.closest("[data-finish-admin-chat]");
+      if (finishChatButton) {
+        await requestFinishAdminChat(finishChatButton.dataset.finishAdminChat);
+        return;
+      }
+
+      const minimizedChat = event.target.closest(".admin-chat-window.is-minimized");
+      if (minimizedChat) {
+        setAdminChatMinimized(minimizedChat.dataset.adminChatWindow, false);
+        return;
+      }
 
       const target = event.target.closest("button");
       if (!target) return;
@@ -5992,12 +7361,10 @@ const App = (() => {
         }
       }
       if (target.id === "selectAllTableQrs") {
-        state.selectedTableQrIds = new Set(state.tables.map((table) => String(table.id)));
-        renderTableManager();
+        setAllQrSelections(true);
       }
       if (target.id === "clearTableQrs") {
-        state.selectedTableQrIds.clear();
-        renderTableManager();
+        setAllQrSelections(false);
       }
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
@@ -6006,6 +7373,7 @@ const App = (() => {
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
+      if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
       if (target.id === "refreshIncomeReport") await loadIncomeReport();
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
@@ -6014,8 +7382,46 @@ const App = (() => {
         $("#inventoryDialog")?.close();
       }
       if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
-      if (target.dataset.finishAdminChat) await finishAdminChat(target.dataset.finishAdminChat);
+      if (target.dataset.resetSection) {
+        await resetSectionData(target.dataset.resetSection);
+        return;
+      }
+      if (target.dataset.removeConsumptionDraft !== undefined) {
+        state.consumptionDrafts.splice(Number(target.dataset.removeConsumptionDraft), 1);
+        renderConsumptionSelection();
+      }
+      if (target.dataset.minimizeAdminChat) setAdminChatMinimized(target.dataset.minimizeAdminChat, !state.adminChats.get(String(target.dataset.minimizeAdminChat))?.minimized);
       if (target.id === "newWalkInSale") await createWalkInSale();
+      if (target.id === "addServicePoint") addServicePoint();
+      if (target.dataset.serviceZone) {
+        state.activeServiceZone = target.dataset.serviceZone;
+        localStorage.setItem(SERVICE_ZONE_STORAGE_KEY, state.activeServiceZone);
+        renderServicePoints();
+      }
+      if (target.id === "openCashDrawer" || target.dataset.openCashDrawer !== undefined) await openCashDrawer();
+      if (target.id === "receiptPrintButton") printLastPaidReceipt();
+      if (target.dataset.closeReceiptResult !== undefined) $("#receiptResultDialog")?.close();
+      if (target.id === "viewTableConsumption") {
+        const preview = $("#tableConsumptionPreview");
+        if (preview) setTableConsumptionPreviewVisible(preview.hidden);
+      }
+      if (target.id === "releaseEmptyTable") {
+        const sessionId = $("#consumptionForm")?.session_id.value || "";
+        state.consumptionDrafts = [];
+        $("#consumptionDialog")?.close();
+        const released = await closeSession(sessionId);
+        if (released) toast("Mesa liberada y disponible nuevamente.", "ok", `released-empty-table:${sessionId}`);
+        return;
+      }
+      if (target.id === "chargeTableAccount") {
+        if (state.consumptionDrafts.length) {
+          toast("Confirma o elimina la seleccion pendiente antes de cobrar la cuenta.", "error", "pending-items-before-payment");
+          return;
+        }
+        const sessionId = $("#consumptionForm")?.session_id.value || "";
+        $("#consumptionDialog")?.close();
+        openPaymentDialog(sessionId);
+      }
       if (target.id === "paymentAddItem") {
         const sessionId = $("#paymentForm")?.session_id?.value || "";
         $("#paymentDialog")?.close();
@@ -6028,20 +7434,37 @@ const App = (() => {
       if (target.dataset.openChat) await openAdminChat(target.dataset.openChat);
       if (target.dataset.adminAiQuestion) askAdminAi(target.dataset.adminAiQuestion);
       if (target.dataset.sendBill) await sendBillToClient(target.dataset.sendBill);
+      if (target.dataset.viewAccount) openAccountDetailDialog(target.dataset.viewAccount);
       if (target.dataset.closeSession) await closeSession(target.dataset.closeSession);
-      if (target.dataset.moveSession) openMoveSessionDialog(target.dataset.moveSession);
-      if (target.dataset.chargeSession) openPaymentDialog(target.dataset.chargeSession);
+      if (target.dataset.moveSession) {
+        target.closest("#accountDetailDialog")?.close();
+        openMoveSessionDialog(target.dataset.moveSession);
+      }
+      if (target.dataset.chargeSession) {
+        target.closest("#accountDetailDialog")?.close();
+        openPaymentDialog(target.dataset.chargeSession);
+      }
       if (target.dataset.printSession) {
         const session = state.sessions.find((entry) => entry.id === target.dataset.printSession);
         if (session) printThermalReceipt(session);
       }
-      if (target.dataset.addManual) openConsumptionDialog(target.dataset.addManual);
-      if (target.dataset.editConsumption) editConsumption(target.dataset.sessionId, target.dataset.editConsumption);
+      if (target.dataset.addManual) {
+        target.closest("#accountDetailDialog")?.close();
+        openConsumptionDialog(target.dataset.addManual);
+      }
+      if (target.dataset.editConsumption) {
+        target.closest("#accountDetailDialog")?.close();
+        editConsumption(target.dataset.sessionId, target.dataset.editConsumption);
+      }
       if (target.dataset.deleteConsumption) await deleteConsumption(target.dataset.sessionId, target.dataset.deleteConsumption);
       if (target.dataset.removeIncomeLine !== undefined) {
         const line = target.closest("[data-income-line]");
         const lines = $$('[data-income-line]', $("#incomeEditForm"));
-        if (lines.length <= 1) toast("La venta debe conservar al menos un articulo.", "error", "income-last-line");
+        if (lines.length <= 1) {
+          const saleId = $("#incomeEditForm")?.sale_id.value || "";
+          $("#incomeEditDialog")?.close();
+          openDeleteIncomeDialog(saleId);
+        }
         else line?.remove();
       }
       if (target.dataset.closeDialog !== undefined) target.closest("dialog")?.close();
@@ -6057,10 +7480,15 @@ const App = (() => {
       if (target.dataset.editCategory) editCategory(target.dataset.editCategory);
       if (target.dataset.editItem) editItem(target.dataset.editItem);
       if (target.dataset.editInventory) editInventoryProduct(target.dataset.editInventory);
-      if (target.dataset.inventoryAdjust) adjustInventory(target.dataset.inventoryAdjust, Number(target.dataset.adjustment || 0));
+      if (target.dataset.inventoryAdjust) openInventoryAdjustment(target.dataset.inventoryAdjust);
       if (target.dataset.editUser) editUser(target.dataset.editUser);
       if (target.dataset.deleteUser) await deleteUser(target.dataset.deleteUser);
       if (target.dataset.deleteTable) await deleteRow("restaurant_tables", target.dataset.deleteTable, "esta mesa");
+      if (target.dataset.deleteServicePoint) {
+        const hasOpenAccount = state.sessions.some((session) => String(session.table_id) === String(target.dataset.deleteServicePoint) && session.status === "open");
+        if (hasOpenAccount) toast("Cobra o mueve la cuenta antes de eliminar este puesto.", "error", `service-point-open:${target.dataset.deleteServicePoint}`);
+        else await deleteRow("restaurant_tables", target.dataset.deleteServicePoint, "este puesto");
+      }
       if (target.dataset.deleteCategory) await deleteRow("menu_categories", target.dataset.deleteCategory, "esta categoria");
       if (target.dataset.deleteItem) await deleteRow("menu_items", target.dataset.deleteItem, "este producto");
     });
@@ -6155,14 +7583,6 @@ const App = (() => {
       return;
     }
     let session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
-    if (!session) {
-      session = await dbQuiet(
-        state.sb.from("table_sessions").select("*, session_items(*)")
-          .eq("table_id", table.id).eq("status", "open")
-          .order("opened_at", { ascending: false }).limit(1).maybeSingle(),
-        null
-      );
-    }
     if (session) {
       session = {
         ...session,
@@ -6529,29 +7949,117 @@ const App = (() => {
     });
   };
 
+  const sortUsers = (users) => [...users].sort((left, right) => {
+    const roleOrder = (left.role === "admin" ? 0 : 1) - (right.role === "admin" ? 0 : 1);
+    return roleOrder || String(left.full_name || "").localeCompare(String(right.full_name || ""), "es");
+  });
+
+  const mergeUsers = (...collections) => {
+    const usersById = new Map();
+    collections.flat().filter((user) => user?.id).forEach((user) => usersById.set(String(user.id), user));
+    return sortUsers([...usersById.values()]);
+  };
+
+  const persistUsersCache = () => {
+    try {
+      localStorage.setItem(USER_LIST_CACHE_KEY, JSON.stringify(state.users));
+    } catch (error) { /* La lista remota sigue siendo la fuente principal. */ }
+  };
+
   const loadUsers = async () => {
+    const cachedUsers = readLocalJson(USER_LIST_CACHE_KEY, []);
+    const fallbackUsers = mergeUsers(Array.isArray(cachedUsers) ? cachedUsers : [], state.users, state.currentUser ? [state.currentUser] : []);
     if (state.currentUser?.role !== "admin") {
-      state.users = state.currentUser ? [state.currentUser] : [];
+      state.users = mergeUsers(state.currentUser ? [state.currentUser] : []);
       return;
     }
-    state.users = await dbQuiet(state.sb.rpc("listUsers", { auth_token: state.authToken }), []) || [];
+    state.users = fallbackUsers;
+    renderUsers();
+    let remoteUsers = [];
+    try {
+      const { data, error } = await state.sb.rpc("listUsers", { auth_token: state.authToken });
+      if (error) throw error;
+      remoteUsers = Array.isArray(data) ? data : Array.isArray(data?.users) ? data.users : [];
+    } catch (error) {
+      remoteUsers = [];
+    }
+    state.users = remoteUsers.length
+      ? mergeUsers(state.currentUser ? [state.currentUser] : [], remoteUsers)
+      : fallbackUsers;
+    if (remoteUsers.length) persistUsersCache();
   };
 
   const renderUsers = () => {
     const list = $("#usersList");
     if (!list) return;
+    const badge = $("#usersCountBadge");
+    if (badge) badge.innerHTML = `${icon("users-round", 16)} ${state.users.length} ${state.users.length === 1 ? "usuario" : "usuarios"}`;
     list.innerHTML = state.users.length
       ? state.users.map((user) => `
-          <div class="manager-row">
-            <div class="category-token">${icon(user.role === "admin" ? "shield" : "user-round", 17)}</div>
-            <div>
-              <strong>${escapeHTML(user.full_name)}</strong>
-              <span>@${escapeHTML(user.username)} · ${user.role === "admin" ? "Administrador" : "Mesero"} · ${user.is_active ? "Activo" : "Inactivo"}</span>
+          <article class="user-card ${user.is_active === false ? "is-disabled" : ""}">
+            <div class="user-avatar">${icon(user.role === "admin" ? "shield-check" : "user-round", 20)}</div>
+            <div class="user-card-copy">
+              <div class="user-card-name"><strong>${escapeHTML(user.full_name)}</strong>${String(user.id) === String(state.currentUser?.id) ? '<span class="current-user-badge">Sesión actual</span>' : ""}</div>
+              <span>@${escapeHTML(user.username)}</span>
+              <div class="user-card-badges"><em>${user.role === "admin" ? "Administrador" : "Mesero"}</em><em class="${user.is_active === false ? "is-off" : "is-on"}">${user.is_active === false ? "Sin acceso" : "Acceso activo"}</em></div>
             </div>
-            <div class="row-actions user-row-actions"><button class="icon-btn" data-edit-user="${user.id}" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
-          </div>`).join("")
+            <label class="user-access-switch" title="${user.is_active === false ? "Dar acceso" : "Quitar acceso"}">
+              <span>Acceso</span>
+              <input type="checkbox" data-user-access="${user.id}" ${user.is_active === false ? "" : "checked"} aria-label="${user.is_active === false ? "Dar acceso" : "Quitar acceso"} a ${escapeHTML(user.full_name)}">
+              <span class="user-access-track" aria-hidden="true"></span>
+            </label>
+            <div class="row-actions user-row-actions"><button class="icon-btn" data-edit-user="${user.id}" title="Editar" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" title="Eliminar" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
+          </article>`).join("")
       : emptyState("Sin usuarios", "Crea el equipo operativo.", "users");
     refreshIcons();
+  };
+
+  const resetUserFormPresentation = (form = $("#userForm")) => {
+    if (!form) return;
+    if ($("#userFormEyebrow")) $("#userFormEyebrow").textContent = "Nuevo acceso";
+    if ($("#userFormTitle")) $("#userFormTitle").textContent = "Agregar integrante";
+    const label = form.querySelector('.user-save-button span');
+    if (label) label.textContent = "Guardar usuario";
+  };
+
+  const toggleUserAccess = async (id, nextActive, control) => {
+    const user = state.users.find((entry) => String(entry.id) === String(id));
+    if (!user || (user.is_active !== false) === nextActive) return;
+    if (String(user.id) === String(state.currentUser?.id) && !nextActive) {
+      if (control) control.checked = true;
+      toast("No puedes quitar tu propio acceso mientras esta sesión está abierta.", "error", "disable-current-user");
+      return;
+    }
+    if (control) control.disabled = true;
+    let saved = null;
+    let saveError = null;
+    try {
+      const result = await state.sb.rpc("saveUser", {
+        auth_token: state.authToken,
+        id: user.id,
+        full_name: user.full_name,
+        username: user.username,
+        pin: "",
+        role: user.role,
+        is_active: nextActive
+      });
+      saved = result.data;
+      saveError = result.error;
+    } catch (error) {
+      saveError = error;
+    }
+    if (saveError || !saved?.id) {
+      if (control) {
+        control.checked = user.is_active !== false;
+        control.disabled = false;
+      }
+      toast(saveError?.message || "No se pudo cambiar el acceso del usuario.", "error", `user-access:${id}`);
+      return;
+    }
+    state.users = mergeUsers(state.users.map((entry) => String(entry.id) === String(saved.id) ? saved : entry));
+    persistUsersCache();
+    renderUsers();
+    toast(nextActive ? `Acceso habilitado para ${saved.full_name}.` : `Acceso deshabilitado para ${saved.full_name}.`, "ok", `user-access-saved:${saved.id}:${nextActive}`);
   };
 
   const saveUser = async (form) => {
@@ -6589,9 +8097,8 @@ const App = (() => {
       toast(saveError?.message || "No se pudo guardar el usuario.", "error", "save-user-failed");
       return;
     }
-    state.users = isEditing
-      ? state.users.map((user) => user.id === saved.id ? saved : user)
-      : [...state.users, saved].sort((left, right) => String(left.full_name).localeCompare(String(right.full_name), "es"));
+    state.users = mergeUsers(state.users.map((user) => String(user.id) === String(saved.id) ? saved : user), [saved]);
+    persistUsersCache();
     if (String(saved.id) === String(state.currentUser?.id)) {
       state.currentUser = saved;
       localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(saved));
@@ -6600,6 +8107,8 @@ const App = (() => {
     form.reset();
     form.user_id.value = "";
     form.is_active.checked = true;
+    form.pin.placeholder = "4 a 12 dígitos";
+    resetUserFormPresentation(form);
     renderUsers();
     toast(isEditing ? `Usuario actualizado${pin ? " con nuevo PIN" : ""}.` : "Usuario creado correctamente.", "ok", `user-saved:${saved.id}`);
   };
@@ -6612,8 +8121,13 @@ const App = (() => {
     form.full_name.value = user.full_name || "";
     form.username.value = user.username || "";
     form.pin.value = "";
+    form.pin.placeholder = "Dejar vacío para conservar";
     form.role.value = user.role || "waiter";
     form.is_active.checked = user.is_active !== false;
+    if ($("#userFormEyebrow")) $("#userFormEyebrow").textContent = "Editar acceso";
+    if ($("#userFormTitle")) $("#userFormTitle").textContent = user.full_name || "Usuario";
+    const submitLabel = form.querySelector('.user-save-button span');
+    if (submitLabel) submitLabel.textContent = "Guardar cambios";
     form.scrollIntoView({ behavior: "smooth", block: "center" });
   };
 
@@ -6624,7 +8138,7 @@ const App = (() => {
       toast("No puedes eliminar el usuario con el que tienes la sesion abierta.", "error", "delete-current-user");
       return;
     }
-    if (!window.confirm(`¿Eliminar a ${user.full_name}?\n\nNo podrá volver a iniciar sesión; sus ventas anteriores conservarán el responsable.`)) return;
+    if (!await askForConfirmation({ eyebrow: "Eliminar usuario", title: `¿Eliminar a ${user.full_name}?`, message: "No podrá volver a iniciar sesión. Sus ventas anteriores conservarán el nombre del responsable.", accept: "Sí, eliminar usuario", cancel: "Conservar usuario" })) return;
     let result = null;
     let deleteError = null;
     try {
@@ -6639,12 +8153,15 @@ const App = (() => {
       return;
     }
     state.users = state.users.filter((entry) => entry.id !== id);
+    persistUsersCache();
     renderUsers();
     const form = $("#userForm");
     if (form?.user_id.value === id) {
       form.reset();
       form.user_id.value = "";
       form.is_active.checked = true;
+      form.pin.placeholder = "4 a 12 dígitos";
+      resetUserFormPresentation(form);
     }
     toast("Usuario eliminado. El historial de sus ventas se conserva.", "ok", `user-deleted:${id}`);
   };
@@ -6666,6 +8183,7 @@ const App = (() => {
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
     loadInventoryStore();
+    void loadUsers().then(renderUsers);
     state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") === "1";
     const initialSection = pendingScan ? "service" : (location.hash.replace("#", "") || "dashboard");
     renderAdmin();
@@ -6685,7 +8203,6 @@ const App = (() => {
     initRemoteStorage();
     window.addEventListener("online", flushAppsScriptOutbox);
     startAdminPolling();
-    void loadUsers().then(renderUsers);
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
       cleanUrl.searchParams.delete("scan");
@@ -6698,6 +8215,7 @@ const App = (() => {
 
   const init = async () => {
     state.page = document.body.dataset.page || "";
+    void registerPwa();
     if (!connect()) {
       document.body.innerHTML = `
         <main class="setup-screen">

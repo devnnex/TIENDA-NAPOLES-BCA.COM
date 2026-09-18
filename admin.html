@@ -3,9 +3,16 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f05a28" id="pwaThemeColor">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Admin - Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="stylesheet" href="style.css?v=20260903-tables-2">
+    <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
+    <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
+    <link rel="stylesheet" href="style.css?v=20260918-receipt-2">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -33,9 +40,10 @@
         </div>
       </div>
       <nav>
-        <a href="#dashboard"><i data-lucide="layout-dashboard"></i> Inicio</a>
+        <a href="#dashboard" data-admin-only><i data-lucide="layout-dashboard"></i> Inicio</a>
         <a href="#service" class="service-nav-link"><i data-lucide="scan-line"></i> Atender mesa <span class="nav-request-badge" id="navRequestBadge" role="status" aria-label="Solicitudes pendientes" hidden>0</span></a>
         <a href="#accounts"><i data-lucide="receipt-text"></i> Cuentas</a>
+        <a href="#tips" class="tips-nav-link" data-tip-feature hidden><i data-lucide="hand-coins"></i> Propinas</a>
         <a href="#inventory" data-admin-only><i data-lucide="boxes"></i> Inventario</a>
         <a href="#movements" data-admin-only><i data-lucide="arrow-left-right"></i> Movimientos</a>
         <a href="#income" data-admin-only><i data-lucide="circle-dollar-sign"></i> Ingresos</a>
@@ -68,7 +76,10 @@
           <p class="js-business-subtitle">Gestiona solicitudes, mesas, menu y cuentas.</p>
           <span class="live-status" id="realtimeStatus"><i data-lucide="wifi"></i> Conectando en vivo</span>
         </div>
-        <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
+        <div class="admin-header-actions">
+          <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
+          <button class="ghost" id="openCashDrawer" type="button"><i data-lucide="archive-restore"></i> Abrir caja</button>
+        </div>
       </header>
 
       <section class="metrics-grid" data-admin-section="dashboard">
@@ -135,6 +146,20 @@
             <small data-upload-status="cover_url">Seleccionar imagen</small>
           </label>
           <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar marca</button>
+          <div class="tip-setting-card wide">
+            <div class="tip-setting-copy">
+              <span class="tip-setting-icon"><i data-lucide="hand-coins"></i></span>
+              <div><strong>Propina voluntaria</strong><small>Al activarla, se mostrará como opción en cuentas, pre-cuentas y cobros.</small></div>
+            </div>
+            <label class="modern-switch" title="Propina">
+              <input name="tips_enabled" type="checkbox" role="switch" aria-label="Activar propina voluntaria">
+              <span aria-hidden="true"></span>
+            </label>
+            <label class="tip-percentage-field">Porcentaje
+              <span><input name="tip_percentage" type="number" min="1" max="100" step="1" inputmode="numeric" value="10" aria-label="Porcentaje de propina"><strong>%</strong></span>
+            </label>
+            <small class="tip-setting-status" id="tipSettingStatus">Configura el porcentaje y enciende el switch para aplicarlo.</small>
+          </div>
         </form>
       </section>
 
@@ -164,7 +189,7 @@
           <div class="qr-batch-panel" id="qrBatchPanel">
             <div class="qr-batch-copy">
               <span class="eyebrow">Impresion profesional</span>
-              <strong>QR identificados de 6 x 6 cm</strong>
+              <strong>QR identificados de 9 x 9 cm</strong>
               <small>Selecciona las mesas y descarga un PDF listo para imprimir y recortar.</small>
             </div>
             <div class="qr-batch-actions">
@@ -238,6 +263,7 @@
           <div class="inventory-heading-actions">
             <span class="inventory-sync-status is-local" id="inventorySyncStatus"><i data-lucide="hard-drive"></i> Respaldo local</span>
             <button class="primary" id="newInventoryProduct" type="button"><i data-lucide="package-plus"></i> Nuevo producto</button>
+            <button class="ghost danger-text section-reset-button" type="button" data-reset-section="inventory"><i data-lucide="trash-2"></i> Eliminar todo</button>
           </div>
         </div>
 
@@ -246,7 +272,7 @@
             <strong><i data-lucide="cloud-cog"></i> Historial y respaldo</strong>
             <p>Si se corta internet, las ventas y ajustes pendientes quedan guardados temporalmente en esta caja y se envían al volver la conexión.</p>
           </div>
-          <button class="ghost" id="syncAppsScriptInventory" type="button"><i data-lucide="refresh-cw"></i> Sincronizar ahora</button>
+          <button class="ghost" id="syncAppsScriptInventory" type="button"><i data-lucide="refresh-cw"></i> Actualizar respaldo</button>
         </div>
 
         <div class="inventory-metrics" id="inventoryMetrics"></div>
@@ -279,7 +305,10 @@
             <h2>Movimientos de inventario</h2>
             <p>Entradas, salidas, productos nuevos y devoluciones con fecha, hora y responsable.</p>
           </div>
-          <button class="primary" id="refreshInventoryMovements" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
+          <div class="inventory-heading-actions">
+            <button class="primary" id="refreshInventoryMovements" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
+            <button class="ghost danger-text section-reset-button" type="button" data-reset-section="movements"><i data-lucide="trash-2"></i> Eliminar todo</button>
+          </div>
         </div>
         <div class="movement-summary" id="movementSummary"></div>
         <div class="panel movement-panel">
@@ -310,6 +339,7 @@
           <div class="income-heading-actions">
             <button class="ghost" id="exportIncomeCsv" type="button"><i data-lucide="file-down"></i> Exportar</button>
             <button class="primary" id="refreshIncomeReport" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
+            <button class="ghost danger-text section-reset-button" type="button" data-reset-section="income"><i data-lucide="trash-2"></i> Eliminar todo</button>
           </div>
         </div>
 
@@ -369,6 +399,30 @@
         <div class="accounts-panel" id="accountsPanel"></div>
       </section>
 
+      <section class="panel tips-section" id="tips" data-admin-section="tips" data-tip-feature hidden>
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Equipo y servicio</span>
+            <h2>Propinas</h2>
+            <p>Consulta lo acumulado hoy y calcula cuánto corresponde por persona.</p>
+          </div>
+          <span class="tips-live-badge"><i data-lucide="sparkles"></i> Propina activa</span>
+        </div>
+        <div class="tips-kpis" id="tipsKpis"></div>
+        <div class="tips-layout">
+          <article class="tip-split-card">
+            <span class="eyebrow">División del equipo</span>
+            <h3>Repartir propinas</h3>
+            <label>Número de personas<input id="tipSplitPeople" type="number" min="1" max="100" step="1" value="1" inputmode="numeric"></label>
+            <div class="tip-split-result" id="tipSplitResult"></div>
+          </article>
+          <article class="tips-history-card">
+            <div><span class="eyebrow">Detalle facturado</span><h3>Movimientos con propina</h3></div>
+            <div class="tips-records" id="tipsRecords"></div>
+          </article>
+        </div>
+      </section>
+
       <section class="panel" id="service" data-admin-section="service">
         <div class="section-head">
           <div>
@@ -377,13 +431,24 @@
           </div>
         </div>
         <div class="service-sales-layout">
+          <article class="service-points-panel">
+            <div class="service-points-head">
+              <div class="service-block-title"><span><i data-lucide="wine"></i></span><div><strong>Puntos sin QR</strong><small>Atiéndelos igual que una mesa y reconoce de dónde viene cada cuenta.</small></div></div>
+              <div class="service-zone-tabs" role="tablist" aria-label="Elegir zona">
+                <button class="ghost is-active" type="button" data-service-zone="bar" role="tab" aria-selected="true">Barras del bar</button>
+                <button class="ghost" type="button" data-service-zone="planter" role="tab" aria-selected="false">Materas</button>
+              </div>
+            </div>
+            <div class="service-points-grid" id="servicePointsGrid"></div>
+            <button class="ghost service-point-add" id="addServicePoint" type="button" data-admin-only><i data-lucide="plus"></i> Agregar puesto</button>
+          </article>
           <article class="service-tables-panel">
             <div class="service-block-title"><span><i data-lucide="armchair"></i></span><div><strong>Ventas por mesa</strong><small>Verde libre, amarillo con cuenta abierta</small></div></div>
             <div class="compact-tables-grid" id="waiterTablesGrid"></div>
           </article>
           <article class="walk-in-sale-card">
             <span class="walk-in-icon"><i data-lucide="shopping-bag"></i></span>
-            <div><span class="eyebrow">Venta rapida</span><h3>Cliente individual</h3><p>Sin ocupar mesa. Al cobrar se guarda en el historico de Apps Script y Google Sheets.</p></div>
+            <div><span class="eyebrow">Venta rápida</span><h3>Cliente individual</h3><p>Para una compra que no ocupa mesa, barra ni matera.</p></div>
             <button class="primary" id="newWalkInSale" type="button"><i data-lucide="plus"></i> Nueva venta individual</button>
           </article>
         </div>
@@ -400,23 +465,33 @@
         </div>
       </section>
 
-      <section class="panel" id="users" data-admin-section="users" data-admin-only>
+      <section class="panel users-section" id="users" data-admin-section="users" data-admin-only>
         <div class="section-head">
           <div>
             <span class="eyebrow">Equipo</span>
             <h2>Usuarios y meseros</h2>
+            <p>Administra las credenciales, el rol y el acceso de cada integrante.</p>
           </div>
+          <span class="users-count-badge" id="usersCountBadge"><i data-lucide="users-round"></i> 0 usuarios</span>
         </div>
-        <form class="form-grid" id="userForm">
+        <form class="user-form-card" id="userForm">
           <input type="hidden" name="user_id">
-          <label>Nombre completo<input name="full_name" type="text" required></label>
-          <label>Usuario<input name="username" type="text" autocomplete="off" required></label>
-          <label>PIN<input name="pin" type="password" inputmode="numeric" minlength="4" maxlength="12" pattern="[0-9]{4,12}" autocomplete="new-password" placeholder="Dejar vacio para conservar"></label>
-          <label>Rol<select name="role"><option value="waiter">Mesero</option><option value="admin">Administrador</option></select></label>
-          <label class="check"><input name="is_active" type="checkbox" checked> Activo</label>
-          <button class="primary form-submit" type="submit"><i data-lucide="user-plus"></i> Guardar usuario</button>
+          <div class="user-form-heading">
+            <span class="user-form-icon"><i data-lucide="user-cog"></i></span>
+            <div><span class="eyebrow" id="userFormEyebrow">Nuevo acceso</span><h3 id="userFormTitle">Agregar integrante</h3></div>
+          </div>
+          <div class="user-form-fields">
+            <label class="user-field user-field-name"><span><i data-lucide="contact"></i> Nombre completo</span><input name="full_name" type="text" autocomplete="name" placeholder="Nombre del integrante" required></label>
+            <label class="user-field user-field-username"><span><i data-lucide="at-sign"></i> Usuario</span><input name="username" type="text" autocomplete="off" placeholder="Ej. mesero.juan" required></label>
+            <label class="user-field user-field-pin"><span><i data-lucide="key-round"></i> PIN</span><input name="pin" type="password" inputmode="numeric" minlength="4" maxlength="12" pattern="[0-9]{4,12}" autocomplete="new-password" placeholder="4 a 12 dígitos"></label>
+            <label class="user-field user-field-role"><span><i data-lucide="shield-check"></i> Rol</span><select name="role"><option value="waiter">Mesero</option><option value="admin">Administrador</option></select></label>
+          </div>
+          <div class="user-form-footer">
+            <div class="check user-active-check"><input name="is_active" type="checkbox" checked aria-label="Usuario activo"><span>Activo al guardar</span></div>
+            <button class="primary user-save-button" type="submit"><i data-lucide="user-plus"></i> <span>Guardar usuario</span></button>
+          </div>
         </form>
-        <div class="manager-list" id="usersList"></div>
+        <div class="users-list" id="usersList"></div>
       </section>
     </main>
 
@@ -435,6 +510,12 @@
             <i data-lucide="x"></i>
           </button>
         </div>
+        <div class="table-session-actions" id="tableSessionActions" hidden>
+          <button class="ghost" id="viewTableConsumption" type="button"><i data-lucide="receipt-text"></i> Ver consumo</button>
+          <button class="primary" id="chargeTableAccount" type="button"><i data-lucide="badge-dollar-sign"></i> Cobrar cuenta</button>
+          <button class="ghost danger-text" id="releaseEmptyTable" type="button" hidden><i data-lucide="door-open"></i> Liberar mesa</button>
+        </div>
+        <div class="table-consumption-preview" id="tableConsumptionPreview" hidden></div>
         <div class="product-picker-field">
           <label for="consumptionProductSearch">Producto</label>
           <div class="product-combobox" id="consumptionProductCombobox">
@@ -454,17 +535,27 @@
         <details class="consumption-optional" id="consumptionOptionalFields">
           <summary><i data-lucide="sliders-horizontal"></i> Datos opcionales</summary>
           <div class="consumption-optional-grid">
-            <label>Nombre personalizado<input name="item_name" type="text" placeholder="Solo si no eliges un producto"></label>
+            <label class="consumption-admin-field">Nombre personalizado<input name="item_name" type="text" placeholder="Solo si no eliges un producto"></label>
             <label>Quién paga<input name="payer_name" type="text" placeholder="Responsable de la cuenta"></label>
-            <label>Precio manual<input name="unit_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+            <label class="consumption-admin-field">Precio manual<input name="unit_price" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
             <label class="wide">Nota<textarea name="notes" rows="2" placeholder="Observaciones opcionales"></textarea></label>
           </div>
         </details>
+        <div class="consumption-selection" id="consumptionSelection" hidden>
+          <div class="consumption-selection-head"><strong>Selección actual</strong><span id="consumptionSelectionCount">0 productos</span></div>
+          <div class="consumption-selection-lines" id="consumptionSelectionLines"></div>
+          <div class="consumption-selection-total"><span>Total de la selección</span><strong id="consumptionSelectionTotal">$0</strong></div>
+        </div>
         <div class="modal-actions">
           <button class="ghost" type="button" data-cancel-consumption>Cancelar</button>
-          <button class="primary" id="consumptionSubmitButton" type="submit"><i data-lucide="plus"></i> <span>Agregar</span></button>
+          <button class="ghost" id="consumptionQueueButton" type="button"><i data-lucide="list-plus"></i> Añadir a selección</button>
+          <button class="primary" id="consumptionSubmitButton" type="submit"><i data-lucide="check"></i> <span>Confirmar selección</span></button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="modal account-detail-modal" id="accountDetailDialog">
+      <article class="modal-card account-detail-card" id="accountDetailContent"></article>
     </dialog>
 
     <dialog class="modal" id="stockWarningDialog">
@@ -501,8 +592,14 @@
         <div class="payment-summary">
           <span id="paymentTableLabel">Mesa</span>
           <strong id="paymentTotal">$0</strong>
-          <small>El total se valida antes de cerrar la cuenta.</small>
+          <small id="paymentTotalHint">El total se valida antes de cerrar la cuenta.</small>
         </div>
+
+        <fieldset class="payment-tip-choice" id="paymentTipChoice" hidden>
+          <legend>¿Cómo desea pagar el cliente?</legend>
+          <label><input type="radio" name="tip_choice" value="without"><span><i data-lucide="receipt"></i><strong>Sin propina</strong><small id="paymentWithoutTipAmount">Total consumo</small></span></label>
+          <label><input type="radio" name="tip_choice" value="with"><span><i data-lucide="hand-coins"></i><strong id="paymentWithTipLabel">Con propina</strong><small id="paymentWithTipAmount">Propina voluntaria</small></span></label>
+        </fieldset>
 
         <div class="payment-sale-lines" id="paymentSaleLines"></div>
         <button class="ghost payment-add-item" id="paymentAddItem" type="button" hidden><i data-lucide="plus"></i> Agregar otro producto</button>
@@ -514,6 +611,11 @@
           <label><input type="radio" name="payment_method" value="breb"><span><i data-lucide="scan-line"></i>Bre-B</span></label>
           <label><input type="radio" name="payment_method" value="mixed"><span><i data-lucide="split"></i>Mixto</span></label>
         </fieldset>
+
+        <div class="cash-received" id="cashReceivedFields">
+          <label>Dinero recibido<input name="cash_received" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
+          <div class="cash-change" id="cashChange"><span>Vueltas / cambio</span><strong>$0</strong><small>Ingresa el dinero que entrega el cliente.</small></div>
+        </div>
 
         <div class="mixed-payment" id="mixedPaymentFields" hidden>
           <div class="mixed-payment-head">
@@ -542,10 +644,23 @@
         <label>Referencia o nota (opcional)<input name="payment_reference" type="text" maxlength="100" placeholder="Ultimos 4 digitos, comprobante, observacion..."></label>
         <div class="modal-actions payment-actions">
           <button class="ghost" type="button" data-cancel-payment>Cancelar</button>
+          <button class="ghost payment-preview-print" type="button" id="paymentPrintPreview"><i data-lucide="printer"></i> Imprimir pre-cuenta</button>
           <button class="ghost" type="submit" name="receipt_action" value="save"><i data-lucide="badge-check"></i> Cobrar sin imprimir</button>
           <button class="primary" type="submit" name="receipt_action" value="print"><i data-lucide="printer"></i> Cobrar e imprimir</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="modal receipt-result-modal" id="receiptResultDialog">
+      <div class="modal-card receipt-result-card">
+        <span class="receipt-result-icon"><i data-lucide="badge-check"></i></span>
+        <div><span class="eyebrow">Pago confirmado</span><h2 id="receiptResultTitle">Factura generada</h2><p id="receiptResultMessage"></p></div>
+        <div class="receipt-result-actions">
+          <button class="ghost" type="button" data-close-receipt-result>Cerrar</button>
+          <button class="primary" id="receiptPrintButton" type="button" title="Clic para imprimir. Clic derecho: impresión rápida"><i data-lucide="printer"></i> Imprimir factura</button>
+        </div>
+        <small class="receipt-print-hint"><i data-lucide="mouse-pointer-click"></i> También puedes hacer clic derecho únicamente sobre “Imprimir factura” como acceso rápido.</small>
+      </div>
     </dialog>
 
     <dialog class="modal inventory-product-modal" id="inventoryDialog">
@@ -563,10 +678,32 @@
           <label>Existencia actual<input name="stock" type="number" min="0" step="0.01" value="" inputmode="decimal" placeholder="Escribe la existencia"></label>
           <label>Stock minimo<input name="min_stock" type="number" min="0" step="0.01" value="5" inputmode="decimal"></label>
           <label>Unidad<select name="unit"><option value="unidad">Unidad</option><option value="botella">Botella</option><option value="lata">Lata</option><option value="paquete">Paquete</option><option value="porcion">Porcion</option></select></label>
-          <label class="check"><input name="is_available" type="checkbox" checked> Disponible para vender</label>
+          <div class="check inventory-availability"><input name="is_available" type="checkbox" checked aria-label="Disponible para vender"><span>Disponible para vender</span></div>
           <div class="inventory-live-calculation wide" id="inventoryLiveCalculation" aria-live="polite"></div>
           <div class="inventory-form-actions wide"><button class="ghost" id="cancelInventoryEdit" type="button">Cancelar</button><button class="primary" type="submit"><i data-lucide="save"></i> Guardar producto</button></div>
         </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal inventory-adjust-modal" id="inventoryAdjustDialog">
+      <form class="modal-card" id="inventoryAdjustForm">
+        <input type="hidden" name="product_id">
+        <div class="section-head"><div><span class="eyebrow">Corregir existencia</span><h2 id="inventoryAdjustTitle">Ajustar unidades</h2><p id="inventoryAdjustCurrent"></p></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <fieldset class="inventory-adjust-options">
+          <label><input type="radio" name="operation" value="add" checked><span><i data-lucide="plus"></i><strong>Sumar</strong><small>Agregar unidades</small></span></label>
+          <label><input type="radio" name="operation" value="subtract"><span><i data-lucide="minus"></i><strong>Restar</strong><small>Quitar unidades</small></span></label>
+        </fieldset>
+        <label>¿Cuántas unidades?<input name="quantity" type="number" min="0.01" step="0.01" value="1" inputmode="decimal" required></label>
+        <div class="inventory-adjust-result" id="inventoryAdjustResult"></div>
+        <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Cancelar</button><button class="primary" type="submit"><i data-lucide="check"></i> Guardar existencia</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="modal zero-profit-modal" id="zeroProfitDialog">
+      <form class="modal-card zero-profit-card" method="dialog">
+        <span class="zero-profit-icon"><i data-lucide="circle-alert"></i></span>
+        <div><span class="eyebrow">Ojo con este producto</span><h2>No te dejará ganancia</h2><p>El precio de venta es igual al costo. Si lo vendes así, recuperarás lo invertido, pero no ganarás dinero.</p></div>
+        <div class="modal-actions"><button class="ghost" type="submit" value="cancel">Volver a revisar</button><button class="danger-button" type="submit" value="confirm">Guardar de todas formas</button></div>
       </form>
     </dialog>
 
@@ -595,9 +732,26 @@
       </form>
     </dialog>
 
+    <dialog class="modal" id="deleteIncomeDialog">
+      <form class="modal-card confirm-card" id="deleteIncomeForm">
+        <input type="hidden" name="sale_id">
+        <span class="confirm-icon danger"><i data-lucide="trash-2"></i></span>
+        <div><span class="eyebrow">Eliminar venta</span><h2 id="deleteIncomeTitle">¿Eliminar esta venta?</h2><p id="deleteIncomeMessage">Se borrará del historial y las unidades vendidas volverán al inventario.</p></div>
+        <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Conservar venta</button><button class="danger-button" type="submit"><i data-lucide="trash-2"></i> Sí, eliminar esta venta</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="modal" id="actionConfirmDialog">
+      <form class="modal-card confirm-card" method="dialog">
+        <span class="confirm-icon danger"><i data-lucide="triangle-alert"></i></span>
+        <div><span class="eyebrow" id="actionConfirmEyebrow">Confirmación</span><h2 id="actionConfirmTitle">¿Continuar?</h2><p id="actionConfirmMessage"></p></div>
+        <div class="modal-actions"><button class="ghost" type="submit" value="cancel" id="actionConfirmCancel">Cancelar</button><button class="danger-button" type="submit" value="confirm" id="actionConfirmAccept">Sí, continuar</button></div>
+      </form>
+    </dialog>
+
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260903-multichat-1"></script>
+    <script src="app.js?v=20260918-receipt-2"></script>
   </body>
 </html>

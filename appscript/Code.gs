@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.3.1",
+  version: "2.6.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -156,10 +156,30 @@ function apiRequest(payloadText) {
       requireAdmin_(user);
       result = editSale_(payload.invoice, user);
     }
+    else if (request.action === "delete_sale") {
+      requireAdmin_(user);
+      result = deleteSale_(payload.saleId, user);
+    }
     else if (request.action === "adjust_inventory") result = adjustInventory_(payload.adjustment, user);
+    else if (request.action === "set_inventory_stock") {
+      requireAdmin_(user);
+      result = setInventoryStock_(payload, user);
+    }
     else if (request.action === "delete_inventory") {
       requireAdmin_(user);
       result = deleteInventory_(payload.productId, user);
+    }
+    else if (request.action === "clear_inventory") {
+      requireAdmin_(user);
+      result = clearInventory_(user, request.authToken);
+    }
+    else if (request.action === "clear_inventory_movements") {
+      requireAdmin_(user);
+      result = clearInventoryMovements_(user);
+    }
+    else if (request.action === "clear_income") {
+      requireAdmin_(user);
+      result = clearIncome_(user);
     }
     else if (request.action === "upsert_inventory") {
       requireAdmin_(user);
@@ -561,6 +581,24 @@ function adjustInventory_(adjustment, user) {
   });
 }
 
+function setInventoryStock_(payload, user) {
+  var productId = String(payload && payload.productId || "").trim();
+  var stock = asNumber_(payload && payload.stock);
+  if (!productId || stock < 0) return { ok: false, retryable: false, error: "La existencia indicada no es válida." };
+  return withScriptLock_(function () {
+    var table = readInventoryTable_();
+    var rowIndex = findInventoryIndex_(table.rows, productId);
+    if (rowIndex < 0) return { ok: false, retryable: false, error: "El producto ya no existe en el inventario." };
+    var row = table.rows[rowIndex];
+    row[7] = stock;
+    row[10] = String(payload.updatedAt || new Date().toISOString());
+    row[12] = asNumber_(row[12]) + 1;
+    table.sheet.getRange(rowIndex + 2, 1, 1, HEADERS.inventory.length).setValues([row]);
+    appendAudit_("INVENTORY_STOCK_CORRECTION", productId, user.full_name || user.username, "OK", "Existencia corregida a " + stock + " sin movimiento.");
+    return { item: inventoryRowToObject_(row) };
+  });
+}
+
 function consumptionAdjustedByProduct_(movementsSheet, sessionId) {
   var totals = {};
   var rows = readSheetRows_(movementsSheet, HEADERS.movements.length);
@@ -584,6 +622,44 @@ function deleteInventory_(productId, user) {
     if (rowIndex >= 0) table.sheet.deleteRow(rowIndex + 2);
     appendAudit_("INVENTORY_DELETE", cleanId, user.full_name || user.username, "OK", rowIndex >= 0 ? "Producto eliminado" : "Producto ya no existia");
     return { deleted: rowIndex >= 0, productId: cleanId };
+  });
+}
+
+function clearInventory_(user, authToken) {
+  return withScriptLock_(function () {
+    var spreadsheet = getSpreadsheet_();
+    var inventorySheet = spreadsheet.getSheetByName(APP.sheets.inventory);
+    var deleted = Math.max(0, inventorySheet.getLastRow() - 1);
+    var config = getConfig_();
+    var url = config.supabaseUrl.replace(/\/$/, "") + "/rest/v1/menu_items?id=not.is.null";
+    deleteSupabaseRows_(url, authToken, config, "No se pudo vaciar el catálogo operativo en Supabase.");
+    writeInventoryRows_(inventorySheet, []);
+    appendAudit_("INVENTORY_CLEAR_ALL", String(deleted), user.full_name || user.username, "OK", "Inventario reiniciado desde el panel.");
+    return { cleared: true, deleted: deleted, items: [] };
+  });
+}
+
+function clearInventoryMovements_(user) {
+  return withScriptLock_(function () {
+    var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
+    var deleted = Math.max(0, sheet.getLastRow() - 1);
+    writeDataRows_(sheet, [], HEADERS.movements.length);
+    appendAudit_("INVENTORY_MOVEMENTS_CLEAR_ALL", String(deleted), user.full_name || user.username, "OK", "Historial de movimientos reiniciado desde el panel.");
+    return { cleared: true, deleted: deleted, movements: [] };
+  });
+}
+
+function clearIncome_(user) {
+  return withScriptLock_(function () {
+    var spreadsheet = getSpreadsheet_();
+    var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
+    var deleted = Math.max(0, salesSheet.getLastRow() - 1);
+    writeDataRows_(salesSheet, [], HEADERS.sales.length);
+    writeDataRows_(spreadsheet.getSheetByName(APP.sheets.details), [], HEADERS.details.length);
+    writeDataRows_(spreadsheet.getSheetByName(APP.sheets.payments), [], HEADERS.payments.length);
+    writeDataRows_(spreadsheet.getSheetByName(APP.sheets.daily), [], HEADERS.daily.length);
+    appendAudit_("INCOME_CLEAR_ALL", String(deleted), user.full_name || user.username, "OK", "Ingresos reiniciados desde el panel sin modificar existencias.");
+    return { cleared: true, deleted: deleted };
   });
 }
 
@@ -644,7 +720,7 @@ function recordSale_(invoice, user, authToken) {
         }
         var inventoryRow = inventoryRows[inventoryIndex];
         code = safeText_(inventoryRow[1]);
-        cost = asNumber_(inventoryRow[5]);
+        cost = line.unit_cost !== undefined && line.unit_cost !== null && line.unit_cost !== "" ? Math.max(0, asNumber_(line.unit_cost)) : asNumber_(inventoryRow[5]);
         if (!processedProducts[productId]) {
           var productQuantity = (invoice.items || []).filter(function (entry) {
             return safeText_(entry.menu_item_id) === productId;
@@ -668,7 +744,7 @@ function recordSale_(invoice, user, authToken) {
           }
           if (reconciliationDelta !== 0) {
             movements.push([
-              "SALE-" + saleId + "-" + productId, productId, code, safeText_(line.item_name), "AJUSTE_CIERRE", reconciliationDelta,
+              "SALE-" + saleId + "-" + productId, productId, code, safeText_(line.item_name), reconciliationDelta < 0 ? "SALIDA_VENTA" : "DEVOLUCION_VENTA", reconciliationDelta,
               before, after, cost, safeText_(invoice.number), sessionId, safeText_(invoice.createdAt || now),
               safeText_(user.full_name || user.username)
             ]);
@@ -790,7 +866,7 @@ function editSale_(invoice, user) {
     var nextDetails = oldDetails.filter(function (row) { return String(row[0] || "") !== saleId; });
     invoice.items.forEach(function (line) {
       var inventoryIndex = findInventoryIndex_(inventory.rows, line.menu_item_id);
-      var cost = inventoryIndex >= 0 ? asNumber_(inventory.rows[inventoryIndex][5]) : 0;
+      var cost = line.unit_cost !== undefined && line.unit_cost !== null && line.unit_cost !== "" ? Math.max(0, asNumber_(line.unit_cost)) : (inventoryIndex >= 0 ? asNumber_(inventory.rows[inventoryIndex][5]) : 0);
       var quantity = Math.max(0, asNumber_(line.quantity));
       var price = Math.max(0, asNumber_(line.unit_price));
       nextDetails.push([saleId, safeText_(invoice.number), safeText_(line.id), safeText_(line.menu_item_id), safeText_(line.item_name), quantity, price, quantity * price, cost, quantity * cost, quantity * (price - cost)]);
@@ -803,6 +879,61 @@ function editSale_(invoice, user) {
     rebuildDailyIncome_(spreadsheet);
     appendAudit_("SALE_EDIT", saleId, user.full_name || user.username, "OK", "Venta corregida desde el panel");
     return { saleId: saleId, corrected: true, items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
+  });
+}
+
+function deleteSale_(saleIdValue, user) {
+  var saleId = safeText_(saleIdValue);
+  if (!saleId) throw new Error("Venta inválida.");
+  return withScriptLock_(function () {
+    var spreadsheet = getSpreadsheet_();
+    var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
+    var detailsSheet = spreadsheet.getSheetByName(APP.sheets.details);
+    var paymentsSheet = spreadsheet.getSheetByName(APP.sheets.payments);
+    var movementsSheet = spreadsheet.getSheetByName(APP.sheets.movements);
+    var sales = readSheetRows_(salesSheet, HEADERS.sales.length);
+    var sale = null;
+    var remainingSales = sales.filter(function (row) {
+      if (String(row[0] || "") === saleId) { sale = row; return false; }
+      return true;
+    });
+    if (!sale) return { deleted: false, saleId: saleId, items: readInventoryTable_().rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
+
+    var details = readSheetRows_(detailsSheet, HEADERS.details.length);
+    var deletedDetails = details.filter(function (row) { return String(row[0] || "") === saleId; });
+    var remainingDetails = details.filter(function (row) { return String(row[0] || "") !== saleId; });
+    var payments = readSheetRows_(paymentsSheet, HEADERS.payments.length);
+    var remainingPayments = payments.filter(function (row) { return String(row[0] || "") !== saleId; });
+    var inventory = readInventoryTable_();
+    var quantities = {};
+    deletedDetails.forEach(function (row) {
+      var productId = String(row[3] || "");
+      if (productId) quantities[productId] = asNumber_(quantities[productId]) + Math.max(0, asNumber_(row[5]));
+    });
+    var now = new Date().toISOString();
+    var restoredMovements = [];
+    Object.keys(quantities).forEach(function (productId) {
+      var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
+      if (inventoryIndex < 0) return;
+      var row = inventory.rows[inventoryIndex];
+      var before = asNumber_(row[7]);
+      var after = before + quantities[productId];
+      row[7] = after;
+      row[10] = now;
+      row[11] = "VENTA_ELIMINADA " + saleId;
+      row[12] = asNumber_(row[12]) + 1;
+      inventory.rows[inventoryIndex] = row;
+      restoredMovements.push(["DELETE-SALE-" + saleId + "-" + productId, productId, safeText_(row[1]), safeText_(row[2]), "VENTA_ELIMINADA", quantities[productId], before, after, asNumber_(row[5]), safeText_(sale[1]), safeText_(sale[2]), now, safeText_(user.full_name || user.username)]);
+    });
+
+    writeInventoryRows_(inventory.sheet, inventory.rows);
+    if (restoredMovements.length) appendRows_(movementsSheet, restoredMovements);
+    writeDataRows_(salesSheet, remainingSales, HEADERS.sales.length);
+    writeDataRows_(detailsSheet, remainingDetails, HEADERS.details.length);
+    writeDataRows_(paymentsSheet, remainingPayments, HEADERS.payments.length);
+    rebuildDailyIncome_(spreadsheet);
+    appendAudit_("SALE_DELETE", saleId, user.full_name || user.username, "OK", "Venta eliminada desde el panel: " + safeText_(sale[1]));
+    return { deleted: true, saleId: saleId, restoredProducts: Object.keys(quantities).length, items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
   });
 }
 
@@ -834,7 +965,7 @@ function archiveSupabaseSession_(sessionId, authToken) {
   return true;
 }
 
-function deleteSupabaseRows_(url, authToken, config) {
+function deleteSupabaseRows_(url, authToken, config, errorMessage) {
   var response = UrlFetchApp.fetch(url, {
     method: "delete",
     headers: {
@@ -846,7 +977,7 @@ function deleteSupabaseRows_(url, authToken, config) {
     muteHttpExceptions: true
   });
   if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
-    throw new Error("La venta se archivo, pero Supabase no permitio limpiar la sesion cerrada. Se reintentara.");
+    throw new Error(errorMessage || "La venta se archivo, pero Supabase no permitio limpiar la sesion cerrada. Se reintentara.");
   }
 }
 
