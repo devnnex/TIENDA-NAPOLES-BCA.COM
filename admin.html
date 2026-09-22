@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#f05a28" id="pwaThemeColor">
+    <meta name="theme-color" content="#050505" id="pwaThemeColor">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -12,7 +12,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260918-tip-payment-1">
+    <link rel="stylesheet" href="style.css?v=20260922-section-nav-3">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -20,6 +20,7 @@
 
     <section class="admin-login" id="adminLogin">
       <form class="admin-login-card" id="loginForm">
+        <img class="admin-login-logo" src="images/tienda-napoles-login.png" alt="Tienda Nápoles La Catedral">
         <i data-lucide="shield-check"></i>
         <span class="eyebrow">Acceso operativo</span>
         <h1>Iniciar sesion</h1>
@@ -184,6 +185,7 @@
               </div>
             </div>
             <label class="check"><input name="is_active" type="checkbox" checked> Activa</label>
+            <label class="check"><input name="is_outdoor" type="checkbox"> Mesa exterior</label>
             <button class="primary" type="submit"><i data-lucide="save"></i> Guardar mesa</button>
           </form>
           <div class="qr-batch-panel" id="qrBatchPanel">
@@ -326,6 +328,7 @@
             </label>
           </div>
           <div class="movement-list" id="inventoryMovementList"></div>
+          <button class="ghost history-more-button" id="moreInventoryMovements" type="button" hidden>Ver más movimientos</button>
         </div>
       </section>
 
@@ -368,7 +371,7 @@
             </label>
             <label>Desde<input id="incomeDateFrom" name="date_from" type="date" required></label>
             <label>Hasta<input id="incomeDateTo" name="date_to" type="date" required></label>
-            <button class="primary" type="submit"><i data-lucide="sliders-horizontal"></i> Aplicar filtros</button>
+            <button class="primary" type="submit"><i data-lucide="sliders-horizontal"></i> Aplicar cambios</button>
           </form>
           <div class="income-filter-summary" id="incomeFilterSummary" aria-live="polite"></div>
         </div>
@@ -386,6 +389,7 @@
             <span class="income-report-status" id="incomeReportStatus"><i data-lucide="loader-circle"></i> Preparando informe</span>
           </div>
           <div class="income-records" id="incomeRecords"></div>
+          <button class="ghost history-more-button" id="moreIncomeRecords" type="button" hidden>Ver más ventas</button>
         </div>
       </section>
 
@@ -752,6 +756,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260920-appscript-status-1"></script>
+    <script src="app.js?v=20260922-inventory-kpis-1"></script>
   </body>
 </html>

@@ -10,9 +10,9 @@ const SUPABASE_CONFIG = {
 // necesita solo el origen del proyecto y construye internamente /rest/v1.
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbz9uUz_Gp2-0Y27aZsHjMLYTth_KpYHLfQRuqfmS21oLfseITwwLd5V4Mz4HU1KUxxbMA/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbxcq-0ynXRAgueNSnBhdrM9OGIsGKWSkL74Whwzw2MgqBg_-CFvmY73BWrFWarOym6FKA/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.7.0";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.8.0";
 const APPS_SCRIPT_TIMEOUT_MS = 45000;
 
 const isAppsScriptVersionCompatible = (version) => {
@@ -294,6 +294,13 @@ const App = (() => {
     users: [],
     inventoryMeta: {},
     inventoryMovements: [],
+    movementCursor: null,
+    movementRevision: "",
+    movementHasMore: false,
+    movementLoading: false,
+    movementRequestId: 0,
+    movementLoaded: false,
+    movementFetchedAt: 0,
     movementSearch: "",
     movementTypeFilter: "all",
     invoiceHistory: [],
@@ -302,10 +309,15 @@ const App = (() => {
     incomeReport: null,
     incomeLoading: false,
     incomeRequestId: 0,
-    incomeRangePreset: "today",
+    incomeRangePreset: "month",
+    incomePageLoading: false,
+    incomeFetchedAt: 0,
+    incomeAppliedRange: null,
+    businessTimeZone: "America/Bogota",
     incomeSearchTimer: null,
     productPickerMatches: [],
     consumptionDrafts: [],
+    consumptionDraftEditIndex: -1,
     activePaymentTotal: 0,
     activePaymentBase: 0,
     activePaymentTip: 0,
@@ -341,6 +353,12 @@ const App = (() => {
     adminPollTimer: null,
     adminSyncBusy: false,
     activeAdminSection: "dashboard",
+    adminSectionSwitchToken: 0,
+    adminSectionSwitchFrame: 0,
+    adminSectionSwitchTimer: 0,
+    tableManagerRenderSignature: "",
+    usersRenderSignature: "",
+    adminAiRenderSignature: "",
     pwaBrandSignature: "",
     pwaBrandSyncToken: 0,
     pwaManifestObjectUrl: "",
@@ -570,6 +588,18 @@ const App = (() => {
 
   const tableLabel = (table) => table?.table_name || `Mesa ${table?.table_number || ""}`.trim();
 
+  const OUTDOOR_TABLE_PREFIX = "tn-outdoor:v1:";
+  const isOutdoorTable = (table) => String(table?.qr_image_url || "").startsWith(OUTDOOR_TABLE_PREFIX);
+  const originalQrImageUrl = (table) => {
+    const value = String(table?.qr_image_url || "");
+    if (!value.startsWith(OUTDOOR_TABLE_PREFIX)) return value || null;
+    try { return decodeURIComponent(value.slice(OUTDOOR_TABLE_PREFIX.length)) || null; }
+    catch (error) { return null; }
+  };
+  const outdoorQrImageValue = (table, outdoor) => outdoor
+    ? `${OUTDOOR_TABLE_PREFIX}${encodeURIComponent(originalQrImageUrl(table) || "")}`
+    : originalQrImageUrl(table);
+
   const servicePointKind = (table) => {
     const name = normalizeText(table?.table_name || "");
     if (/^barra\s+\d+$/.test(name)) return "bar";
@@ -672,35 +702,54 @@ const App = (() => {
     });
     $$(".admin-sidebar nav a").forEach((link) => {
       const target = link.getAttribute("href")?.replace("#", "");
-      link.classList.toggle("active", target === section);
+      const active = target === section;
+      link.classList.toggle("active", active);
+      if (active) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
     });
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-      if (state.activeAdminSection !== section) return;
-      if (section === "dashboard") {
-        renderAlerts();
-        renderTables();
-      }
-      if (section === "accounts") renderAccounts();
-      if (section === "tips") renderTips();
-      if (section === "service") renderServiceTables();
-      if (section === "menu") {
-        renderTableManager();
-        renderTableFormQr();
-      }
-      if (section === "inventory") renderInventory();
-      if (section === "movements") {
-        renderInventoryMovements();
-        void loadInventoryMovements();
-      }
-      if (section === "income") {
-        initializeIncomeFilters();
-        renderIncomeReport();
-        void loadIncomeReport();
-      }
-      if (section === "users") renderUsers();
-      if (section === "assistant") renderAdminAi();
-      refreshIcons();
-    }));
+    const switchToken = ++state.adminSectionSwitchToken;
+    window.cancelAnimationFrame(state.adminSectionSwitchFrame);
+    window.clearTimeout(state.adminSectionSwitchTimer);
+    state.adminSectionSwitchFrame = window.requestAnimationFrame(() => {
+      if (state.activeAdminSection !== section || switchToken !== state.adminSectionSwitchToken) return;
+      state.adminSectionSwitchTimer = window.setTimeout(() => {
+        if (state.activeAdminSection !== section || switchToken !== state.adminSectionSwitchToken) return;
+        if (section === "dashboard") {
+          renderAlerts();
+          renderTables();
+        }
+        if (section === "accounts") renderAccounts();
+        if (section === "tips") renderTips();
+        if (section === "service") {
+          renderServiceTables();
+          renderWaiterTableSelect();
+        }
+        if (section === "menu") {
+          renderTableManager();
+          renderTableFormQr();
+        }
+        if (section === "brand") renderBusinessForm();
+        if (section === "inventory") renderInventory();
+        if (section === "movements") {
+          renderInventoryMovements();
+          if (!state.movementLoaded || Date.now() - state.movementFetchedAt > 60000) void loadInventoryMovements();
+        }
+        if (section === "income") {
+          initializeIncomeFilters();
+          if (state.incomeRangePreset !== "custom") {
+            const currentRange = incomeRangeDates(state.incomeRangePreset);
+            if (currentRange.dateFrom !== state.incomeAppliedRange?.dateFrom || currentRange.dateTo !== state.incomeAppliedRange?.dateTo) {
+              setIncomeRange(state.incomeRangePreset, false);
+              state.incomeReport = null;
+            }
+          }
+          renderIncomeReport();
+          if (!state.incomeLoading && (!state.incomeReport || Date.now() - state.incomeFetchedAt > 60000)) void loadIncomeReport();
+        }
+        if (section === "users") renderUsers();
+        if (section === "assistant") renderAdminAi();
+      }, 0);
+    });
   };
 
   const findTableFromUrl = () => {
@@ -1629,7 +1678,7 @@ const App = (() => {
     const invoices = readLocalJson(INVOICE_STORAGE_KEY, []);
     state.invoiceHistory = Array.isArray(invoices) ? invoices : [];
     const movements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, []);
-    state.inventoryMovements = Array.isArray(movements) ? movements : [];
+    if (!state.movementLoaded) state.inventoryMovements = Array.isArray(movements) ? movements : [];
     const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
     const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
     state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
@@ -1693,7 +1742,10 @@ const App = (() => {
 
   const persistInventoryMovements = () => {
     try {
-      localStorage.setItem(INVENTORY_MOVEMENTS_STORAGE_KEY, JSON.stringify(state.inventoryMovements.slice(-3000)));
+      const recent = [...state.inventoryMovements]
+        .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || "")))
+        .slice(0, 800);
+      localStorage.setItem(INVENTORY_MOVEMENTS_STORAGE_KEY, JSON.stringify(recent));
     } catch (error) { /* Historial remoto y memoria siguen disponibles. */ }
   };
 
@@ -1872,12 +1924,30 @@ const App = (() => {
     };
   };
 
-  const applyRemoteInventoryItems = (items = []) => {
+  const pendingInventoryIds = (settledJobId = "") => {
+    const pendingIds = new Set();
+    readAppsScriptOutbox().forEach((job) => {
+      if (job.id === settledJobId) return;
+      if (job.payload?.item?.productId) pendingIds.add(String(job.payload.item.productId));
+      if (job.payload?.adjustment?.productId) pendingIds.add(String(job.payload.adjustment.productId));
+      if (job.payload?.productId) pendingIds.add(String(job.payload.productId));
+      (job.payload?.items || []).forEach((item) => { if (item.productId) pendingIds.add(String(item.productId)); });
+      (job.payload?.invoice?.items || []).forEach((line) => { if (line.menu_item_id) pendingIds.add(String(line.menu_item_id)); });
+    });
+    return pendingIds;
+  };
+
+  const applyRemoteInventoryItems = (items = [], baseline = null, settledJobId = "") => {
     if (!Array.isArray(items)) return;
+    const itemById = new Map(state.items.map((item) => [item.id, item]));
+    const pendingIds = pendingInventoryIds(settledJobId);
+    let changed = false;
     items.forEach((remote) => {
-      const item = state.items.find((entry) => entry.id === remote.productId);
+      const item = itemById.get(remote.productId);
       if (!item) return;
-      state.inventoryMeta[item.id] = {
+      if (pendingIds.has(String(item.id))) return;
+      if (baseline && baseline.get(item.id) !== state.inventoryMeta[item.id]?.updatedAt) return;
+      const nextMeta = {
         code: String(remote.code || productAcronym(item.name)).toUpperCase(),
         costPrice: Math.max(0, Number(remote.costPrice || 0)),
         stock: Math.max(0, Number(remote.stock || 0)),
@@ -1886,13 +1956,24 @@ const App = (() => {
         updatedAt: remote.updatedAt || new Date().toISOString(),
         version: Number(remote.version || 0)
       };
-      if (Number.isFinite(Number(remote.salePrice))) item.price = Math.max(0, Number(remote.salePrice));
-      if (typeof remote.isAvailable === "boolean") item.is_available = remote.isAvailable;
+      if (JSON.stringify(state.inventoryMeta[item.id] || {}) !== JSON.stringify(nextMeta)) {
+        state.inventoryMeta[item.id] = nextMeta;
+        changed = true;
+      }
+      if (Number.isFinite(Number(remote.salePrice)) && item.price !== Math.max(0, Number(remote.salePrice))) {
+        item.price = Math.max(0, Number(remote.salePrice));
+        changed = true;
+      }
+      if (typeof remote.isAvailable === "boolean" && item.is_available !== remote.isAvailable) {
+        item.is_available = remote.isAvailable;
+        changed = true;
+      }
     });
+    if (!changed) return;
     persistInventoryStore();
     persistBootstrapCache();
-    renderInventory();
-    renderMenuManager();
+    if (state.activeAdminSection === "inventory") renderInventory();
+    if (state.activeAdminSection === "menu") renderMenuManager();
   };
 
   const enqueueAppsScriptJob = (action, payload, dedupeKey = uid()) => {
@@ -1943,7 +2024,7 @@ const App = (() => {
             ? [result.item]
             : result?.items || (result?.item ? [result.item] : []);
           const freshItems = remoteItems.filter((item) => !pendingProductIds.has(item.productId));
-          if (freshItems.length) applyRemoteInventoryItems(freshItems);
+          if (freshItems.length) applyRemoteInventoryItems(freshItems, null, job.id);
         };
         if (!result?.ok) {
           const legacyInventoryService = job.action === "adjust_inventory"
@@ -2005,6 +2086,13 @@ const App = (() => {
         supabaseAnonKey: SUPABASE_CONFIG.anonKey
       });
       if (!result?.ok) throw new Error(result?.error || "No fue posible inicializar el respaldo remoto.");
+      if (result.timezone && result.timezone !== state.businessTimeZone) {
+        state.businessTimeZone = result.timezone;
+        if (state.incomeRangePreset !== "custom") {
+          setIncomeRange(state.incomeRangePreset, false);
+          if (state.activeAdminSection === "income") void loadIncomeReport();
+        }
+      }
       if (!isAppsScriptVersionCompatible(result.version)) {
         toast(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para activar movimientos, correcciones y reinicios completos.`, "error", "appscript-version-required");
       }
@@ -2023,25 +2111,43 @@ const App = (() => {
     }
   };
 
-  const syncInventoryWithAppsScript = async () => {
+  let inventorySyncPromise = null;
+  const syncInventoryWithAppsScript = () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
-    try {
-      const result = await appsScriptRequest("get_inventory");
-      if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
-      if (Array.isArray(result.items) && result.items.length) {
-        applyRemoteInventoryItems(result.items);
-      } else {
-        const localItems = state.items
-          .filter((item) => Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id))
-          .map(inventoryPayload);
-        if (localItems.length) enqueueAppsScriptJob("sync_inventory", { items: localItems }, "inventory:initial-sync");
+    if (inventorySyncPromise) return inventorySyncPromise;
+    inventorySyncPromise = (async () => {
+      const baseline = new Map(Object.entries(state.inventoryMeta).map(([id, meta]) => [id, meta?.updatedAt]));
+      try {
+        const result = await appsScriptRequest("get_inventory");
+        if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
+        if (Array.isArray(result.items) && result.items.length) {
+          applyRemoteInventoryItems(result.items, baseline);
+        } else if (result.everInitialized) {
+          const pendingIds = pendingInventoryIds();
+          let changed = false;
+          Object.keys(state.inventoryMeta).forEach((id) => {
+            if (pendingIds.has(String(id)) || baseline.get(id) !== state.inventoryMeta[id]?.updatedAt) return;
+            delete state.inventoryMeta[id];
+            changed = true;
+          });
+          if (changed) {
+            persistInventoryStore();
+            if (state.activeAdminSection === "inventory") renderInventory();
+          }
+        } else {
+          const localItems = state.items
+            .filter((item) => Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id))
+            .map(inventoryPayload);
+          if (localItems.length) enqueueAppsScriptJob("sync_inventory", { items: localItems }, "inventory:initial-sync");
+        }
+        setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
+        return true;
+      } catch (error) {
+        setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
+        return false;
       }
-      setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
-      return true;
-    } catch (error) {
-      setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
-      return false;
-    }
+    })().finally(() => { inventorySyncPromise = null; });
+    return inventorySyncPromise;
   };
 
   const queueInventoryUpsert = (item, movement = {}) => {
@@ -3730,19 +3836,26 @@ const App = (() => {
       [...state.selectedTableQrIds].filter((id) => validIds.has(String(id)))
     );
     const query = normalizeText($("#tableManagerSearch")?.value || "");
+    const renderSignature = JSON.stringify({
+      query,
+      selected: [...state.selectedTableQrIds].sort(),
+      tables: qrTables.map((table) => [table.id, table.table_number, table.table_name, table.is_active, table.qr_code, table.qr_image_url])
+    });
+    if (renderSignature === state.tableManagerRenderSignature) return;
+    state.tableManagerRenderSignature = renderSignature;
     const visibleTables = qrTables.filter((table) => !query || normalizeText(`${table.table_number} ${table.table_name || ""}`).includes(query));
     list.innerHTML = visibleTables.length
       ? visibleTables
           .map(
             (table) => `
-              <div class="manager-row table-manager-row${state.selectedTableQrIds.has(String(table.id)) ? " is-selected" : ""}">
+              <div class="manager-row table-manager-row${state.selectedTableQrIds.has(String(table.id)) ? " is-selected" : ""}${isOutdoorTable(table) ? " is-outdoor" : ""}">
                 <label class="qr-table-checkbox" title="Seleccionar ${escapeHTML(tableLabel(table))}">
                   <input type="checkbox" data-select-table-qr="${table.id}" ${state.selectedTableQrIds.has(String(table.id)) ? "checked" : ""}>
                   <span>${icon("check", 16)}</span>
                 </label>
                 <div class="qr-mini" data-table-qr="${table.id}"></div>
                 <div class="table-manager-copy">
-                  <strong>${escapeHTML(tableLabel(table))}</strong>
+                  <strong>${escapeHTML(tableLabel(table))}${isOutdoorTable(table) ? ' <span class="table-outdoor-badge">Exterior</span>' : ""}</strong>
                   <span>${qrTextForTable(table)}</span>
                 </div>
                 <div class="row-actions">
@@ -4145,8 +4258,8 @@ const App = (() => {
     const summary = inventorySummary();
     metrics.innerHTML = `
       <article><span>${icon("package-check", 19)} Unidades</span><strong>${summary.units.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><small>Existencia total registrada</small></article>
-      <article><span>${icon("circle-dollar-sign", 19)} Inversion</span><strong>${money(summary.costValue)}</strong><small>Valor a costo</small></article>
-      <article><span>${icon("trending-up", 19)} Venta potencial</span><strong>${money(summary.saleValue)}</strong><small>Antes de gastos</small></article>
+      <article><span>${icon("circle-dollar-sign", 19)} Inversion</span><strong>${money(summary.costValue)}</strong><small>Inventario registrado</small></article>
+      <article><span>${icon("trending-up", 19)} Venta potencial</span><strong>${money(summary.saleValue)}</strong><small>Estimado al vender todo</small></article>
       <article class="${summary.low || summary.out ? "inventory-alert-metric" : ""}"><span>${icon("triangle-alert", 19)} Alertas</span><strong>${summary.low + summary.out}</strong><small>${summary.out} agotados · ${summary.low} por reponer</small></article>`;
 
     const query = state.inventorySearch;
@@ -4189,7 +4302,7 @@ const App = (() => {
 
   const movementKind = (movement) => Number(movement.delta ?? movement.quantityChange ?? 0) >= 0 ? "entry" : "exit";
 
-  const renderInventoryMovements = () => {
+  const renderInventoryMovements = (appendFrom = 0) => {
     const list = $("#inventoryMovementList");
     const summary = $("#movementSummary");
     if (!list || !summary) return;
@@ -4197,32 +4310,74 @@ const App = (() => {
     const movements = [...state.inventoryMovements]
       .filter((movement) => state.movementTypeFilter === "all" || movementKind(movement) === state.movementTypeFilter)
       .filter((movement) => !query || normalizeText([movement.product, movement.code, movement.type, movement.reference, movement.user].join(" ")).includes(query))
-      .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")));
+      .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || "")));
     const entries = movements.filter((movement) => movementKind(movement) === "entry").reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
     const exits = movements.filter((movement) => movementKind(movement) === "exit").reduce((sum, movement) => sum + Math.abs(Number(movement.delta || 0)), 0);
     summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line", 19)}<span><small>Unidades ingresadas</small><strong>+${entries.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></span></article><article class="movement-kpi exit">${icon("arrow-up-from-line", 19)}<span><small>Unidades retiradas</small><strong>-${exits.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></span></article><article class="movement-kpi">${icon("list-checks", 19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
-    list.innerHTML = movements.length ? movements.map((movement) => {
+    const appendOnly = appendFrom > 0 && list.querySelectorAll(".movement-row").length === appendFrom;
+    const visibleMovements = appendOnly ? movements.slice(appendFrom) : movements;
+    const movementMarkup = visibleMovements.length ? visibleMovements.map((movement) => {
       const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
       const kind = delta >= 0 ? "entry" : "exit";
       return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
-    }).join("") : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
+    }).join("") : appendOnly ? "" : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
+    if (appendOnly) list.insertAdjacentHTML("beforeend", movementMarkup);
+    else list.innerHTML = movementMarkup;
+    const moreButton = $("#moreInventoryMovements");
+    if (moreButton) {
+      moreButton.hidden = !state.movementHasMore;
+      moreButton.disabled = state.movementLoading;
+      moreButton.textContent = state.movementLoading ? "Cargando movimientos..." : "Ver más movimientos";
+    }
     refreshIcons();
   };
 
-  const loadInventoryMovements = async () => {
-    if (!isAppsScriptConfigured() || !state.currentUser) return false;
+  const loadInventoryMovements = async ({ more = false } = {}) => {
+    if (!isAppsScriptConfigured() || !state.currentUser || state.movementLoading) return false;
+    if (more && !state.movementHasMore) return false;
+    const requestId = ++state.movementRequestId;
+    state.movementLoading = true;
+    const button = $("#moreInventoryMovements");
+    if (button) { button.disabled = true; button.textContent = "Cargando movimientos..."; }
+    let appendFrom = 0;
+    let refreshAfterStale = false;
+    const previousIds = more && !state.movementSearch && state.movementTypeFilter === "all"
+      ? [...state.inventoryMovements].sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || ""))).map((movement) => String(movement.movementId))
+      : [];
     try {
-      const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
+      const result = await appsScriptRequest("get_inventory_movements", { limit: 800, cursor: more ? state.movementCursor : null, revision: state.movementRevision });
       if (!result?.ok || !Array.isArray(result.movements)) return false;
-      const merged = new Map(state.inventoryMovements.map((movement) => [movement.movementId, movement]));
+      if (requestId !== state.movementRequestId) return false;
+      if (result.stale) {
+        refreshAfterStale = true;
+        return false;
+      }
+      if (typeof result.revision !== "string" || typeof result.hasMore !== "boolean") throw new Error(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para paginar movimientos.`);
+      const newestRemote = result.movements[0]?.date || "";
+      const localRecent = more ? state.inventoryMovements : state.inventoryMovements.filter((movement) => String(movement.date || "") > String(newestRemote));
+      const merged = new Map(localRecent.map((movement) => [movement.movementId, movement]));
       result.movements.forEach((movement) => merged.set(movement.movementId, movement));
-      state.inventoryMovements = Array.from(merged.values()).slice(-3000);
+      state.inventoryMovements = Array.from(merged.values());
+      state.movementCursor = result.nextCursor || null;
+      state.movementRevision = result.revision || "";
+      state.movementHasMore = Boolean(result.hasMore && result.nextCursor);
+      state.movementLoaded = true;
+      state.movementFetchedAt = Date.now();
       persistInventoryMovements();
-      renderInventoryMovements();
+      if (previousIds.length) {
+        const sorted = [...state.inventoryMovements].sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || "")));
+        if (previousIds.every((id, index) => String(sorted[index]?.movementId) === id)) appendFrom = previousIds.length;
+      }
       return true;
     } catch (error) {
-      renderInventoryMovements();
+      toast(String(error?.message || error), "error", "movement-page-failed");
       return false;
+    } finally {
+      if (requestId === state.movementRequestId) {
+        state.movementLoading = false;
+        renderInventoryMovements(appendFrom);
+        if (refreshAfterStale) window.setTimeout(() => void loadInventoryMovements(), 0);
+      }
     }
   };
 
@@ -4404,32 +4559,29 @@ const App = (() => {
     toast(`Existencia de ${item.name} actualizada a ${nextStock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}.`, "ok", `stock-adjusted:${id}:${nextStock}`);
   };
 
-  const dateInputValue = (date) => {
-    const value = date instanceof Date ? date : new Date(date);
-    if (Number.isNaN(value.getTime())) return "";
-    const year = value.getFullYear();
-    const month = String(value.getMonth() + 1).padStart(2, "0");
-    const day = String(value.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
+  const businessDateKey = (date = new Date()) => {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: state.businessTimeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+    const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${value.year}-${value.month}-${value.day}`;
   };
 
-  const shiftedDate = (date, days) => {
-    const next = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12);
-    next.setDate(next.getDate() + days);
-    return next;
+  const shiftBusinessDateKey = (key, days) => {
+    const date = new Date(`${key}T12:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + days);
+    return date.toISOString().slice(0, 10);
   };
 
   const incomeRangeDates = (preset = "today") => {
-    const today = new Date();
+    const today = businessDateKey();
     let from = today;
     let to = today;
-    if (preset === "yesterday") from = to = shiftedDate(today, -1);
-    if (preset === "7days") from = shiftedDate(today, -6);
-    if (preset === "15days") from = shiftedDate(today, -14);
-    if (preset === "30days") from = shiftedDate(today, -29);
-    if (preset === "month") from = new Date(today.getFullYear(), today.getMonth(), 1, 12);
-    if (preset === "year") from = new Date(today.getFullYear(), 0, 1, 12);
-    return { dateFrom: dateInputValue(from), dateTo: dateInputValue(to) };
+    if (preset === "yesterday") from = to = shiftBusinessDateKey(today, -1);
+    if (preset === "7days") from = shiftBusinessDateKey(today, -6);
+    if (preset === "15days") from = shiftBusinessDateKey(today, -14);
+    if (preset === "30days") from = shiftBusinessDateKey(today, -29);
+    if (preset === "month") from = `${today.slice(0, 7)}-01`;
+    if (preset === "year") from = `${today.slice(0, 4)}-01-01`;
+    return { dateFrom: from, dateTo: to };
   };
 
   const markIncomeRangePreset = () => {
@@ -4449,6 +4601,7 @@ const App = (() => {
       from.value = range.dateFrom;
       to.value = range.dateTo;
     }
+    if (!state.incomeAppliedRange) state.incomeAppliedRange = { dateFrom: from.value, dateTo: to.value };
     markIncomeRangePreset();
   };
 
@@ -4460,6 +4613,7 @@ const App = (() => {
     state.incomeRangePreset = preset;
     from.value = range.dateFrom;
     to.value = range.dateTo;
+    state.incomeAppliedRange = range;
     markIncomeRangePreset();
     if (refresh) void loadIncomeReport();
   };
@@ -4467,8 +4621,8 @@ const App = (() => {
   const incomeFiltersFromForm = () => {
     initializeIncomeFilters();
     return {
-      dateFrom: $("#incomeDateFrom")?.value || dateInputValue(new Date()),
-      dateTo: $("#incomeDateTo")?.value || dateInputValue(new Date()),
+      dateFrom: state.incomeAppliedRange?.dateFrom || businessDateKey(),
+      dateTo: state.incomeAppliedRange?.dateTo || businessDateKey(),
       paymentMethod: $("#incomePaymentMethod")?.value || "all",
       query: $("#incomeSearch")?.value.trim() || "",
       limit: 300
@@ -4484,7 +4638,7 @@ const App = (() => {
 
   const incomeRecordDateKey = (value) => {
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value || "").slice(0, 10) : dateInputValue(date);
+    return Number.isNaN(date.getTime()) ? String(value || "").slice(0, 10) : businessDateKey(date);
   };
 
   const incomeTotalsFromRecords = (records = []) => {
@@ -4559,22 +4713,26 @@ const App = (() => {
   };
 
   const localIncomeReport = (filters, error = "") => {
-    const records = localIncomeRecords(filters);
+    const allLocalRecords = localIncomeRecords(filters);
     return {
       filters,
-      totals: incomeTotalsFromRecords(records),
-      records,
-      recordKeys: records.map((record) => record.saleId),
-      totalRecords: records.length,
-      truncated: false,
+      totals: incomeTotalsFromRecords(allLocalRecords),
+      records: allLocalRecords.slice(0, 300),
+      allLocalRecords,
+      nextIndex: Math.min(300, allLocalRecords.length),
+      totalRecords: allLocalRecords.length,
+      truncated: allLocalRecords.length > 300,
       localOnly: true,
       error
     };
   };
 
   const mergeIncomeReport = (remote, filters) => {
-    const remoteKeys = new Set(remote.recordKeys || (remote.records || []).map((record) => record.saleId));
-    const pending = localIncomeRecords(filters).filter((record) => !remoteKeys.has(record.saleId));
+    const remoteKeys = new Set((remote.recordRows || []).map((entry) => String(entry.saleId)));
+    const queuedKeys = new Set(readAppsScriptOutbox()
+      .filter((job) => job.action === "record_sale")
+      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || "")));
+    const pending = localIncomeRecords(filters).filter((record) => queuedKeys.has(String(record.saleId)) && !remoteKeys.has(String(record.saleId)));
     const pendingTotals = incomeTotalsFromRecords(pending);
     const totals = { ...(remote.totals || {}) };
     Object.keys(pendingTotals).forEach((key) => { totals[key] = Number(totals[key] || 0) + (key === "averageTicket" ? 0 : Number(pendingTotals[key] || 0)); });
@@ -4583,7 +4741,8 @@ const App = (() => {
       ...remote,
       filters,
       totals,
-      records: [...pending, ...(remote.records || [])].sort((left, right) => String(right.date).localeCompare(String(left.date))),
+      records: [...pending, ...(remote.records || [])].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))),
+      nextIndex: (remote.records || []).length,
       totalRecords: Number(remote.totalRecords || 0) + pending.length,
       pendingCount: pending.length,
       localOnly: false
@@ -4602,6 +4761,9 @@ const App = (() => {
     const chat = $("#adminAiChat");
     const suggestions = $("#adminAiSuggestions");
     if (!chat || !suggestions) return;
+    const renderSignature = JSON.stringify(state.adminAiMessages);
+    if (renderSignature === state.adminAiRenderSignature) return;
+    state.adminAiRenderSignature = renderSignature;
     suggestions.innerHTML = ["¿Cuanto se vendio hoy?", "¿Que producto se vendio mas?", "¿Quien realizo las ventas?", "¿Que productos tienen stock bajo?"]
       .map((question) => `<button class="chip" type="button" data-admin-ai-question="${escapeHTML(question)}">${escapeHTML(question)}</button>`).join("");
     const messages = state.adminAiMessages.length ? state.adminAiMessages : [{ role: "bot", text: "Puedo cruzar el informe de ingresos, el inventario y los movimientos visibles. Preguntame por productos, cantidades, responsables, ventas o existencias." }];
@@ -4673,10 +4835,10 @@ const App = (() => {
   const formatIncomeDate = (value) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value || "Sin fecha");
-    return new Intl.DateTimeFormat("es-CO", { dateStyle: "medium", timeStyle: "short" }).format(date);
+    return new Intl.DateTimeFormat("es-CO", { dateStyle: "medium", timeStyle: "short", timeZone: state.businessTimeZone }).format(date);
   };
 
-  const renderIncomeReport = () => {
+  const renderIncomeReport = (appendFrom = 0) => {
     const kpis = $("#incomeKpis");
     const payments = $("#incomePaymentBreakdown");
     const recordsTarget = $("#incomeRecords");
@@ -4684,6 +4846,7 @@ const App = (() => {
     if (!kpis || !payments || !recordsTarget) return;
     const report = state.incomeReport;
     if (!report) {
+      if ($("#moreIncomeRecords")) $("#moreIncomeRecords").hidden = true;
       kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
       payments.innerHTML = "";
       recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
@@ -4709,8 +4872,10 @@ const App = (() => {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
       summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}`;
     }
-    recordsTarget.innerHTML = report.records?.length
-      ? report.records.map((record) => {
+    const appendOnly = appendFrom > 0 && recordsTarget.querySelectorAll(".income-record").length === appendFrom;
+    const visibleRecords = appendOnly ? report.records.slice(appendFrom) : report.records;
+    const recordsMarkup = visibleRecords?.length
+      ? visibleRecords.map((record) => {
           const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
@@ -4730,15 +4895,28 @@ const App = (() => {
             </details>
           </article>`;
         }).join("")
-      : emptyState("Sin ingresos en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
+      : appendOnly ? "" : emptyState("Sin ingresos en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
+    if (appendOnly) recordsTarget.insertAdjacentHTML("beforeend", recordsMarkup);
+    else recordsTarget.innerHTML = recordsMarkup;
     const pendingText = report.pendingCount ? ` · ${report.pendingCount} pendiente${report.pendingCount === 1 ? "" : "s"} de respaldo` : "";
-    const limitedText = report.truncated ? " · mostrando los 300 más recientes" : "";
+    const moreButton = $("#moreIncomeRecords");
+    const hasMore = report.localOnly
+      ? Number(report.nextIndex || 0) < (report.allLocalRecords || []).length
+      : Number(report.nextIndex || 0) < (report.recordRows || []).length;
+    if (moreButton) {
+      moreButton.hidden = !hasMore;
+      moreButton.disabled = state.incomePageLoading || state.incomeLoading;
+      moreButton.textContent = state.incomePageLoading ? "Cargando ventas..." : "Ver más ventas";
+    }
+    const limitedText = hasMore ? ` · mostrando ${report.records.length} ventas` : "";
     setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
     refreshIcons();
   };
 
   const loadIncomeReport = async () => {
     if (!$("#income") || state.currentUser?.role !== "admin") return false;
+    clearTimeout(state.incomeSearchTimer);
+    state.incomeSearchTimer = null;
     const filters = incomeFiltersFromForm();
     if (filters.dateFrom > filters.dateTo) {
       toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
@@ -4746,27 +4924,79 @@ const App = (() => {
     }
     const requestId = ++state.incomeRequestId;
     state.incomeLoading = true;
+    state.incomePageLoading = false;
     state.incomeReport = localIncomeReport(filters);
     renderIncomeReport();
     setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
-      const result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      let result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      if (requestId !== state.incomeRequestId) return false;
+      if (result?.stale) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
+      if (result.stale) throw new Error("El historial cambió mientras se calculaba. Actualiza el informe.");
+      if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para paginar ingresos.`);
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       state.incomeReport = mergeIncomeReport(result, filters);
+      state.incomeFetchedAt = Date.now();
       renderIncomeReport();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       state.incomeReport = localIncomeReport(filters, String(error?.message || error));
+      state.incomeFetchedAt = Date.now();
       renderIncomeReport();
       setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
       return false;
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
+    }
+  };
+
+  const loadMoreIncomeRecords = async () => {
+    const report = state.incomeReport;
+    if (!report || state.incomeLoading || state.incomePageLoading) return false;
+    const start = Number(report.nextIndex || 0);
+    if (report.localOnly) {
+      const previousLength = report.records.length;
+      report.records = [...report.records, ...(report.allLocalRecords || []).slice(start, start + 300)];
+      report.nextIndex = report.records.length;
+      renderIncomeReport(previousLength);
+      return true;
+    }
+    const pageRows = (report.recordRows || []).slice(start, start + 300);
+    if (!pageRows.length) return false;
+    const requestId = state.incomeRequestId;
+    state.incomePageLoading = true;
+    const moreButton = $("#moreIncomeRecords");
+    if (moreButton) { moreButton.disabled = true; moreButton.textContent = "Cargando ventas..."; }
+    try {
+      const result = await appsScriptRequest("get_income_report", { filters: { ...report.filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
+      if (!result?.ok) throw new Error(result?.error || "No se pudo consultar la siguiente página.");
+      if (requestId !== state.incomeRequestId || state.incomeReport !== report) return false;
+      if (result.stale) {
+        await loadIncomeReport();
+        return false;
+      }
+      const previousIds = report.records.map((record) => String(record.saleId));
+      const merged = new Map(report.records.map((record) => [String(record.saleId), record]));
+      result.records.forEach((record) => merged.set(String(record.saleId), record));
+      report.records = Array.from(merged.values()).sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId)));
+      report.nextIndex = start + pageRows.length;
+      const canAppend = previousIds.every((id, index) => String(report.records[index]?.saleId) === id);
+      renderIncomeReport(canAppend ? previousIds.length : 0);
+      return true;
+    } catch (error) {
+      if (requestId === state.incomeRequestId) toast(String(error?.message || error), "error", "income-page-failed");
+      return false;
+    } finally {
+      if (requestId === state.incomeRequestId) {
+        state.incomePageLoading = false;
+        const button = $("#moreIncomeRecords");
+        if (button) { button.disabled = false; button.textContent = "Ver más ventas"; }
+      }
     }
   };
 
@@ -4837,6 +5067,10 @@ const App = (() => {
       items: state.items.map((item) => ({ ...item })),
       inventoryMeta: JSON.parse(JSON.stringify(state.inventoryMeta)),
       inventoryMovements: state.inventoryMovements.map((movement) => ({ ...movement })),
+      movementCursor: state.movementCursor,
+      movementRevision: state.movementRevision,
+      movementHasMore: state.movementHasMore,
+      movementLoaded: state.movementLoaded,
       invoiceHistory: state.invoiceHistory.map((invoice) => ({ ...invoice })),
       incomeReport: state.incomeReport,
       lastPaidReceipt: state.lastPaidReceipt
@@ -4859,6 +5093,12 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        state.movementRequestId += 1;
+        state.movementLoading = false;
+        state.movementCursor = null;
+        state.movementRevision = "";
+        state.movementHasMore = false;
+        state.movementLoaded = true;
         state.inventoryMovements = [];
         state.movementSearch = "";
         state.movementTypeFilter = "all";
@@ -4870,6 +5110,7 @@ const App = (() => {
       if (section === "income") {
         state.incomeRequestId += 1;
         state.incomeLoading = false;
+        state.incomePageLoading = false;
         state.invoiceHistory = [];
         state.lastPaidReceipt = null;
         persistInvoiceHistory();
@@ -4919,6 +5160,10 @@ const App = (() => {
       }
       if (section === "movements") {
         state.inventoryMovements = snapshot.inventoryMovements;
+        state.movementCursor = snapshot.movementCursor;
+        state.movementRevision = snapshot.movementRevision;
+        state.movementHasMore = snapshot.movementHasMore;
+        state.movementLoaded = snapshot.movementLoaded;
         persistInventoryMovements();
         renderInventoryMovements();
       }
@@ -4981,6 +5226,8 @@ const App = (() => {
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     if (!record) return;
     const reportBefore = state.incomeReport;
+    state.incomeRequestId += 1;
+    state.incomePageLoading = false;
     const invoicesBefore = [...state.invoiceHistory];
     const inventoryBefore = JSON.parse(JSON.stringify(state.inventoryMeta));
     const outboxBefore = readAppsScriptOutbox();
@@ -4999,7 +5246,7 @@ const App = (() => {
       updatedTotals[method] = Math.max(0, Number(updatedTotals[method] || 0) - Number(payment.amount || 0));
     });
     updatedTotals.averageTicket = updatedTotals.sales ? updatedTotals.income / updatedTotals.sales : 0;
-    state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordKeys: (reportBefore.recordKeys || []).filter((key) => String(key) !== String(saleId)) };
+    state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordRows: [], nextIndex: 0 };
     state.invoiceHistory = state.invoiceHistory.filter((invoice) => String(invoice.id || invoice.sessionId) !== String(saleId));
     (record.items || []).forEach((line) => {
       const productId = line.menuItemId || line.menu_item_id;
@@ -5021,6 +5268,7 @@ const App = (() => {
         if (!result?.ok) throw new Error(result?.error || "No se pudo eliminar la venta.");
         if (Array.isArray(result?.items)) applyRemoteInventoryItems(result.items);
       }
+      await loadIncomeReport();
       toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
     } catch (error) {
       state.incomeReport = reportBefore;
@@ -5422,20 +5670,21 @@ const App = (() => {
 
   const saveTable = async (form) => {
     const number = Number(form.table_number.value);
+    const id = form.table_id.value;
+    const existing = id ? null : state.tables.find((table) => Number(table.table_number) === number);
+    const targetId = id || existing?.id;
+    const currentTable = state.tables.find((table) => table.id === targetId);
     const payload = {
       table_number: number,
       table_name: form.table_name.value.trim() || null,
       qr_code: `mesa-${number}`,
-      qr_image_url: null,
+      qr_image_url: outdoorQrImageValue(currentTable, form.is_outdoor.checked),
       is_active: form.is_active.checked
     };
     if (!payload.table_number) {
       toast("El numero de mesa es obligatorio.", "error");
       return;
     }
-    const id = form.table_id.value;
-    const existing = id ? null : state.tables.find((table) => Number(table.table_number) === number);
-    const targetId = id || existing?.id;
     const isUpdate = Boolean(targetId);
     const recordId = targetId || uid();
     const original = [...state.tables];
@@ -5460,6 +5709,7 @@ const App = (() => {
       if (saved) {
         state.tables = state.tables.map((table) => table.id === recordId ? saved : table);
         persistBootstrapCache();
+        renderTableManager();
         return;
       }
       state.tables = original;
@@ -6143,13 +6393,94 @@ const App = (() => {
     const total = $("#consumptionSelectionTotal");
     if (!box || !lines || !count || !total) return;
     const drafts = state.consumptionDrafts;
+    const canEditPrice = state.currentUser?.role !== "waiter";
     box.hidden = drafts.length === 0;
     count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
     total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
-    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
+    lines.innerHTML = drafts.map((draft, index) => `<div class="${state.consumptionDraftEditIndex === index ? "is-editing" : ""}"><span class="consumption-draft-product" data-edit-consumption-product="${index}" title="Doble clic para cambiar este producto"><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-price="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
     const form = $("#consumptionForm");
     if (form) form.quantity.required = drafts.length === 0;
+    updateConsumptionDraftAction();
     refreshIcons();
+  };
+
+  const updateConsumptionDraftAction = () => {
+    const queue = $("#consumptionQueueButton");
+    if (!queue) return;
+    queue.innerHTML = state.consumptionDraftEditIndex >= 0
+      ? `${icon("save", 16)} Guardar cambio`
+      : `${icon("list-plus", 16)} Añadir a selección`;
+    refreshIcons();
+  };
+
+  const editConsumptionDraftProduct = (index) => {
+    const draft = state.consumptionDrafts[index];
+    const form = $("#consumptionForm");
+    const search = $("#consumptionProductSearch");
+    if (!draft || !form || !search) return;
+    state.consumptionDraftEditIndex = index;
+    form.menu_item_id.value = draft.menuItemId || "";
+    form.item_name.value = draft.itemName || "";
+    form.quantity.value = draft.quantity || 1;
+    form.notes.value = draft.notes || "";
+    form.payer_name.value = draft.payerName || form.payer_name.value;
+    setCurrencyInputValue(form.unit_price, draft.unitPrice || 0);
+    const product = state.items.find((item) => item.id === draft.menuItemId);
+    search.value = product ? `${inventoryFor(product).code} · ${product.name}` : draft.itemName || "";
+    renderConsumptionProductOptions(product?.name || draft.itemName || "");
+    closeConsumptionProductOptions();
+    updateConsumptionDraftAction();
+    renderConsumptionSelection();
+    window.requestAnimationFrame(() => {
+      search.focus({ preventScroll: true });
+      search.select();
+    });
+  };
+
+  const editConsumptionDraftPrice = (priceElement) => {
+    if (state.currentUser?.role === "waiter") return;
+    const index = Number(priceElement?.dataset.editConsumptionPrice);
+    const draft = state.consumptionDrafts[index];
+    if (!Number.isInteger(index) || !draft) return;
+    const input = document.createElement("input");
+    input.className = "consumption-draft-price-editor";
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.autocomplete = "off";
+    input.setAttribute("aria-label", `Precio unitario de ${draft.itemName}`);
+    input.value = formattedCurrencyInput(draft.unitPrice);
+    let finished = false;
+    const save = () => {
+      if (finished) return;
+      finished = true;
+      draft.unitPrice = currencyInputNumber(input);
+      if (state.consumptionDraftEditIndex === index) {
+        const form = $("#consumptionForm");
+        if (form?.unit_price) setCurrencyInputValue(form.unit_price, draft.unitPrice);
+      }
+      renderConsumptionSelection();
+    };
+    input.addEventListener("input", () => {
+      input.value = formattedCurrencyInput(input.value, { allowEmpty: true });
+      input.setSelectionRange?.(input.value.length, input.value.length);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        save();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finished = true;
+        renderConsumptionSelection();
+      }
+    });
+    input.addEventListener("blur", save, { once: true });
+    priceElement.replaceWith(input);
+    window.requestAnimationFrame(() => {
+      input.focus({ preventScroll: true });
+      input.select();
+    });
   };
 
   const currentConsumptionDraft = (form, { quiet = false } = {}) => {
@@ -6180,6 +6511,8 @@ const App = (() => {
     if ($("#consumptionProductSearch")) $("#consumptionProductSearch").value = "";
     renderConsumptionProductOptions("");
     closeConsumptionProductOptions();
+    state.consumptionDraftEditIndex = -1;
+    updateConsumptionDraftAction();
   };
 
   const queueConsumptionDraft = () => {
@@ -6187,7 +6520,11 @@ const App = (() => {
     if (!form || form.session_item_id.value) return false;
     const draft = currentConsumptionDraft(form);
     if (!draft) return false;
-    state.consumptionDrafts.push(draft);
+    if (state.consumptionDraftEditIndex >= 0 && state.consumptionDrafts[state.consumptionDraftEditIndex]) {
+      state.consumptionDrafts[state.consumptionDraftEditIndex] = draft;
+    } else {
+      state.consumptionDrafts.push(draft);
+    }
     clearConsumptionEntry(form);
     renderConsumptionSelection();
     window.requestAnimationFrame(() => $("#consumptionProductSearch")?.focus({ preventScroll: true }));
@@ -6440,7 +6777,14 @@ const App = (() => {
       currentConsumptionDraft(form);
       return null;
     }
-    if (pendingEntry) state.consumptionDrafts.push(pendingEntry);
+    if (pendingEntry) {
+      if (state.consumptionDraftEditIndex >= 0 && state.consumptionDrafts[state.consumptionDraftEditIndex]) {
+        state.consumptionDrafts[state.consumptionDraftEditIndex] = pendingEntry;
+      } else {
+        state.consumptionDrafts.push(pendingEntry);
+      }
+      state.consumptionDraftEditIndex = -1;
+    }
     if (!state.consumptionDrafts.length) {
       toast("Añade al menos un producto a la selección.", "error", "empty-consumption-selection");
       return null;
@@ -6463,6 +6807,7 @@ const App = (() => {
       return null;
     }
     state.consumptionDrafts = [];
+    state.consumptionDraftEditIndex = -1;
     renderConsumptionSelection();
     const sessionId = result.sessionId;
     $("#consumptionDialog")?.close();
@@ -6483,6 +6828,7 @@ const App = (() => {
     form.quantity.required = true;
     applyConsumptionRoleRestrictions(form);
     state.consumptionDrafts = [];
+    state.consumptionDraftEditIndex = -1;
     const session = state.sessions.find((entry) => entry.id === sessionId);
     form.payer_name.value = session?.payer_name || "";
     form.quantity.value = "";
@@ -6512,6 +6858,7 @@ const App = (() => {
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
     const quickCheckout = form.quick_checkout.value === "1";
     state.consumptionDrafts = [];
+    state.consumptionDraftEditIndex = -1;
     renderConsumptionSelection();
     $("#consumptionDialog")?.close();
     if (!quickCheckout || !isLocalWalkInSession(session)) return;
@@ -6941,7 +7288,7 @@ const App = (() => {
     const saved = await db(
       state.sb
         .from("restaurant_tables")
-        .update({ qr_code: nextCode, qr_image_url: null })
+        .update({ qr_code: nextCode, qr_image_url: isOutdoorTable(table) ? outdoorQrImageValue(null, true) : null })
         .eq("id", id)
         .select("*")
         .single(),
@@ -6963,6 +7310,7 @@ const App = (() => {
     form.table_number.value = table.table_number;
     form.table_name.value = table.table_name || "";
     form.is_active.checked = table.is_active;
+    form.is_outdoor.checked = isOutdoorTable(table);
     renderTableFormQr();
     history.replaceState(null, "", "#menu");
     showAdminSection("menu");
@@ -7105,6 +7453,13 @@ const App = (() => {
     });
     $("#incomeFilterForm")?.addEventListener("submit", (event) => {
       event.preventDefault();
+      const dateFrom = $("#incomeDateFrom")?.value || "";
+      const dateTo = $("#incomeDateTo")?.value || "";
+      if (dateFrom > dateTo) {
+        toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
+        return;
+      }
+      state.incomeAppliedRange = { dateFrom, dateTo };
       state.incomeRangePreset = "custom";
       markIncomeRangePreset();
       void loadIncomeReport();
@@ -7124,13 +7479,14 @@ const App = (() => {
     });
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
-      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 120);
+      state.incomeRequestId += 1;
+      state.incomePageLoading = false;
+      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 350);
     });
     $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
     [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
       state.incomeRangePreset = "custom";
       markIncomeRangePreset();
-      if ($("#incomeDateFrom")?.value && $("#incomeDateTo")?.value) void loadIncomeReport();
     }));
     $("#inventorySearch")?.addEventListener("input", (event) => {
       state.inventorySearch = event.currentTarget.value;
@@ -7159,6 +7515,15 @@ const App = (() => {
       else queueConsumptionDraft();
     });
     $("#consumptionQueueButton")?.addEventListener("click", queueConsumptionDraft);
+    $("#consumptionSelectionLines")?.addEventListener("dblclick", (event) => {
+      const price = event.target.closest("[data-edit-consumption-price]");
+      if (price) {
+        editConsumptionDraftPrice(price);
+        return;
+      }
+      const product = event.target.closest("[data-edit-consumption-product]");
+      if (product) editConsumptionDraftProduct(Number(product.dataset.editConsumptionProduct));
+    });
     $("#paymentForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await processPayment(event.currentTarget, event.submitter);
@@ -7410,6 +7775,7 @@ const App = (() => {
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
       if (target.id === "refreshIncomeReport") await loadIncomeReport();
+      if (target.id === "moreIncomeRecords") await loadMoreIncomeRecords();
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
@@ -7417,12 +7783,16 @@ const App = (() => {
         $("#inventoryDialog")?.close();
       }
       if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
+      if (target.id === "moreInventoryMovements") await loadInventoryMovements({ more: true });
       if (target.dataset.resetSection) {
         await resetSectionData(target.dataset.resetSection);
         return;
       }
       if (target.dataset.removeConsumptionDraft !== undefined) {
-        state.consumptionDrafts.splice(Number(target.dataset.removeConsumptionDraft), 1);
+        const removedIndex = Number(target.dataset.removeConsumptionDraft);
+        state.consumptionDrafts.splice(removedIndex, 1);
+        if (state.consumptionDraftEditIndex === removedIndex) clearConsumptionEntry($("#consumptionForm"));
+        else if (state.consumptionDraftEditIndex > removedIndex) state.consumptionDraftEditIndex -= 1;
         renderConsumptionSelection();
       }
       if (target.dataset.minimizeAdminChat) setAdminChatMinimized(target.dataset.minimizeAdminChat, !state.adminChats.get(String(target.dataset.minimizeAdminChat))?.minimized);
@@ -8027,6 +8397,9 @@ const App = (() => {
   const renderUsers = () => {
     const list = $("#usersList");
     if (!list) return;
+    const renderSignature = JSON.stringify(state.users.map((user) => [user.id, user.full_name, user.username, user.role, user.is_active]));
+    if (renderSignature === state.usersRenderSignature) return;
+    state.usersRenderSignature = renderSignature;
     const badge = $("#usersCountBadge");
     if (badge) badge.innerHTML = `${icon("users-round", 16)} ${state.users.length} ${state.users.length === 1 ? "usuario" : "usuarios"}`;
     list.innerHTML = state.users.length
@@ -8221,8 +8594,8 @@ const App = (() => {
     void loadUsers().then(renderUsers);
     state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") === "1";
     const initialSection = pendingScan ? "service" : (location.hash.replace("#", "") || "dashboard");
-    renderAdmin();
-    renderUsers();
+    renderAdminShell();
+    renderBusinessForm();
     showAdminSection(initialSection);
     updateAlarmButton();
     bindAdmin();
@@ -8232,8 +8605,10 @@ const App = (() => {
     setLoading(false);
     await loadBootstrap();
     await ensurePresetCategories();
-    renderAdmin();
-    showAdminSection(initialSection);
+    const currentSection = state.activeAdminSection || location.hash.replace("#", "") || initialSection;
+    renderAdminShell();
+    renderBusinessForm();
+    showAdminSection(currentSection);
     renderTableFormQr();
     initRemoteStorage();
     window.addEventListener("online", flushAppsScriptOutbox);

@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.6.0",
+  version: "2.8.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -145,7 +145,7 @@ function apiRequest(payloadText) {
     if (request.action === "get_inventory") result = getInventory_();
     else if (request.action === "get_inventory_movements") {
       requireAdmin_(user);
-      result = getInventoryMovements_(payload.limit);
+      result = getInventoryMovements_(payload.limit, payload.cursor, payload.revision);
     }
     else if (request.action === "get_income_report") {
       requireAdmin_(user);
@@ -191,6 +191,16 @@ function apiRequest(payloadText) {
       throw new Error("Accion no permitida: " + request.action);
     }
     if (result && result.ok === false) return result;
+    if (["record_sale", "edit_sale", "delete_sale", "clear_income"].indexOf(request.action) >= 0
+        && !result.duplicate && result.deleted !== false) {
+      PropertiesService.getScriptProperties().setProperty("TN_HISTORY_REVISION", String(new Date().getTime()) + "-" + Math.random());
+    }
+    if (request.action === "clear_inventory_movements") {
+      PropertiesService.getScriptProperties().setProperty("TN_MOVEMENT_REVISION", String(new Date().getTime()) + "-" + Math.random());
+    }
+    if (["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].indexOf(request.action) >= 0) {
+      PropertiesService.getScriptProperties().setProperty("TN_INVENTORY_INITIALIZED", "1");
+    }
     result.ok = true;
     return result;
   } catch (error) {
@@ -238,7 +248,7 @@ function bootstrapConnection_(payload, origin, authToken) {
   CacheService.getScriptCache().remove("tn_config");
   CacheService.getScriptCache().put("user_" + hash_(String(authToken || "")), JSON.stringify(user), 120);
   appendAudit_("REMOTE_BOOTSTRAP", cleanOrigin, user.full_name || user.username, "OK", "Conexion inicializada desde el panel.");
-  return { ok: true, configured: true, version: APP.version, user: { id: user.id, role: user.role } };
+  return { ok: true, configured: true, version: APP.version, timezone: getTimezone_(), user: { id: user.id, role: user.role } };
 }
 
 function updateConfigurationSheet_(candidate, origins) {
@@ -306,15 +316,23 @@ function getInventory_() {
     if (!row[0]) continue;
     items.push(inventoryRowToObject_(row));
   }
-  return { items: items, syncedAt: new Date().toISOString() };
+  var properties = PropertiesService.getScriptProperties();
+  if (items.length && properties.getProperty("TN_INVENTORY_INITIALIZED") !== "1") properties.setProperty("TN_INVENTORY_INITIALIZED", "1");
+  return { items: items, everInitialized: properties.getProperty("TN_INVENTORY_INITIALIZED") === "1", syncedAt: new Date().toISOString() };
 }
 
-function getInventoryMovements_(requestedLimit) {
+function getInventoryMovements_(requestedLimit, requestedCursor, requestedRevision) {
   var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
-  var rows = readSheetRows_(sheet, HEADERS.movements.length);
-  var limit = Math.min(2000, Math.max(50, asNumber_(requestedLimit) || 800));
+  var revision = PropertiesService.getScriptProperties().getProperty("TN_MOVEMENT_REVISION") || "";
+  if (requestedCursor && String(requestedRevision || "") !== revision) return { stale: true, movements: [] };
+  var limit = Math.min(800, Math.max(1, asNumber_(requestedLimit) || 800));
+  var lastRow = sheet.getLastRow();
+  var cursor = requestedCursor ? Math.min(lastRow, Math.floor(asNumber_(requestedCursor))) : lastRow;
+  if (!isFinite(cursor) || cursor < 2) cursor = 1;
+  var firstRow = Math.max(2, cursor - limit + 1);
+  var rows = cursor >= 2 ? sheet.getRange(firstRow, 1, cursor - firstRow + 1, HEADERS.movements.length).getValues() : [];
   return {
-    movements: rows.slice(-limit).map(function (row) {
+    movements: rows.reverse().map(function (row) {
       return {
         movementId: String(row[0] || ""),
         productId: String(row[1] || ""),
@@ -330,13 +348,19 @@ function getInventoryMovements_(requestedLimit) {
         date: row[11] instanceof Date ? row[11].toISOString() : String(row[11] || ""),
         user: String(row[12] || "Sistema")
       };
-    })
+    }),
+    nextCursor: firstRow > 2 ? firstRow - 1 : null,
+    hasMore: firstRow > 2,
+    revision: revision
   };
 }
 
 function getIncomeReport_(filters) {
   var spreadsheet = getSpreadsheet_();
   var timezone = getTimezone_();
+  var pageRows = Array.isArray(filters.pageRows) ? filters.pageRows.slice(0, 300) : null;
+  var revision = PropertiesService.getScriptProperties().getProperty("TN_HISTORY_REVISION") || "";
+  if (pageRows && String(filters.revision || "") !== revision) return { stale: true, records: [] };
   var today = Utilities.formatDate(new Date(), timezone, "yyyy-MM-dd");
   var dateFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(filters.dateFrom || "")) ? String(filters.dateFrom) : today;
   var dateTo = /^\d{4}-\d{2}-\d{2}$/.test(String(filters.dateTo || "")) ? String(filters.dateTo) : today;
@@ -347,15 +371,36 @@ function getIncomeReport_(filters) {
   }
   var methodFilter = String(filters.paymentMethod || "all").toLowerCase();
   var query = normalizeSearch_(filters.query || "");
-  var salesRows = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.sales), HEADERS.sales.length);
+  var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
+  var salesRows = pageRows ? [] : readSheetRows_(salesSheet, HEADERS.sales.length);
+  if (pageRows) {
+    var validRows = pageRows.map(function (entry) { return Math.floor(asNumber_(entry.row)); })
+      .filter(function (row) { return row >= 2 && row <= salesSheet.getLastRow(); }).sort(function (a, b) { return a - b; });
+    for (var position = 0; position < validRows.length;) {
+      var end = position + 1;
+      while (end < validRows.length && validRows[end] - validRows[end - 1] <= 20 && validRows[end] - validRows[position] < 600) end += 1;
+      var block = salesSheet.getRange(validRows[position], 1, validRows[end - 1] - validRows[position] + 1, HEADERS.sales.length).getValues();
+      for (var entryIndex = position; entryIndex < end; entryIndex += 1) {
+        salesRows.push({ row: block[validRows[entryIndex] - validRows[position]], sheetRow: validRows[entryIndex] });
+      }
+      position = end;
+    }
+  } else {
+    salesRows = salesRows.map(function (row, index) { return { row: row, sheetRow: index + 2 }; });
+  }
   var paymentRows = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length);
   var detailRows = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length);
   var paymentsBySale = {};
   var detailsBySale = {};
+  var selectedSales = null;
+  if (pageRows) {
+    selectedSales = {};
+    pageRows.forEach(function (entry) { selectedSales[String(entry.saleId || "")] = true; });
+  }
 
   paymentRows.forEach(function (row) {
     var saleId = String(row[0] || "");
-    if (!saleId) return;
+    if (!saleId || selectedSales && !selectedSales[saleId]) return;
     if (!paymentsBySale[saleId]) paymentsBySale[saleId] = [];
     paymentsBySale[saleId].push({
       method: String(row[2] || "").toLowerCase(),
@@ -366,7 +411,7 @@ function getIncomeReport_(filters) {
 
   detailRows.forEach(function (row) {
     var saleId = String(row[0] || "");
-    if (!saleId) return;
+    if (!saleId || selectedSales && !selectedSales[saleId]) return;
     if (!detailsBySale[saleId]) detailsBySale[saleId] = [];
     detailsBySale[saleId].push({
       lineId: String(row[2] || ""),
@@ -396,7 +441,8 @@ function getIncomeReport_(filters) {
   };
   var records = [];
 
-  salesRows.forEach(function (row) {
+  salesRows.forEach(function (entry) {
+    var row = entry.row;
     var saleId = String(row[0] || "");
     if (!saleId) return;
     var dateKey = dateValueToKey_(row[5], timezone);
@@ -435,6 +481,7 @@ function getIncomeReport_(filters) {
       payments: payments,
       items: items
     };
+    record.sheetRow = entry.sheetRow;
     records.push(record);
     totals.income += total;
     totals.sales += 1;
@@ -452,15 +499,28 @@ function getIncomeReport_(filters) {
     });
   });
 
-  records.sort(function (left, right) { return String(right.date).localeCompare(String(left.date)); });
+  records.sort(function (left, right) { return String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId)); });
+  if ((PropertiesService.getScriptProperties().getProperty("TN_HISTORY_REVISION") || "") !== revision) return { stale: true, records: [] };
+  if (pageRows) {
+    var expectedIds = {};
+    pageRows.forEach(function (entry) { expectedIds[entry.row] = String(entry.saleId || ""); });
+    if (records.length !== pageRows.length || records.some(function (record) { return expectedIds[record.sheetRow] !== record.saleId; })) {
+      return { stale: true, records: [] };
+    }
+    records.forEach(function (record) { delete record.sheetRow; });
+    return { records: records, generatedAt: new Date().toISOString() };
+  }
   totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
   var totalRecords = records.length;
   var limit = Math.min(500, Math.max(50, asNumber_(filters.limit) || 300));
+  var recordRows = records.map(function (record) { return { row: record.sheetRow, saleId: record.saleId }; });
+  records.forEach(function (record) { delete record.sheetRow; });
   return {
     filters: { dateFrom: dateFrom, dateTo: dateTo, paymentMethod: methodFilter, query: String(filters.query || "") },
     totals: totals,
     records: records.slice(0, limit),
-    recordKeys: records.slice(0, 1200).map(function (record) { return record.saleId; }),
+    recordRows: recordRows,
+    revision: revision,
     totalRecords: totalRecords,
     truncated: totalRecords > limit,
     generatedAt: new Date().toISOString()
@@ -475,8 +535,7 @@ function readSheetRows_(sheet, width) {
 function dateValueToKey_(value, timezone) {
   if (value instanceof Date && !isNaN(value.getTime())) return Utilities.formatDate(value, timezone, "yyyy-MM-dd");
   var text = String(value || "").trim();
-  var direct = text.match(/^(\d{4}-\d{2}-\d{2})/);
-  if (direct) return direct[1];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
   var parsed = new Date(text);
   return isNaN(parsed.getTime()) ? "" : Utilities.formatDate(parsed, timezone, "yyyy-MM-dd");
 }

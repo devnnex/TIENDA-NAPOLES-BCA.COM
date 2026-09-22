@@ -28,7 +28,7 @@ Cada vez que modifique `Code.gs`, edite la implementación y publique una versi�
 - `Movimientos_Inventario`: trazabilidad de entradas, salidas, altas, devoluciones y correcciones con responsable y hora exacta.
 - `Ingresos_Diarios`: acumulado diario por medio de pago, costos y utilidad.
 
-El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer, 7 días, 15 días, mes, 30 días, año o fechas personalizadas. También permite filtrar por efectivo, transferencia, Bre-B y pagos mixtos, buscar facturas o productos y exportar el resultado visible en CSV.
+El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer, 7 días, 15 días, mes, 30 días, año o fechas personalizadas. Los totales cubren todo el período filtrado; el detalle llega en páginas de 300 ventas. Los movimientos llegan en páginas de 800. También permite filtrar por efectivo, transferencia, Bre-B y pagos mixtos, buscar facturas o productos y exportar el resultado visible en CSV.
 
 ## Funcionamiento
 
@@ -45,4 +45,4 @@ El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer,
 
 ## Comprobación rápida
 
-Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.6.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.
+Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.8.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.
