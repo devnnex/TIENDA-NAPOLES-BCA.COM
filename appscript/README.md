@@ -17,6 +17,8 @@ No crea otros libros, no divide la información por años y no necesita archivos
 
 Cada vez que modifique `Code.gs`, edite la implementación y publique una versión nueva. Guardar el código sin actualizar la implementación no cambia la URL `/exec` que usa la caja.
 
+La versión `2.10.0` incorpora revisiones ligeras de Ventas y Movimientos. El panel conserva la información ya cargada, consulta estas revisiones en segundo plano y solo vuelve a descargar una sección cuando existen registros nuevos, editados o eliminados.
+
 ## Pestañas creadas
 
 - `Configuracion`: conexión privada y orígenes autorizados.
@@ -45,4 +47,4 @@ El panel **Ventas** consulta estas pestañas para calcular KPIs por hoy, ayer, 7
 
 ## Comprobación rápida
 
-Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.9.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.
+Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.10.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.

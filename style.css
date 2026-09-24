@@ -1705,6 +1705,13 @@ option {
   color: var(--text);
 }
 
+.empty-state > .lucide-loader-circle,
+.empty-state > .lucide-refresh-cw {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: inventorySyncSpin .85s linear infinite;
+}
+
 .setup-screen {
   min-height: 100vh;
   display: grid;
@@ -4110,8 +4117,6 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 .cash-change small { font-size: .68rem; }
 .cash-change.is-sufficient { color: #0e6840; background: #e3f8ec; }
 .cash-change.is-insufficient { color: #a52a2a; background: #ffebeb; }
-.payment-cash-drawer { width: 100%; justify-content: center; }
-
 .receipt-result-modal { width: min(560px, calc(100vw - 1.5rem)); }
 .receipt-result-card { width: 100%; max-width: none; text-align: center; }
 .receipt-result-icon { width: 64px; height: 64px; display: grid; place-items: center; margin: 0 auto; color: #0d7043; border-radius: 20px; background: #e2f8eb; }
@@ -4897,6 +4902,26 @@ body[data-page="admin"] { overflow-x: hidden; }
 .user-row-actions .icon-btn.danger { color: #b42318; background: #fff3f2; }
 .user-row-actions .user-share-access { width: auto; min-width: 104px; gap: .35rem; margin-right: auto; padding-inline: .65rem; color: #11683f; background: #eefaf3; }
 
+.role-guide { display: grid; gap: 1rem; margin-top: 1rem; padding: 1rem; border: 1px solid rgba(18, 24, 31, .09); border-radius: 20px; background: linear-gradient(145deg, #fff, #f6f8fb); box-shadow: 0 12px 34px rgba(18, 24, 31, .07); }
+.role-guide-heading { display: flex; align-items: flex-start; gap: .75rem; }
+.role-guide-heading h3 { margin: .12rem 0 .25rem; font-size: 1.1rem; }
+.role-guide-heading p { margin: 0; color: #667085; font-size: .8rem; line-height: 1.45; }
+.role-guide-icon { width: 46px; height: 46px; flex: 0 0 46px; display: grid; place-items: center; color: #fff; border-radius: 15px; background: linear-gradient(135deg, #17191f, #3f4857); box-shadow: 0 10px 24px rgba(18, 24, 31, .18); }
+.role-guide-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem; }
+.role-guide-grid article { display: grid; align-content: start; gap: .42rem; min-width: 0; padding: .85rem; border: 1px solid rgba(18, 24, 31, .08); border-radius: 14px; background: #fff; }
+.role-guide-grid article > strong { color: #17191f; font-size: .82rem; }
+.role-guide-grid article p { margin: 0; color: #667085; font-size: .74rem; line-height: 1.5; }
+.role-guide-role { width: max-content; max-width: 100%; display: inline-flex; align-items: center; gap: .35rem; padding: .3rem .48rem; border-radius: 999px; color: #4f5967; background: #eef1f5; font-size: .68rem; font-weight: 850; }
+.role-guide-role svg { width: 14px; height: 14px; }
+.role-guide-role.is-boss { color: #9a4e00; background: #fff2d1; }
+.role-guide-role.is-admin { color: #4a3475; background: #eee8fb; }
+.role-guide-role.is-waiter { color: #11683f; background: #e4f7ec; }
+.role-guide-steps { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; padding: .75rem; border-radius: 13px; color: #525d6d; background: #f1f4f7; font-size: .73rem; }
+.role-guide-steps strong { color: #17191f; }
+.role-guide-steps span { padding: .25rem .4rem; border-radius: 8px; background: #fff; }
+.role-guide-access { display: flex; align-items: center; gap: .5rem; margin: 0; color: #525d6d; font-size: .75rem; line-height: 1.45; }
+.role-guide-access svg { flex: 0 0 auto; color: #169b5b; }
+
 @media (max-width: 700px) {
   #tableManagerList { grid-template-columns: 1fr; }
   .income-edit-modal .form-grid { grid-template-columns: 1fr 1fr; }
@@ -4906,6 +4931,7 @@ body[data-page="admin"] { overflow-x: hidden; }
   .income-edit-line .income-line-delete { grid-column: 3; grid-row: 2; }
   .user-form-fields { grid-template-columns: 1fr 1fr; }
   .user-permissions-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .role-guide-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 430px) {

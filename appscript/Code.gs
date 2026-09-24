@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.9.0",
+  version: "2.10.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -137,7 +137,14 @@ function apiRequest(payloadText) {
     }
     validateOrigin_(request.origin);
     if (request.action === "status") {
-      return { ok: true, version: APP.version, configured: isConfigured_() };
+      var revisionProperties = PropertiesService.getScriptProperties();
+      return {
+        ok: true,
+        version: APP.version,
+        configured: isConfigured_(),
+        historyRevision: revisionProperties.getProperty("TN_HISTORY_REVISION") || "",
+        movementRevision: revisionProperties.getProperty("TN_MOVEMENT_REVISION") || ""
+      };
     }
     var user = validateSupabaseUser_(request.authToken);
     var payload = request.payload || {};
@@ -201,7 +208,8 @@ function apiRequest(payloadText) {
         && !result.duplicate && result.deleted !== false) {
       PropertiesService.getScriptProperties().setProperty("TN_HISTORY_REVISION", String(new Date().getTime()) + "-" + Math.random());
     }
-    if (request.action === "clear_inventory_movements") {
+    if (["upsert_inventory", "adjust_inventory", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements"].indexOf(request.action) >= 0
+        && !result.duplicate && result.deleted !== false) {
       PropertiesService.getScriptProperties().setProperty("TN_MOVEMENT_REVISION", String(new Date().getTime()) + "-" + Math.random());
     }
     if (["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].indexOf(request.action) >= 0) {

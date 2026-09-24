@@ -12,7 +12,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260923-users-income-1">
+    <link rel="stylesheet" href="style.css?v=20260924-background-reports-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -79,7 +79,6 @@
         </div>
         <div class="admin-header-actions">
           <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
-          <button class="ghost" id="openCashDrawer" type="button"><i data-lucide="archive-restore"></i> Abrir caja</button>
         </div>
       </header>
 
@@ -512,6 +511,19 @@
           </div>
         </form>
         <div class="users-list" id="usersList"></div>
+        <aside class="role-guide" data-boss-only role="note" aria-labelledby="roleGuideTitle">
+          <div class="role-guide-heading">
+            <span class="role-guide-icon"><i data-lucide="shield-question"></i></span>
+            <div><span class="eyebrow">Guía sencilla</span><h3 id="roleGuideTitle">¿Qué puede hacer cada rol?</h3><p>Elige el rol según lo que la persona necesita hacer dentro del sistema.</p></div>
+          </div>
+          <div class="role-guide-grid">
+            <article><span class="role-guide-role is-boss"><i data-lucide="crown"></i> Jefe</span><strong>Puede hacer todo</strong><p>Ve todas las secciones, crea usuarios, cambia permisos, edita y elimina información.</p></article>
+            <article><span class="role-guide-role is-admin"><i data-lucide="shield-check"></i> Administrador</span><strong>Solo entra donde el Jefe decida</strong><p>Al elegir Administrador, marca abajo las secciones permitidas. Puede trabajar en ellas, pero no puede eliminar datos ni modificar ventas cerradas.</p></article>
+            <article><span class="role-guide-role is-waiter"><i data-lucide="user-round"></i> Mesero</span><strong>Solo atiende mesas</strong><p>Puede agregar consumos, editar el producto o el precio con doble clic y confirmar la selección. No puede cobrar, cerrar cuentas ni eliminar.</p></article>
+          </div>
+          <div class="role-guide-steps"><strong>Para cambiar permisos:</strong><span>1. Pulsa el lápiz del usuario.</span><span>2. Elige Administrador.</span><span>3. Marca o desmarca sus secciones.</span><span>4. Guarda el usuario.</span></div>
+          <p class="role-guide-access"><i data-lucide="toggle-right"></i><span>El interruptor <strong>Acceso</strong> de cada tarjeta permite activar o bloquear su entrada al sistema.</span></p>
+        </aside>
       </section>
     </main>
 
@@ -772,6 +784,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260923-users-income-2"></script>
+    <script src="app.js?v=20260924-background-reports-1"></script>
   </body>
 </html>

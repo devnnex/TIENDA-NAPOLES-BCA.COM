@@ -10,9 +10,9 @@ const SUPABASE_CONFIG = {
 // necesita solo el origen del proyecto y construye internamente /rest/v1.
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbwF1--zNxUi9E5FMVmTwI9oqhrZPZGjA5iPVJBTtY9aseAzLkarD8eCwVSBSg1glM3RUQ/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbzUCN4NextZRZev6ckp9JqeyRhBUO_M2qgS9v_2HxyFH6KELTUL0IW8z2ay-N0QgirXjA/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.9.0";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.10.0";
 const APPS_SCRIPT_TIMEOUT_MS = 45000;
 
 const isAppsScriptVersionCompatible = (version) => {
@@ -310,6 +310,7 @@ const App = (() => {
     inventorySearch: "",
     inventoryStatusFilter: "all",
     incomeReport: null,
+    incomeRevision: "",
     incomeLoading: false,
     incomeRequestId: 0,
     incomeRangePreset: "month",
@@ -355,6 +356,8 @@ const App = (() => {
     alarmStopTimer: null,
     adminPollTimer: null,
     adminSyncBusy: false,
+    backgroundReportSyncBusy: false,
+    backgroundReportCheckedAt: 0,
     activeAdminSection: "dashboard",
     adminSectionSwitchToken: 0,
     adminSectionSwitchFrame: 0,
@@ -756,7 +759,7 @@ const App = (() => {
         if (section === "inventory") renderInventory();
         if (section === "movements") {
           renderInventoryMovements();
-          if (!state.movementLoaded || Date.now() - state.movementFetchedAt > 60000) void loadInventoryMovements();
+          if (!state.movementLoaded && !state.movementLoading) void loadInventoryMovements();
         }
         if (section === "income") {
           initializeIncomeFilters();
@@ -768,7 +771,7 @@ const App = (() => {
             }
           }
           renderIncomeReport();
-          if (!state.incomeLoading && (!state.incomeReport || Date.now() - state.incomeFetchedAt > 60000)) void loadIncomeReport();
+          if (!state.incomeLoading && !state.incomeReport) void loadIncomeReport();
         }
         if (section === "users") renderUsers();
         if (section === "assistant") renderAdminAi();
@@ -1849,27 +1852,6 @@ const App = (() => {
     mixed: "Pago mixto"
   }[method] || "Pago");
 
-  const openCashDrawer = async () => {
-    const bridge = window.posCashDrawer;
-    const status = $("#cashDrawerStatus");
-    if (!bridge || typeof bridge.open !== "function") {
-      if (status) status.textContent = "No se detecto un puente local compatible con el cajon.";
-      toast("El cajón no está configurado en este equipo. Revisa la conexión del cajón con el punto de venta.", "error", "cash-drawer-unavailable");
-      return false;
-    }
-    try {
-      const result = await bridge.open({ source: "tienda-napoles-pos", requestedAt: new Date().toISOString() });
-      if (result === false) throw new Error("El controlador rechazo la apertura.");
-      if (status) status.textContent = "Orden de apertura enviada correctamente.";
-      toast("Orden de apertura enviada al cajon.", "ok", "cash-drawer-opened");
-      return true;
-    } catch (error) {
-      if (status) status.textContent = "El controlador no pudo abrir el cajon.";
-      toast(String(error?.message || "No se pudo abrir el cajon."), "error", "cash-drawer-failed");
-      return false;
-    }
-  };
-
   const getAppsScriptUrl = () => String(APPS_SCRIPT_CONFIG.webAppUrl || "").trim();
 
   const isAppsScriptConfigured = () => /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:[?#].*)?$/i.test(getAppsScriptUrl());
@@ -1923,6 +1905,9 @@ const App = (() => {
       let result;
       try { result = JSON.parse(text); } catch (error) {
         throw transientAppsScriptError("La respuesta del respaldo remoto todavía se está confirmando.");
+      }
+      if (result?.ok && ["upsert_inventory", "adjust_inventory", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
+        window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
       }
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
@@ -2016,6 +2001,7 @@ const App = (() => {
     if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock"].includes(action)) jobs[existingIndex] = job;
     else if (existingIndex < 0) jobs.push(job);
     writeAppsScriptOutbox(jobs);
+    window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
     if (isAppsScriptConfigured()) void flushAppsScriptOutbox();
     else setInventorySyncStatus(`${jobs.length} cambio${jobs.length === 1 ? "" : "s"} en cola local`, "local", "hard-drive");
   };
@@ -3525,6 +3511,7 @@ const App = (() => {
     try {
       const changed = await loadAdminData();
       if (changed) renderAdminLive();
+      void refreshBackgroundReports();
       return changed;
     } finally {
       state.adminSyncBusy = false;
@@ -4335,6 +4322,14 @@ const App = (() => {
     const list = $("#inventoryMovementList");
     const summary = $("#movementSummary");
     if (!list || !summary) return;
+    if (state.movementLoading && !state.movementLoaded && !state.inventoryMovements.length) {
+      summary.innerHTML = "";
+      list.innerHTML = emptyState("Actualizando movimientos", "Estamos consultando el historial de inventario.", "refresh-cw");
+      const moreButton = $("#moreInventoryMovements");
+      if (moreButton) moreButton.hidden = true;
+      refreshIcons();
+      return;
+    }
     const query = normalizeText(state.movementSearch);
     const movements = [...state.inventoryMovements]
       .filter((movement) => state.movementTypeFilter === "all" || movementKind(movement) === state.movementTypeFilter)
@@ -4361,11 +4356,12 @@ const App = (() => {
     refreshIcons();
   };
 
-  const loadInventoryMovements = async ({ more = false } = {}) => {
+  const loadInventoryMovements = async ({ more = false, background = false } = {}) => {
     if (!isAppsScriptConfigured() || !state.currentUser || state.movementLoading) return false;
     if (more && !state.movementHasMore) return false;
     const requestId = ++state.movementRequestId;
     state.movementLoading = true;
+    if (!more && !background && state.activeAdminSection === "movements") renderInventoryMovements();
     const button = $("#moreInventoryMovements");
     if (button) { button.disabled = true; button.textContent = "Cargando movimientos..."; }
     let appendFrom = 0;
@@ -4399,13 +4395,13 @@ const App = (() => {
       }
       return true;
     } catch (error) {
-      toast(String(error?.message || error), "error", "movement-page-failed");
+      if (!background) toast(String(error?.message || error), "error", "movement-page-failed");
       return false;
     } finally {
       if (requestId === state.movementRequestId) {
         state.movementLoading = false;
-        renderInventoryMovements(appendFrom);
-        if (refreshAfterStale) window.setTimeout(() => void loadInventoryMovements(), 0);
+        if (state.activeAdminSection === "movements") renderInventoryMovements(appendFrom);
+        if (refreshAfterStale) window.setTimeout(() => void loadInventoryMovements({ background }), 0);
       }
     }
   };
@@ -4909,9 +4905,7 @@ const App = (() => {
     const totals = report.totals || {};
     const margin = Number(totals.income || 0) > 0 ? Number(totals.profit || 0) / Number(totals.income) * 100 : 0;
     const infoButton = (label, explanation) => `<button class="income-kpi-info" type="button" aria-label="Qué significa ${escapeHTML(label)}" data-tooltip="${escapeHTML(explanation)}">${icon("info", 15)}</button>`;
-    kpis.innerHTML = state.incomeLoading
-      ? Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("")
-      : `
+    kpis.innerHTML = `
         <article class="income-kpi is-primary">${infoButton("Dinero vendido", "Todo el dinero cobrado en las ventas de este periodo.")}<span>${icon("circle-dollar-sign", 19)} Dinero vendido</span><strong>${money(totals.income)}</strong><small>Total vendido en el periodo seleccionado</small></article>
         <article class="income-kpi is-profit">${infoButton("Ganancia aproximada", "Lo que queda al restar del dinero vendido el costo de los productos.")}<span>${icon("trending-up", 19)} Ganancia aproximada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% del dinero vendido</small></article>
         <article class="income-kpi">${infoButton("Costo de los productos", "Lo que el negocio pagó por los productos que ya vendió.")}<span>${icon("package-search", 19)} Costo de los productos</span><strong>${money(totals.cost)}</strong><small>Valor de compra de lo que se vendió</small></article>`;
@@ -4966,7 +4960,7 @@ const App = (() => {
     refreshIcons();
   };
 
-  const loadIncomeReport = async () => {
+  const loadIncomeReport = async ({ background = false } = {}) => {
     if (!$("#income") || !canAccessAdminSection("income")) return false;
     clearTimeout(state.incomeSearchTimer);
     state.incomeSearchTimer = null;
@@ -4976,11 +4970,14 @@ const App = (() => {
       return false;
     }
     const requestId = ++state.incomeRequestId;
+    const previousReport = state.incomeReport;
     state.incomeLoading = true;
     state.incomePageLoading = false;
-    state.incomeReport = localIncomeReport(filters);
-    renderIncomeReport();
-    setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
+    if (!background || !previousReport) {
+      state.incomeReport = localIncomeReport(filters);
+      renderIncomeReport();
+      setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
+    }
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
       let result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
@@ -4992,12 +4989,17 @@ const App = (() => {
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       state.incomeReport = mergeIncomeReport(result, filters);
+      state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
-      renderIncomeReport();
+      if (state.activeAdminSection === "income") renderIncomeReport();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
+      if (background && previousReport) {
+        state.incomeReport = previousReport;
+        return false;
+      }
       state.incomeReport = localIncomeReport(filters, String(error?.message || error));
       state.incomeFetchedAt = Date.now();
       renderIncomeReport();
@@ -5005,6 +5007,37 @@ const App = (() => {
       return false;
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
+    }
+  };
+
+  const refreshBackgroundReports = async ({ force = false } = {}) => {
+    const canCheckIncome = canAccessAdminSection("income");
+    const canCheckMovements = canAccessAdminSection("movements");
+    if ((!canCheckIncome && !canCheckMovements) || !state.currentUser || !isAppsScriptConfigured() || !navigator.onLine) return false;
+    const now = Date.now();
+    if (state.backgroundReportSyncBusy || (!force && now - state.backgroundReportCheckedAt < 12000)) return false;
+    state.backgroundReportSyncBusy = true;
+    state.backgroundReportCheckedAt = now;
+    try {
+      const status = await appsScriptRequest("status", {}, 12000);
+      if (!status?.ok) return false;
+      const hasIncomeRevision = Object.prototype.hasOwnProperty.call(status, "historyRevision");
+      const hasMovementRevision = Object.prototype.hasOwnProperty.call(status, "movementRevision");
+      const historyRevision = String(status.historyRevision || "");
+      const movementRevision = String(status.movementRevision || "");
+      const updates = [];
+      if (canCheckIncome && !state.incomeLoading && (!state.incomeReport || (hasIncomeRevision && state.incomeRevision !== historyRevision))) {
+        updates.push(loadIncomeReport({ background: Boolean(state.incomeReport) }));
+      }
+      if (canCheckMovements && !state.movementLoading && (!state.movementLoaded || (hasMovementRevision && state.movementRevision !== movementRevision))) {
+        updates.push(loadInventoryMovements({ background: state.movementLoaded || Boolean(state.inventoryMovements.length) }));
+      }
+      if (updates.length) await Promise.all(updates);
+      return updates.length > 0;
+    } catch (error) {
+      return false;
+    } finally {
+      state.backgroundReportSyncBusy = false;
     }
   };
 
@@ -7878,7 +7911,6 @@ const App = (() => {
         localStorage.setItem(SERVICE_ZONE_STORAGE_KEY, state.activeServiceZone);
         renderServicePoints();
       }
-      if (target.id === "openCashDrawer" || target.dataset.openCashDrawer !== undefined) await openCashDrawer();
       if (target.id === "receiptPrintButton") printLastPaidReceipt();
       if (target.dataset.closeReceiptResult !== undefined) $("#receiptResultDialog")?.close();
       if (target.id === "viewTableConsumption") {
@@ -8770,6 +8802,11 @@ const App = (() => {
 
   const initAdmin = async () => {
     setLoading(true);
+    const loginUrl = new URL(location.href);
+    const credentialParams = ["username", "pin", "initialFullName", "initialUsername", "initialPin"];
+    const hadCredentialParams = credentialParams.some((key) => loginUrl.searchParams.has(key));
+    credentialParams.forEach((key) => loginUrl.searchParams.delete(key));
+    if (hadCredentialParams) history.replaceState(null, "", `${loginUrl.pathname}${loginUrl.search}${loginUrl.hash}`);
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
     loadInventoryStore();
@@ -8793,10 +8830,11 @@ const App = (() => {
     showAdminSection(currentSection);
     renderTableFormQr();
     initRemoteStorage();
-    window.setTimeout(() => {
-      if (canAccessAdminSection("income") && !state.incomeLoading && !state.incomeReport) void loadIncomeReport();
-    }, 400);
-    window.addEventListener("online", () => { if (!isWaiter()) void flushAppsScriptOutbox(); });
+    window.setTimeout(() => void refreshBackgroundReports({ force: true }), 400);
+    window.addEventListener("online", () => {
+      if (!isWaiter()) void flushAppsScriptOutbox();
+      void refreshBackgroundReports({ force: true });
+    });
     startAdminPolling();
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
