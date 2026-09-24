@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.8.0",
+  version: "2.9.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -144,48 +144,54 @@ function apiRequest(payloadText) {
     var result;
     if (request.action === "get_inventory") result = getInventory_();
     else if (request.action === "get_inventory_movements") {
-      requireAdmin_(user);
+      requireSection_(user, "movements");
       result = getInventoryMovements_(payload.limit, payload.cursor, payload.revision);
     }
     else if (request.action === "get_income_report") {
-      requireAdmin_(user);
+      requireSection_(user, "income");
       result = getIncomeReport_(payload.filters || {});
     }
-    else if (request.action === "record_sale") result = recordSale_(payload.invoice, user, request.authToken);
+    else if (request.action === "record_sale") {
+      requireManager_(user);
+      result = recordSale_(payload.invoice, user, request.authToken);
+    }
     else if (request.action === "edit_sale") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = editSale_(payload.invoice, user);
     }
     else if (request.action === "delete_sale") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = deleteSale_(payload.saleId, user);
     }
-    else if (request.action === "adjust_inventory") result = adjustInventory_(payload.adjustment, user);
+    else if (request.action === "adjust_inventory") {
+      requireSection_(user, "inventory");
+      result = adjustInventory_(payload.adjustment, user);
+    }
     else if (request.action === "set_inventory_stock") {
-      requireAdmin_(user);
+      requireSection_(user, "inventory");
       result = setInventoryStock_(payload, user);
     }
     else if (request.action === "delete_inventory") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = deleteInventory_(payload.productId, user);
     }
     else if (request.action === "clear_inventory") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = clearInventory_(user, request.authToken);
     }
     else if (request.action === "clear_inventory_movements") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = clearInventoryMovements_(user);
     }
     else if (request.action === "clear_income") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = clearIncome_(user);
     }
     else if (request.action === "upsert_inventory") {
-      requireAdmin_(user);
+      requireSection_(user, "inventory");
       result = upsertInventory_(payload.item, user);
     } else if (request.action === "sync_inventory") {
-      requireAdmin_(user);
+      requireSection_(user, "inventory");
       result = syncInventory_(payload.items || [], user);
     } else {
       throw new Error("Accion no permitida: " + request.action);
@@ -234,7 +240,7 @@ function bootstrapConnection_(payload, origin, authToken) {
     throw new Error("La conexion operativa enviada por el panel esta incompleta.");
   }
   var user = validateSupabaseUserWithConfig_(authToken, candidate);
-  requireAdmin_(user);
+  requireBoss_(user);
   var properties = PropertiesService.getScriptProperties();
   var existingOrigins = String(properties.getProperty(APP.properties.allowedOrigins) || "")
     .split(",").map(function (value) { return value.trim(); }).filter(Boolean);
@@ -1212,7 +1218,22 @@ function validateSupabaseUserWithConfig_(authToken, config) {
 }
 
 function requireAdmin_(user) {
-  if (!user || user.role !== "admin") throw new Error("Esta operacion requiere un administrador.");
+  requireManager_(user);
+}
+
+function requireManager_(user) {
+  if (!user || ["boss", "admin"].indexOf(String(user.role || "")) < 0) throw new Error("Esta operacion requiere un Jefe o Administrador.");
+}
+
+function requireBoss_(user) {
+  if (!user || user.role !== "boss") throw new Error("Esta operacion es exclusiva del Jefe.");
+}
+
+function requireSection_(user, section) {
+  requireManager_(user);
+  if (user.role === "boss") return;
+  if (!Array.isArray(user.permissions)) return;
+  if (user.permissions.indexOf(section) < 0) throw new Error("No tienes acceso a esta seccion.");
 }
 
 function getConfig_() {

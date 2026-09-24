@@ -24,7 +24,7 @@ const elements = {
 let replacementInput = null;
 const context = vm.createContext({
   state: {
-    currentUser: { role: "admin" },
+    currentUser: { role: "waiter" },
     consumptionDrafts: [{ menuItemId: "a", itemName: "Agua", quantity: 1, unitPrice: 1000, notes: "", payerName: "Responsable" }],
     consumptionDraftEditIndex: -1,
     items: [{ id: "a", name: "Agua" }, { id: "b", name: "Cerveza" }]
@@ -75,4 +75,4 @@ context.editPrice(priceElement);
 replacementInput.value = "$3200";
 replacementInput.fire("blur");
 assert.equal(context.state.consumptionDrafts[0].unitPrice, 3200);
-console.log("pending consumption replacement and unit price editing OK");
+console.log("waiter pending consumption replacement and unit price editing OK");

@@ -10,9 +10,9 @@ const SUPABASE_CONFIG = {
 // necesita solo el origen del proyecto y construye internamente /rest/v1.
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbxcq-0ynXRAgueNSnBhdrM9OGIsGKWSkL74Whwzw2MgqBg_-CFvmY73BWrFWarOym6FKA/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbwF1--zNxUi9E5FMVmTwI9oqhrZPZGjA5iPVJBTtY9aseAzLkarD8eCwVSBSg1glM3RUQ/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.8.0";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.9.0";
 const APPS_SCRIPT_TIMEOUT_MS = 45000;
 
 const isAppsScriptVersionCompatible = (version) => {
@@ -116,7 +116,9 @@ const App = (() => {
   const TIP_SETTINGS_STORAGE_KEY = "tienda_napoles_tip_settings_v1";
   const TIP_SPLIT_STORAGE_KEY = "tienda_napoles_tip_split_people_v1";
   const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
+  const USER_CREDENTIALS_CACHE_KEY = "tienda_napoles_user_credentials_v1";
   const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
+  const ADMIN_SECTION_KEYS = ["dashboard", "service", "accounts", "tips", "inventory", "movements", "income", "assistant", "menu", "brand"];
   const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
   const REQUEST_IMAGES = {
     waiter: "images/mesero.png",
@@ -292,6 +294,7 @@ const App = (() => {
     authToken: "",
     currentUser: null,
     users: [],
+    userCredentialPins: {},
     inventoryMeta: {},
     inventoryMovements: [],
     movementCursor: null,
@@ -563,7 +566,7 @@ const App = (() => {
   };
 
   const ensurePresetCategories = async () => {
-    if (state.currentUser?.role !== "admin") return;
+    if (!canAccessAdminSection("menu") && !canAccessAdminSection("inventory")) return;
     const existing = new Set(state.categories.map((category) => normalizeText(category.name)));
     const missing = CATEGORY_PRESETS.filter((name) => !existing.has(normalizeText(name)));
     if (!missing.length) return;
@@ -693,9 +696,30 @@ const App = (() => {
     refreshIcons();
   };
 
+  const isBoss = (user = state.currentUser) => user?.role === "boss";
+  const isWaiter = (user = state.currentUser) => user?.role === "waiter";
+  const roleLabel = (role) => ({ boss: "Jefe", admin: "Administrador", waiter: "Mesero" }[role] || "Usuario");
+  const normalizedUserPermissions = (user = state.currentUser) => {
+    if (isBoss(user)) return [...ADMIN_SECTION_KEYS, "users"];
+    if (isWaiter(user)) return ["service"];
+    if (Array.isArray(user?.permissions)) return [...new Set(user.permissions.filter((section) => ADMIN_SECTION_KEYS.includes(section)))];
+    return [...ADMIN_SECTION_KEYS];
+  };
+  const canAccessAdminSection = (section, user = state.currentUser) => normalizedUserPermissions(user).includes(section);
+  const firstAllowedAdminSection = (user = state.currentUser) => normalizedUserPermissions(user)[0] || "service";
+  const canDeleteRecords = () => isBoss();
+
+  const syncAdminSectionAccess = () => {
+    $$(".admin-sidebar nav a").forEach((link) => {
+      const section = link.getAttribute("href")?.replace("#", "") || "";
+      link.hidden = !canAccessAdminSection(section);
+    });
+  };
+
   const showAdminSection = (section = "dashboard") => {
-    if (section === "tips" && !tipsEnabled()) section = state.currentUser?.role === "waiter" ? "service" : "accounts";
-    if (state.currentUser?.role === "waiter" && !["service", "accounts", "tips"].includes(section)) section = "service";
+    syncAdminSectionAccess();
+    if (section === "tips" && !tipsEnabled()) section = canAccessAdminSection("accounts") ? "accounts" : firstAllowedAdminSection();
+    if (!canAccessAdminSection(section)) section = firstAllowedAdminSection();
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -1679,6 +1703,8 @@ const App = (() => {
     state.invoiceHistory = Array.isArray(invoices) ? invoices : [];
     const movements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, []);
     if (!state.movementLoaded) state.inventoryMovements = Array.isArray(movements) ? movements : [];
+    const credentialPins = readLocalJson(USER_CREDENTIALS_CACHE_KEY, {});
+    state.userCredentialPins = credentialPins && typeof credentialPins === "object" && !Array.isArray(credentialPins) ? credentialPins : {};
     const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
     const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
     state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
@@ -2074,9 +2100,9 @@ const App = (() => {
 
   const bootstrapRemoteStorage = async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
-    if (state.currentUser.role !== "admin") {
+    if (!isBoss()) {
       void syncInventoryWithAppsScript();
-      void flushAppsScriptOutbox();
+      if (!isWaiter()) void flushAppsScriptOutbox();
       return true;
     }
     setInventorySyncStatus("Preparando respaldo remoto", "pending", "refresh-cw");
@@ -3597,7 +3623,10 @@ const App = (() => {
 
   const syncTipFeatureVisibility = () => {
     const enabled = tipsEnabled();
-    $$('[data-tip-feature]').forEach((element) => { element.hidden = !enabled; });
+    $$('[data-tip-feature]').forEach((element) => {
+      const section = element.dataset.adminSection || element.getAttribute("href")?.replace("#", "") || "tips";
+      element.hidden = !enabled || !canAccessAdminSection(section);
+    });
   };
 
   const sessionTotals = (session) => {
@@ -3762,7 +3791,7 @@ const App = (() => {
           ${icon(state.activeServiceZone === "bar" ? "wine" : "flower-2", 22)}
           <span><strong>${escapeHTML(tableLabel(table))}</strong><small>${occupied ? money(sessionTotal(session)) : "Libre"}</small></span>
         </button>
-        ${state.currentUser?.role === "admin" ? `<button class="icon-btn danger" type="button" data-delete-service-point="${escapeHTML(table.id)}" aria-label="Eliminar ${escapeHTML(tableLabel(table))}">${icon("trash-2", 15)}</button>` : ""}
+        ${isBoss() ? `<button class="icon-btn danger" type="button" data-delete-service-point="${escapeHTML(table.id)}" data-boss-only aria-label="Eliminar ${escapeHTML(tableLabel(table))}">${icon("trash-2", 15)}</button>` : ""}
       </article>`;
     }).join("") : emptyState(`Sin ${kindLabel}s`, `Agrega un puesto de ${kindLabel} para atender clientes aquí.`, state.activeServiceZone === "bar" ? "wine" : "flower-2");
     const addButton = $("#addServicePoint");
@@ -3771,7 +3800,7 @@ const App = (() => {
   };
 
   const addServicePoint = () => {
-    if (state.currentUser?.role !== "admin") return;
+    if (isWaiter() || !canAccessAdminSection("service")) return;
     const kind = state.activeServiceZone;
     const sameKind = state.tables.filter((table) => servicePointKind(table) === kind);
     const sequence = sameKind.reduce((largest, table) => {
@@ -3862,7 +3891,7 @@ const App = (() => {
                   <button class="icon-btn" data-edit-table="${table.id}" title="Editar" aria-label="Editar mesa">${icon("pencil", 17)}</button>
                   <button class="icon-btn" data-download-qr="${table.id}" title="Descargar" aria-label="Descargar QR en PDF de 9 por 9 centimetros">${icon("file-down", 17)}</button>
                   <button class="icon-btn" data-regenerate-qr="${table.id}" title="Regenerar" aria-label="Rehacer QR">${icon("refresh-cw", 17)}</button>
-                  <button class="icon-btn danger" data-delete-table="${table.id}" title="Eliminar" aria-label="Eliminar mesa">${icon("trash-2", 17)}</button>
+                  <button class="icon-btn danger" data-delete-table="${table.id}" data-boss-only title="Eliminar" aria-label="Eliminar mesa">${icon("trash-2", 17)}</button>
                 </div>
               </div>
             `
@@ -4179,7 +4208,7 @@ const App = (() => {
                   </div>
                   <div class="row-actions">
                     <button class="icon-btn" data-edit-category="${category.id}" aria-label="Editar categoria">${icon("pencil", 17)}</button>
-                    <button class="icon-btn danger" data-delete-category="${category.id}" aria-label="Eliminar categoria">${icon("trash-2", 17)}</button>
+                    <button class="icon-btn danger" data-delete-category="${category.id}" data-boss-only aria-label="Eliminar categoria">${icon("trash-2", 17)}</button>
                   </div>
                 </div>
               `
@@ -4213,7 +4242,7 @@ const App = (() => {
                   <strong class="product-price">${money(item.price)}</strong>
                   <div class="row-actions">
                     <button class="icon-btn" data-edit-item="${item.id}" aria-label="Editar producto">${icon("pencil", 17)}</button>
-                    <button class="icon-btn danger" data-delete-item="${item.id}" aria-label="Eliminar producto">${icon("trash-2", 17)}</button>
+                    <button class="icon-btn danger" data-delete-item="${item.id}" data-boss-only aria-label="Eliminar producto">${icon("trash-2", 17)}</button>
                   </div>
                 </div>
               `
@@ -4291,7 +4320,7 @@ const App = (() => {
               <div class="inventory-row-actions">
                 <button class="ghost small inventory-adjust-trigger" type="button" data-inventory-adjust="${escapeHTML(item.id)}">${icon("package-plus", 16)} Unidades</button>
                 <button class="icon-btn" type="button" data-edit-inventory="${escapeHTML(item.id)}" aria-label="Editar ${escapeHTML(item.name)}">${icon("pencil", 17)}</button>
-                <button class="icon-btn danger" type="button" data-delete-item="${escapeHTML(item.id)}" aria-label="Eliminar ${escapeHTML(item.name)}">${icon("trash-2", 17)}</button>
+                <button class="icon-btn danger" type="button" data-delete-item="${escapeHTML(item.id)}" data-boss-only aria-label="Eliminar ${escapeHTML(item.name)}">${icon("trash-2", 17)}</button>
               </div>
             </article>`;
         }).join("")
@@ -4514,7 +4543,7 @@ const App = (() => {
     const subtract = form.operation.value === "subtract";
     const next = subtract ? current - quantity : current + quantity;
     target.classList.toggle("is-invalid", next < 0);
-    target.innerHTML = `<span>Quedará en</span><strong>${Math.max(0, next).toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${escapeHTML(inventoryFor(item).unit)}${next === 1 ? "" : "s"}</strong>${next < 0 ? "<small>No puedes retirar más de lo disponible.</small>" : "<small>Este ajuste no se agrega a Movimientos.</small>"}`;
+    target.innerHTML = `<span>Quedará en</span><strong>${Math.max(0, next).toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${escapeHTML(inventoryFor(item).unit)}${next === 1 ? "" : "s"}</strong>${next < 0 ? "<small>No puedes retirar más de lo disponible.</small>" : "<small>El ajuste quedará identificado en Movimientos.</small>"}`;
   };
 
   const openInventoryAdjustment = (id) => {
@@ -4552,8 +4581,32 @@ const App = (() => {
       stock: nextStock,
       updatedAt: new Date().toISOString()
     };
+    const eventId = `units:${item.id}:${uid()}`;
+    const movementType = delta > 0 ? "ENTRADA_UNIDADES" : "SALIDA_UNIDADES";
+    const movementReference = "Botón + Unidades";
+    recordLocalInventoryMovement({
+      eventId,
+      item,
+      delta,
+      before: current.stock,
+      after: nextStock,
+      type: movementType,
+      reference: movementReference,
+      occurredAt: state.inventoryMeta[id].updatedAt
+    });
     persistInventoryStore();
-    enqueueAppsScriptJob("set_inventory_stock", { productId: item.id, stock: nextStock, updatedAt: state.inventoryMeta[id].updatedAt }, `inventory-stock:${item.id}`);
+    enqueueAppsScriptJob("adjust_inventory", {
+      adjustment: {
+        eventId,
+        productId: item.id,
+        code: current.code,
+        name: item.name || "Producto",
+        delta,
+        reference: movementReference,
+        movementType,
+        occurredAt: state.inventoryMeta[id].updatedAt
+      }
+    }, `inventory-adjust:${eventId}`);
     $("#inventoryAdjustDialog")?.close();
     renderInventory();
     toast(`Existencia de ${item.name} actualizada a ${nextStock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}.`, "ok", `stock-adjusted:${id}:${nextStock}`);
@@ -4766,7 +4819,7 @@ const App = (() => {
     state.adminAiRenderSignature = renderSignature;
     suggestions.innerHTML = ["¿Cuanto se vendio hoy?", "¿Que producto se vendio mas?", "¿Quien realizo las ventas?", "¿Que productos tienen stock bajo?"]
       .map((question) => `<button class="chip" type="button" data-admin-ai-question="${escapeHTML(question)}">${escapeHTML(question)}</button>`).join("");
-    const messages = state.adminAiMessages.length ? state.adminAiMessages : [{ role: "bot", text: "Puedo cruzar el informe de ingresos, el inventario y los movimientos visibles. Preguntame por productos, cantidades, responsables, ventas o existencias." }];
+    const messages = state.adminAiMessages.length ? state.adminAiMessages : [{ role: "bot", text: "Puedo cruzar el informe de ventas, el inventario y los movimientos visibles. Pregúntame por productos, cantidades, responsables, ventas o existencias." }];
     chat.innerHTML = messages.map((message) => `<div class="admin-ai-message ${message.role}">${message.role === "bot" ? icon("sparkles", 17) : ""}<p>${escapeHTML(message.text)}</p></div>`).join("");
     chat.scrollTop = chat.scrollHeight;
     refreshIcons();
@@ -4850,7 +4903,7 @@ const App = (() => {
       kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
       payments.innerHTML = "";
       recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
-      setIncomeReportStatus("Consultando ingresos", "loading", "loader-circle");
+      setIncomeReportStatus("Consultando ventas", "loading", "loader-circle");
       return;
     }
     const totals = report.totals || {};
@@ -4880,7 +4933,7 @@ const App = (() => {
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
             <div class="income-record-main">
-              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><div class="income-record-actions"><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div></div>
+              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small>${isBoss() ? `<div class="income-record-actions" data-boss-only><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div>` : ""}</div>
               <div><small>Mesa / responsable</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
               <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
               <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span class="income-record-profit">Ganancia ${money(record.profit)}</span></div>
@@ -4895,7 +4948,7 @@ const App = (() => {
             </details>
           </article>`;
         }).join("")
-      : appendOnly ? "" : emptyState("Sin ingresos en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
+      : appendOnly ? "" : emptyState("Sin ventas en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
     if (appendOnly) recordsTarget.insertAdjacentHTML("beforeend", recordsMarkup);
     else recordsTarget.innerHTML = recordsMarkup;
     const pendingText = report.pendingCount ? ` · ${report.pendingCount} pendiente${report.pendingCount === 1 ? "" : "s"} de respaldo` : "";
@@ -4914,7 +4967,7 @@ const App = (() => {
   };
 
   const loadIncomeReport = async () => {
-    if (!$("#income") || state.currentUser?.role !== "admin") return false;
+    if (!$("#income") || !canAccessAdminSection("income")) return false;
     clearTimeout(state.incomeSearchTimer);
     state.incomeSearchTimer = null;
     const filters = incomeFiltersFromForm();
@@ -4935,7 +4988,7 @@ const App = (() => {
       if (result?.stale) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (result.stale) throw new Error("El historial cambió mientras se calculaba. Actualiza el informe.");
-      if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para paginar ingresos.`);
+      if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para paginar ventas.`);
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       state.incomeReport = mergeIncomeReport(result, filters);
@@ -5012,12 +5065,12 @@ const App = (() => {
   };
 
   const resetSectionData = async (section) => {
-    if (state.currentUser?.role !== "admin") return;
+    if (!canDeleteRecords()) return;
     const settings = {
       inventory: {
         eyebrow: "Reiniciar inventario",
         title: "¿Eliminar todo el inventario?",
-        message: "Se eliminarán todos los productos y sus existencias. Ingresos y movimientos conservarán su información.",
+        message: "Se eliminarán todos los productos y sus existencias. Ventas y movimientos conservarán su información.",
         action: "clear_inventory",
         success: "Inventario eliminado. Ya puedes empezar desde cero."
       },
@@ -5029,11 +5082,11 @@ const App = (() => {
         success: "Movimientos eliminados. El historial quedó en cero."
       },
       income: {
-        eyebrow: "Reiniciar ingresos",
-        title: "¿Eliminar todos los ingresos?",
+        eyebrow: "Reiniciar ventas",
+        title: "¿Eliminar todas las ventas?",
         message: "Se borrarán todas las ventas, pagos y totales históricos. El inventario actual no cambiará.",
         action: "clear_income",
-        success: "Ingresos eliminados. Todos los valores quedaron en cero."
+        success: "Ventas eliminadas. Todos los valores quedaron en cero."
       }
     }[section];
     if (!settings) return;
@@ -5193,6 +5246,7 @@ const App = (() => {
   };
 
   const openIncomeEdit = (saleId) => {
+    if (!isBoss()) return;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     const form = $("#incomeEditForm");
     if (!record || !form) return;
@@ -5211,6 +5265,7 @@ const App = (() => {
   };
 
   const openDeleteIncomeDialog = (saleId) => {
+    if (!canDeleteRecords()) return;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     const form = $("#deleteIncomeForm");
     if (!record || !form) return;
@@ -5222,6 +5277,7 @@ const App = (() => {
   };
 
   const deleteIncomeSale = async (form) => {
+    if (!canDeleteRecords()) return;
     const saleId = form.sale_id.value;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     if (!record) return;
@@ -5284,6 +5340,7 @@ const App = (() => {
   };
 
   const saveIncomeEdit = async (form) => {
+    if (!isBoss()) return;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(form.sale_id.value));
     if (!record) return;
     const items = $$('[data-income-line]', form).map((row) => ({
@@ -5353,7 +5410,7 @@ const App = (() => {
   const exportIncomeCsv = () => {
     const records = state.incomeReport?.records || [];
     if (!records.length) {
-      toast("No hay ingresos para exportar con estos filtros.", "error", "empty-income-export");
+      toast("No hay ventas para exportar con estos filtros.", "error", "empty-income-export");
       return;
     }
     const safeCsv = (value) => {
@@ -5371,7 +5428,7 @@ const App = (() => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `ingresos-${state.incomeReport.filters?.dateFrom || "inicio"}-${state.incomeReport.filters?.dateTo || "hoy"}.csv`;
+    link.download = `ventas-${state.incomeReport.filters?.dateFrom || "inicio"}-${state.incomeReport.filters?.dateTo || "hoy"}.csv`;
     link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
@@ -5447,7 +5504,7 @@ const App = (() => {
               <div><strong>${escapeHTML(item.item_name)}</strong><span>${Number(item.quantity || 0)} × ${money(item.unit_price)}</span><small>${escapeHTML(item.created_by_user?.full_name || "Cliente")}${item.created_at ? ` · ${new Date(item.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : ""}${item.notes ? ` · ${escapeHTML(item.notes)}` : ""}</small></div>
               <strong>${money(Number(item.unit_price) * Number(item.quantity))}</strong>
               <button class="icon-btn" type="button" data-edit-consumption="${item.id}" data-session-id="${session.id}" aria-label="Editar consumo">${icon("pencil", 15)}</button>
-              <button class="icon-btn danger" type="button" data-delete-consumption="${item.id}" data-session-id="${session.id}" aria-label="Eliminar consumo">${icon("trash-2", 15)}</button>
+              <button class="icon-btn danger" type="button" data-delete-consumption="${item.id}" data-session-id="${session.id}" data-boss-only aria-label="Eliminar consumo">${icon("trash-2", 15)}</button>
             </div>`).join("") || `<div class="invoice-empty">${icon("clipboard-list", 18)} Sin consumos registrados</div>`}
         </div>
         ${suggestedTip ? `<div class="account-detail-tip"><span><small>Propina voluntaria (${state.tipSettings.percentage}%)</small><strong>${money(suggestedTip)}</strong></span><span><small>Total sugerido con propina</small><strong>${money(suggestedTotal)}</strong></span></div>` : ""}
@@ -6393,7 +6450,7 @@ const App = (() => {
     const total = $("#consumptionSelectionTotal");
     if (!box || !lines || !count || !total) return;
     const drafts = state.consumptionDrafts;
-    const canEditPrice = state.currentUser?.role !== "waiter";
+    const canEditPrice = true;
     box.hidden = drafts.length === 0;
     count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
     total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
@@ -6438,7 +6495,6 @@ const App = (() => {
   };
 
   const editConsumptionDraftPrice = (priceElement) => {
-    if (state.currentUser?.role === "waiter") return;
     const index = Number(priceElement?.dataset.editConsumptionPrice);
     const draft = state.consumptionDrafts[index];
     if (!Number.isInteger(index) || !draft) return;
@@ -6533,7 +6589,7 @@ const App = (() => {
 
   const applyConsumptionRoleRestrictions = (form) => {
     if (!form) return;
-    const waiter = state.currentUser?.role === "waiter";
+    const waiter = isWaiter();
     [form.item_name, form.unit_price].forEach((field) => {
       if (!field) return;
       field.readOnly = waiter;
@@ -6560,7 +6616,7 @@ const App = (() => {
     if (!preview || !actions) return;
     const items = session ? newestSessionItems(session) : [];
     const emptyAccount = Boolean(session) && !items.length && sessionTotal(session) <= 0;
-    actions.hidden = !session || isLocalWalkInSession(session);
+    actions.hidden = isWaiter() || !session || isLocalWalkInSession(session);
     const viewButton = $("#viewTableConsumption");
     const chargeButton = $("#chargeTableAccount");
     const releaseButton = $("#releaseEmptyTable");
@@ -6910,6 +6966,7 @@ const App = (() => {
   };
 
   const deleteConsumption = async (sessionId, itemId) => {
+    if (!canDeleteRecords()) return;
     const session = state.sessions.find((entry) => entry.id === sessionId);
     const item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
     if (!session || !item) return;
@@ -7348,6 +7405,7 @@ const App = (() => {
   };
 
   const deleteRow = async (table, id, label) => {
+    if (!canDeleteRecords()) return;
     const rowBeforeDelete = table === "restaurant_tables" ? state.tables.find((entry) => entry.id === id) : null;
     const quickServicePointDelete = Boolean(rowBeforeDelete && isServicePoint(rowBeforeDelete));
     if (table === "menu_items") {
@@ -7613,6 +7671,7 @@ const App = (() => {
       event.preventDefault();
       await saveUser(event.currentTarget);
     });
+    $("#userForm")?.role?.addEventListener("change", (event) => syncUserPermissionsForm(event.currentTarget.form));
     $("#adminChatDock")?.addEventListener("submit", async (event) => {
       const form = event.target.closest("[data-admin-chat-form]");
       if (!form) return;
@@ -7729,7 +7788,7 @@ const App = (() => {
         const section = navLink.getAttribute("href")?.replace("#", "") || "dashboard";
         history.replaceState(null, "", `#${section}`);
         showAdminSection(section);
-        if (section === "users" && state.currentUser?.role === "admin") {
+        if (section === "users" && isBoss()) {
           void loadUsers().then(renderUsers);
         }
         document.documentElement.scrollTop = 0;
@@ -7753,6 +7812,22 @@ const App = (() => {
 
       const target = event.target.closest("button");
       if (!target) return;
+      if (target.dataset.toggleUserPin !== undefined) {
+        const pin = target.closest("form")?.elements.pin;
+        if (pin) {
+          const visible = pin.type === "text";
+          pin.type = visible ? "password" : "text";
+          target.title = visible ? "Mostrar PIN" : "Ocultar PIN";
+          target.setAttribute("aria-label", target.title);
+          target.innerHTML = icon(visible ? "eye-off" : "eye", 18);
+          refreshIcons();
+        }
+        return;
+      }
+      if (target.dataset.shareUser) {
+        await shareUserCredentials(target.dataset.shareUser);
+        return;
+      }
       if (target.id === "enableSound") {
         if (state.soundEnabled) {
           if (await confirmDisableAlarm()) disableAlarm();
@@ -8275,11 +8350,12 @@ const App = (() => {
     document.body.dataset.userRole = state.currentUser?.role || "";
     const displayName = state.currentUser?.full_name || "Sin sesión";
     $("#currentUserName") && ($("#currentUserName").textContent = displayName);
-    $("#currentUserRole") && ($("#currentUserRole").textContent = state.currentUser?.role === "admin" ? "Administrador" : "Mesero");
+    $("#currentUserRole") && ($("#currentUserRole").textContent = roleLabel(state.currentUser?.role));
     $("#currentUserInitials") && ($("#currentUserInitials").textContent = state.currentUser
       ? displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part.charAt(0)).join("").toUpperCase()
       : "TN");
     document.body.classList.toggle("admin-authenticated", Boolean(state.currentUser));
+    syncAdminSectionAccess();
   };
 
   const ADMIN_USER_CACHE_KEY = "la_licorera_17_admin_user_v1";
@@ -8298,6 +8374,7 @@ const App = (() => {
           state.currentUser = data;
           localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(data));
           applyCurrentUser();
+          if (isBoss()) void loadUsers().then(renderUsers);
           return;
         }
         if (error && /sesion vencida|autenticacion requerida|usuario inactivo/i.test(String(error.message || ""))) {
@@ -8355,7 +8432,8 @@ const App = (() => {
   };
 
   const sortUsers = (users) => [...users].sort((left, right) => {
-    const roleOrder = (left.role === "admin" ? 0 : 1) - (right.role === "admin" ? 0 : 1);
+    const order = { boss: 0, admin: 1, waiter: 2 };
+    const roleOrder = (order[left.role] ?? 3) - (order[right.role] ?? 3);
     return roleOrder || String(left.full_name || "").localeCompare(String(right.full_name || ""), "es");
   });
 
@@ -8371,10 +8449,75 @@ const App = (() => {
     } catch (error) { /* La lista remota sigue siendo la fuente principal. */ }
   };
 
+  const persistUserCredentialPins = () => {
+    try {
+      localStorage.setItem(USER_CREDENTIALS_CACHE_KEY, JSON.stringify(state.userCredentialPins));
+    } catch (error) { /* La credencial puede copiarse durante esta sesión. */ }
+  };
+
+  const syncUserPermissionsForm = (form = $("#userForm"), permissions = null) => {
+    if (!form) return;
+    const isAdministrator = form.role.value === "admin";
+    const fieldset = $("#userPermissions");
+    if (fieldset) fieldset.hidden = !isAdministrator;
+    const selected = new Set(Array.isArray(permissions) && permissions.length ? permissions : ADMIN_SECTION_KEYS);
+    $$("input[name='permissions']", form).forEach((input) => {
+      input.checked = selected.has(input.value);
+      input.disabled = !isAdministrator;
+    });
+  };
+
+  const copyTextToClipboard = async (text) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const field = document.createElement("textarea");
+    field.value = text;
+    field.setAttribute("readonly", "");
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.appendChild(field);
+    field.select();
+    document.execCommand("copy");
+    field.remove();
+  };
+
+  const shareUserCredentials = async (id) => {
+    if (!isBoss()) return;
+    const user = state.users.find((entry) => String(entry.id) === String(id));
+    if (!user) return;
+    const pin = String(state.userCredentialPins[user.id] || "");
+    if (!pin) {
+      editUser(user.id);
+      toast("Por seguridad el PIN anterior no se puede recuperar. Escribe uno nuevo, guarda y luego copia el acceso.", "error", `missing-user-pin:${user.id}`);
+      return;
+    }
+    const accessUrl = new URL("admin.html", location.href);
+    accessUrl.search = "";
+    accessUrl.hash = "";
+    const message = [
+      "✨ Tu acceso a Tienda Nápoles",
+      "",
+      `Hola ${user.full_name}, estas son tus credenciales:`,
+      `🔗 Enlace: ${accessUrl.href}`,
+      `👤 Usuario: ${user.username}`,
+      `🔐 PIN: ${pin}`,
+      "",
+      "Guarda este mensaje en un lugar seguro."
+    ].join("\n");
+    try {
+      await copyTextToClipboard(message);
+      toast(`Acceso de ${user.full_name} copiado para compartir.`, "ok", `credentials-copied:${user.id}`);
+    } catch (error) {
+      toast("No fue posible copiar las credenciales en este dispositivo.", "error", `credentials-copy-failed:${user.id}`);
+    }
+  };
+
   const loadUsers = async () => {
     const cachedUsers = readLocalJson(USER_LIST_CACHE_KEY, []);
     const fallbackUsers = mergeUsers(Array.isArray(cachedUsers) ? cachedUsers : [], state.users, state.currentUser ? [state.currentUser] : []);
-    if (state.currentUser?.role !== "admin") {
+    if (!isBoss()) {
       state.users = mergeUsers(state.currentUser ? [state.currentUser] : []);
       return;
     }
@@ -8397,7 +8540,7 @@ const App = (() => {
   const renderUsers = () => {
     const list = $("#usersList");
     if (!list) return;
-    const renderSignature = JSON.stringify(state.users.map((user) => [user.id, user.full_name, user.username, user.role, user.is_active]));
+    const renderSignature = JSON.stringify(state.users.map((user) => [user.id, user.full_name, user.username, user.role, user.is_active, user.permissions, Boolean(state.userCredentialPins[user.id])]));
     if (renderSignature === state.usersRenderSignature) return;
     state.usersRenderSignature = renderSignature;
     const badge = $("#usersCountBadge");
@@ -8405,18 +8548,18 @@ const App = (() => {
     list.innerHTML = state.users.length
       ? state.users.map((user) => `
           <article class="user-card ${user.is_active === false ? "is-disabled" : ""}">
-            <div class="user-avatar">${icon(user.role === "admin" ? "shield-check" : "user-round", 20)}</div>
+            <div class="user-avatar">${icon(user.role === "boss" ? "crown" : user.role === "admin" ? "shield-check" : "user-round", 20)}</div>
             <div class="user-card-copy">
               <div class="user-card-name"><strong>${escapeHTML(user.full_name)}</strong>${String(user.id) === String(state.currentUser?.id) ? '<span class="current-user-badge">Sesión actual</span>' : ""}</div>
               <span>@${escapeHTML(user.username)}</span>
-              <div class="user-card-badges"><em>${user.role === "admin" ? "Administrador" : "Mesero"}</em><em class="${user.is_active === false ? "is-off" : "is-on"}">${user.is_active === false ? "Sin acceso" : "Acceso activo"}</em></div>
+              <div class="user-card-badges"><em>${roleLabel(user.role)}</em><em class="${user.is_active === false ? "is-off" : "is-on"}">${user.is_active === false ? "Sin acceso" : "Acceso activo"}</em>${user.role === "admin" ? `<em>${normalizedUserPermissions(user).length} secciones</em>` : ""}</div>
             </div>
             <label class="user-access-switch" title="${user.is_active === false ? "Dar acceso" : "Quitar acceso"}">
               <span>Acceso</span>
               <input type="checkbox" data-user-access="${user.id}" ${user.is_active === false ? "" : "checked"} aria-label="${user.is_active === false ? "Dar acceso" : "Quitar acceso"} a ${escapeHTML(user.full_name)}">
               <span class="user-access-track" aria-hidden="true"></span>
             </label>
-            <div class="row-actions user-row-actions"><button class="icon-btn" data-edit-user="${user.id}" title="Editar" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" title="Eliminar" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
+            <div class="row-actions user-row-actions"><button class="icon-btn user-share-access" data-share-user="${user.id}" title="Copiar enlace y credenciales" aria-label="Copiar acceso de ${escapeHTML(user.full_name)}">${icon("copy", 16)} <span>Copiar acceso</span></button><button class="icon-btn" data-edit-user="${user.id}" title="Editar" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" data-boss-only title="Eliminar" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
           </article>`).join("")
       : emptyState("Sin usuarios", "Crea el equipo operativo.", "users");
     refreshIcons();
@@ -8428,9 +8571,19 @@ const App = (() => {
     if ($("#userFormTitle")) $("#userFormTitle").textContent = "Agregar integrante";
     const label = form.querySelector('.user-save-button span');
     if (label) label.textContent = "Guardar usuario";
+    if (form.pin) form.pin.type = "password";
+    const pinToggle = form.querySelector("[data-toggle-user-pin]");
+    if (pinToggle) {
+      pinToggle.title = "Mostrar PIN";
+      pinToggle.setAttribute("aria-label", "Mostrar PIN");
+      pinToggle.innerHTML = icon("eye-off", 18);
+    }
+    refreshIcons();
+    syncUserPermissionsForm(form, ADMIN_SECTION_KEYS);
   };
 
   const toggleUserAccess = async (id, nextActive, control) => {
+    if (!isBoss()) return;
     const user = state.users.find((entry) => String(entry.id) === String(id));
     if (!user || (user.is_active !== false) === nextActive) return;
     if (String(user.id) === String(state.currentUser?.id) && !nextActive) {
@@ -8449,7 +8602,8 @@ const App = (() => {
         username: user.username,
         pin: "",
         role: user.role,
-        is_active: nextActive
+        is_active: nextActive,
+        permissions: normalizedUserPermissions(user)
       });
       saved = result.data;
       saveError = result.error;
@@ -8471,6 +8625,7 @@ const App = (() => {
   };
 
   const saveUser = async (form) => {
+    if (!isBoss()) return;
     const isEditing = Boolean(form.user_id.value);
     const fullName = form.full_name.value.trim();
     const username = form.username.value.trim().toLowerCase();
@@ -8479,14 +8634,23 @@ const App = (() => {
       toast("Revisa el usuario y usa un PIN numerico de 4 a 12 digitos.", "error", "invalid-user-fields");
       return;
     }
+    const role = form.role.value;
+    const permissions = role === "admin"
+      ? $$("input[name='permissions']:checked", form).map((input) => input.value).filter((section) => ADMIN_SECTION_KEYS.includes(section))
+      : [];
+    if (role === "admin" && !permissions.length) {
+      toast("Selecciona al menos una sección para el Administrador.", "error", "admin-without-sections");
+      return;
+    }
     const payload = {
       auth_token: state.authToken,
       id: form.user_id.value || uid(),
       full_name: fullName,
       username,
       pin,
-      role: form.role.value,
-      is_active: form.is_active.checked
+      role,
+      is_active: form.is_active.checked,
+      permissions
     };
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
@@ -8506,11 +8670,16 @@ const App = (() => {
       return;
     }
     state.users = mergeUsers(state.users.map((user) => String(user.id) === String(saved.id) ? saved : user), [saved]);
+    if (pin) {
+      state.userCredentialPins[saved.id] = pin;
+      persistUserCredentialPins();
+    }
     persistUsersCache();
     if (String(saved.id) === String(state.currentUser?.id)) {
       state.currentUser = saved;
       localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(saved));
       applyCurrentUser();
+      showAdminSection(canAccessAdminSection(state.activeAdminSection) ? state.activeAdminSection : firstAllowedAdminSection());
     }
     form.reset();
     form.user_id.value = "";
@@ -8522,16 +8691,26 @@ const App = (() => {
   };
 
   const editUser = (id) => {
+    if (!isBoss()) return;
     const user = state.users.find((entry) => entry.id === id);
     const form = $("#userForm");
     if (!user || !form) return;
     form.user_id.value = user.id;
     form.full_name.value = user.full_name || "";
     form.username.value = user.username || "";
-    form.pin.value = "";
-    form.pin.placeholder = "Dejar vacío para conservar";
+    form.pin.value = state.userCredentialPins[user.id] || "";
+    form.pin.type = "password";
+    form.pin.placeholder = form.pin.value ? "PIN actual guardado en este equipo" : "Dejar vacío para conservar";
+    const pinToggle = form.querySelector("[data-toggle-user-pin]");
+    if (pinToggle) {
+      pinToggle.title = "Mostrar PIN";
+      pinToggle.setAttribute("aria-label", "Mostrar PIN");
+      pinToggle.innerHTML = icon("eye-off", 18);
+    }
+    refreshIcons();
     form.role.value = user.role || "waiter";
     form.is_active.checked = user.is_active !== false;
+    syncUserPermissionsForm(form, user.permissions);
     if ($("#userFormEyebrow")) $("#userFormEyebrow").textContent = "Editar acceso";
     if ($("#userFormTitle")) $("#userFormTitle").textContent = user.full_name || "Usuario";
     const submitLabel = form.querySelector('.user-save-button span');
@@ -8540,6 +8719,7 @@ const App = (() => {
   };
 
   const deleteUser = async (id) => {
+    if (!canDeleteRecords()) return;
     const user = state.users.find((entry) => entry.id === id);
     if (!user) return;
     if (String(user.id) === String(state.currentUser?.id)) {
@@ -8561,6 +8741,8 @@ const App = (() => {
       return;
     }
     state.users = state.users.filter((entry) => entry.id !== id);
+    delete state.userCredentialPins[id];
+    persistUserCredentialPins();
     persistUsersCache();
     renderUsers();
     const form = $("#userForm");
@@ -8611,7 +8793,10 @@ const App = (() => {
     showAdminSection(currentSection);
     renderTableFormQr();
     initRemoteStorage();
-    window.addEventListener("online", flushAppsScriptOutbox);
+    window.setTimeout(() => {
+      if (canAccessAdminSection("income") && !state.incomeLoading && !state.incomeReport) void loadIncomeReport();
+    }, 400);
+    window.addEventListener("online", () => { if (!isWaiter()) void flushAppsScriptOutbox(); });
     startAdminPolling();
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
