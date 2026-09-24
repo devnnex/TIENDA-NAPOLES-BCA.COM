@@ -4052,7 +4052,7 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
   border-top: 1px solid rgba(255, 255, 255, .1);
 }
 
-#consumptionDialog { width: min(calc(100vw - 1.5rem), 1020px); max-width: none; }
+#consumptionDialog { width: min(calc(100vw - 1.5rem), 1020px); max-width: none; overflow: hidden; }
 #consumptionDialog .modal-card {
   width: 100%;
   max-width: none;
@@ -4061,7 +4061,7 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
 }
 #consumptionDialog .product-combobox-options { max-height: min(330px, 36dvh); }
 #consumptionDialog .consumption-selection-lines {
@@ -4088,9 +4088,16 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 .table-consumption-preview-head,
 .table-consumption-preview-lines > div { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .table-consumption-preview-head { padding-bottom: .5rem; border-bottom: 1px dashed rgba(18, 24, 31, .16); }
+.table-consumption-preview-title { display: inline-flex; align-items: baseline; gap: .45rem; min-width: 0; }
+.table-consumption-preview-title > small { color: #7a8492; font-size: .68rem; font-weight: 750; white-space: nowrap; }
 .table-consumption-preview-lines { display: grid; gap: .42rem; }
 .table-consumption-preview-lines > div { color: #4f5967; font-size: .79rem; }
+.table-consumption-item { min-width: 0; display: grid; gap: .1rem; }
+.table-consumption-item > span { overflow-wrap: anywhere; }
+.table-consumption-item time { color: #7a8492; font-size: .66rem; font-weight: 650; }
 .table-consumption-preview-lines strong { color: #17191f; white-space: nowrap; }
+.consumption-last-added { display: block; margin-top: .28rem; color: #6b7280; font-size: .72rem; font-weight: 700; }
+.consumption-last-added[hidden] { display: none; }
 
 .consumption-selection { display: grid; gap: .55rem; padding: .8rem; border: 1px solid rgba(47, 209, 124, .28); border-radius: 15px; background: #f0fbf5; }
 .consumption-selection-head,

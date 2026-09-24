@@ -6643,11 +6643,41 @@ const App = (() => {
     refreshIcons();
   };
 
+  const formatConsumptionTimestamp = (value) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const dateParts = new Intl.DateTimeFormat("es-CO", {
+      timeZone: "America/Bogota",
+      day: "numeric",
+      month: "short",
+      year: "numeric"
+    }).formatToParts(date).reduce((parts, part) => ({ ...parts, [part.type]: part.value }), {});
+    const dateText = `${dateParts.day} ${String(dateParts.month || "").replace(/\./g, "")} ${dateParts.year}`;
+    const timeText = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Bogota",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true
+    }).format(date).toLowerCase();
+    return `${dateText} · ${timeText}`;
+  };
+
+  const renderLastConsumptionTime = (session) => {
+    const target = $("#consumptionLastAdded");
+    if (!target) return;
+    const latest = newestSessionItems(session).find((item) => formatConsumptionTimestamp(item.created_at));
+    const timestamp = latest?.created_at || "";
+    const formatted = formatConsumptionTimestamp(timestamp);
+    target.hidden = !formatted;
+    target.textContent = formatted ? `Último consumo agregado: ${formatted}` : "";
+  };
+
   const renderTableConsumptionPreview = (session) => {
     const preview = $("#tableConsumptionPreview");
     const actions = $("#tableSessionActions");
     if (!preview || !actions) return;
     const items = session ? newestSessionItems(session) : [];
+    const productCount = items.reduce((total, item) => total + Number(item.quantity || 0), 0);
     const emptyAccount = Boolean(session) && !items.length && sessionTotal(session) <= 0;
     actions.hidden = isWaiter() || !session || isLocalWalkInSession(session);
     const viewButton = $("#viewTableConsumption");
@@ -6662,7 +6692,7 @@ const App = (() => {
       preview.innerHTML = "";
       return;
     }
-    preview.innerHTML = `<div class="table-consumption-preview-head"><span>Consumo actual</span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => `<div><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
     setTableConsumptionPreviewVisible(false);
   };
 
@@ -6934,6 +6964,7 @@ const App = (() => {
     if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = false;
     renderConsumptionSelection();
     renderTableConsumptionPreview(session);
+    renderLastConsumptionTime(session);
     closeConsumptionProductOptions();
     dialog.showModal();
     window.setTimeout(() => {
