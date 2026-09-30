@@ -4005,6 +4005,8 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 }
 
 .purchase-history-head { align-items: flex-start; }
+.purchase-history-head-actions { display: flex; align-items: center; gap: .45rem; flex: 0 0 auto; }
+.purchase-history-head-actions .ghost { min-height: 42px; white-space: nowrap; }
 .purchase-history-head h2,
 .purchase-history-head p { margin: 0; }
 .purchase-history-head p { max-width: 680px; margin-top: .3rem; color: #667085; line-height: 1.45; }

@@ -93,6 +93,7 @@ const App = (() => {
   const INVENTORY_STORAGE_KEY = "tienda_napoles_inventory_v1";
   const INVOICE_STORAGE_KEY = "tienda_napoles_invoices_v1";
   const INVENTORY_MOVEMENTS_STORAGE_KEY = "tienda_napoles_inventory_movements_v1";
+  const PURCHASE_HISTORY_CUTOFF_KEY = "tienda_napoles_purchase_history_cutoff_v1";
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
@@ -4364,10 +4365,24 @@ const App = (() => {
     return item ? inventoryFor(item).costPrice : 0;
   };
 
+  const purchaseHistoryCutoff = () => {
+    try {
+      return Date.parse(localStorage.getItem(PURCHASE_HISTORY_CUTOFF_KEY) || "");
+    } catch {
+      return Number.NaN;
+    }
+  };
+
   const purchaseMovements = () => {
     const query = normalizeText(state.purchaseSearch);
+    const cutoff = purchaseHistoryCutoff();
     return state.inventoryMovements
       .filter(isPurchaseMovement)
+      .filter((movement) => {
+        if (!Number.isFinite(cutoff)) return true;
+        const movementTime = Date.parse(movement.date || "");
+        return Number.isFinite(movementTime) && movementTime > cutoff;
+      })
       .filter((movement) => state.purchaseProductFilter === "all" || String(movement.productId) === state.purchaseProductFilter)
       .filter((movement) => {
         const movementDate = new Date(movement.date);
@@ -8241,6 +8256,32 @@ const App = (() => {
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "openPurchases") await openPurchaseHistory();
       if (target.dataset.savePurchaseCost) savePurchaseUnitCost(target);
+      if (target.id === "clearPurchaseHistory") {
+        if (!await askForConfirmation({
+          eyebrow: "Limpiar historial de compras",
+          title: "¿Eliminar todas las compras de esta lista?",
+          message: "Se ocultarán de este modal las compras registradas hasta ahora. El inventario y los movimientos no cambiarán. Las próximas unidades agregadas aparecerán aquí.",
+          accept: "Sí, limpiar lista",
+          cancel: "Conservar lista"
+        })) return;
+        try {
+          localStorage.setItem(PURCHASE_HISTORY_CUTOFF_KEY, new Date().toISOString());
+        } catch {
+          toast("No se pudo limpiar la lista de compras en este dispositivo.", "error");
+          return;
+        }
+        state.purchaseSearch = "";
+        state.purchaseProductFilter = "all";
+        state.purchaseDateFrom = "";
+        state.purchaseDateTo = "";
+        if ($("#purchaseSearch")) $("#purchaseSearch").value = "";
+        if ($("#purchaseProductFilter")) $("#purchaseProductFilter").value = "all";
+        if ($("#purchaseDateFrom")) $("#purchaseDateFrom").value = "";
+        if ($("#purchaseDateTo")) $("#purchaseDateTo").value = "";
+        renderPurchaseProductOptions();
+        renderPurchaseHistory();
+        toast("Lista de compras limpia. El inventario no cambió.");
+      }
       if (target.id === "clearPurchaseFilters") {
         state.purchaseSearch = "";
         state.purchaseProductFilter = "all";
