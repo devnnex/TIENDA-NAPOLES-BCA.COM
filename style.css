@@ -4072,6 +4072,8 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 .purchase-cost-editor label { display: grid; flex: 1 1 170px; gap: .25rem; color: #526174; font-size: .72rem; font-weight: 800; }
 .purchase-cost-editor input { min-width: 0; min-height: 38px; padding: .48rem .62rem; }
 .purchase-cost-editor button { flex: 0 0 auto; min-height: 38px; }
+.purchase-record-actions { display: flex; align-items: center; justify-content: flex-end; gap: .35rem; }
+.purchase-record-remove { width: 36px; height: 36px; flex: 0 0 auto; }
 .purchase-record-total { color: #123f7c; font-size: 1.05rem; white-space: nowrap; text-align: right; }
 
 @media (max-width: 900px) {
@@ -4095,7 +4097,8 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
   .purchase-cost-editor { align-items: stretch; flex-direction: column; }
   .purchase-cost-editor label { flex-basis: auto; }
   .purchase-cost-editor button { width: 100%; }
-  .purchase-record-total { grid-column: 1 / -1; padding-top: .55rem; border-top: 1px dashed rgba(18, 24, 31, .12); text-align: left; }
+  .purchase-record-actions { grid-column: 1 / -1; justify-content: space-between; padding-top: .55rem; border-top: 1px dashed rgba(18, 24, 31, .12); }
+  .purchase-record-total { text-align: left; }
 }
 
 .income-kpi { position: relative; padding-right: 2.8rem; }

@@ -94,6 +94,7 @@ const App = (() => {
   const INVOICE_STORAGE_KEY = "tienda_napoles_invoices_v1";
   const INVENTORY_MOVEMENTS_STORAGE_KEY = "tienda_napoles_inventory_movements_v1";
   const PURCHASE_HISTORY_CUTOFF_KEY = "tienda_napoles_purchase_history_cutoff_v1";
+  const HIDDEN_PURCHASE_MOVEMENTS_KEY = "tienda_napoles_hidden_purchase_movements_v1";
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
@@ -4373,11 +4374,22 @@ const App = (() => {
     }
   };
 
+  const hiddenPurchaseMovementIds = () => {
+    try {
+      const ids = JSON.parse(localStorage.getItem(HIDDEN_PURCHASE_MOVEMENTS_KEY) || "[]");
+      return new Set(Array.isArray(ids) ? ids.map(String) : []);
+    } catch {
+      return new Set();
+    }
+  };
+
   const purchaseMovements = () => {
     const query = normalizeText(state.purchaseSearch);
     const cutoff = purchaseHistoryCutoff();
+    const hiddenIds = hiddenPurchaseMovementIds();
     return state.inventoryMovements
       .filter(isPurchaseMovement)
+      .filter((movement) => !hiddenIds.has(String(movement.movementId || "")))
       .filter((movement) => {
         if (!Number.isFinite(cutoff)) return true;
         const movementTime = Date.parse(movement.date || "");
@@ -4466,9 +4478,11 @@ const App = (() => {
           const unitCost = purchaseUnitCost(movement);
           const total = quantity * unitCost;
           const exactCost = Number.isFinite(Number(movement.unitCost));
+          const movementId = String(movement.movementId || "");
+          const productName = movement.product || "Producto";
           return `<article class="purchase-record" data-purchase-record="${escapeHTML(String(movement.movementId || ""))}">
             <span class="purchase-record-icon">${icon("shopping-basket", 20)}</span>
-            <div class="purchase-record-main"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "Sin siglas")} &middot; ${escapeHTML(formatIncomeDate(movement.date))}</small></div>
+            <div class="purchase-record-main"><strong>${escapeHTML(productName)}</strong><small>${escapeHTML(movement.code || "Sin siglas")} &middot; ${escapeHTML(formatIncomeDate(movement.date))}</small></div>
             <div class="purchase-record-calculation">
               <span>Agregaste <strong>${quantity.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong> ${quantity === 1 ? "unidad" : "unidades"}</span>
               <small>${exactCost ? "Costo unitario registrado" : "Calculado con el costo actual"}${movement.user ? ` &middot; ${escapeHTML(movement.user)}` : ""}</small>
@@ -4477,7 +4491,7 @@ const App = (() => {
                 <button class="primary small" type="button" data-save-purchase-cost="${escapeHTML(String(movement.movementId || ""))}">${icon("save", 15)} Guardar</button>
               </div>
             </div>
-            <strong class="purchase-record-total" data-purchase-total>${money(total)}</strong>
+            <div class="purchase-record-actions"><strong class="purchase-record-total" data-purchase-total>${money(total)}</strong>${movementId ? `<button class="icon-btn danger-text purchase-record-remove" type="button" data-hide-purchase="${escapeHTML(movementId)}" aria-label="Quitar compra de ${escapeHTML(productName)} de la lista" title="Quitar de la lista">${icon("trash-2", 16)}</button>` : ""}</div>
           </article>`;
         }).join("")
       : emptyState(invalidRange ? "Revisa las fechas" : "Sin compras", invalidRange ? "Corrige el rango para consultar el historial." : "No hay entradas de unidades que coincidan con estos filtros.", invalidRange ? "calendar-x" : "shopping-cart");
@@ -8256,6 +8270,27 @@ const App = (() => {
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "openPurchases") await openPurchaseHistory();
       if (target.dataset.savePurchaseCost) savePurchaseUnitCost(target);
+      if (target.dataset.hidePurchase) {
+        const movementId = String(target.dataset.hidePurchase);
+        const movement = state.inventoryMovements.find((entry) => String(entry.movementId) === movementId);
+        if (!movement || !await askForConfirmation({
+          eyebrow: "Quitar compra de la lista",
+          title: "¿Quitar este registro de compras?",
+          message: "El registro solo se ocultará en este modal y en este dispositivo. El inventario, las existencias y el movimiento original no cambiarán.",
+          accept: "Sí, quitar de la lista",
+          cancel: "Conservar registro"
+        })) return;
+        try {
+          const hiddenIds = hiddenPurchaseMovementIds();
+          hiddenIds.add(movementId);
+          localStorage.setItem(HIDDEN_PURCHASE_MOVEMENTS_KEY, JSON.stringify([...hiddenIds]));
+        } catch {
+          toast("No se pudo quitar el registro de compras en este dispositivo.", "error");
+          return;
+        }
+        renderPurchaseHistory();
+        toast("Registro quitado de la lista. El inventario no cambió.");
+      }
       if (target.id === "clearPurchaseHistory") {
         if (!await askForConfirmation({
           eyebrow: "Limpiar historial de compras",
