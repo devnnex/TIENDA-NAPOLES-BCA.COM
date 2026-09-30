@@ -10,26 +10,9 @@ const SUPABASE_CONFIG = {
 // necesita solo el origen del proyecto y construye internamente /rest/v1.
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbzUCN4NextZRZev6ckp9JqeyRhBUO_M2qgS9v_2HxyFH6KELTUL0IW8z2ay-N0QgirXjA/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbz0kMO6luyS5kt4LJz9qhFHpCaKNqC3ho_1ngHVYqQLj4kObkcWEkdmvF3Ya9JHWy_F/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.10.0";
 const APPS_SCRIPT_TIMEOUT_MS = 45000;
-
-const isAppsScriptVersionCompatible = (version) => {
-  const current = String(version || "").trim();
-  if (!current) return true;
-  const parse = (value) => value.split(".").map((part) => Number(part));
-  const installed = parse(current);
-  const required = parse(APPS_SCRIPT_REQUIRED_VERSION);
-  if (installed.some((part) => !Number.isFinite(part)) || required.some((part) => !Number.isFinite(part))) {
-    return current === APPS_SCRIPT_REQUIRED_VERSION;
-  }
-  for (let index = 0; index < Math.max(installed.length, required.length); index += 1) {
-    const difference = Number(installed[index] || 0) - Number(required[index] || 0);
-    if (difference !== 0) return difference > 0;
-  }
-  return true;
-};
 
 const transientAppsScriptError = (message) => {
   const error = new Error(message);
@@ -309,6 +292,11 @@ const App = (() => {
     invoiceHistory: [],
     inventorySearch: "",
     inventoryStatusFilter: "all",
+    inventoryCategoryFilter: "all",
+    purchaseSearch: "",
+    purchaseProductFilter: "all",
+    purchaseDateFrom: "",
+    purchaseDateTo: "",
     incomeReport: null,
     incomeRevision: "",
     incomeLoading: false,
@@ -358,6 +346,7 @@ const App = (() => {
     adminSyncBusy: false,
     backgroundReportSyncBusy: false,
     backgroundReportCheckedAt: 0,
+    appsScriptInventoryRevision: "",
     activeAdminSection: "dashboard",
     adminSectionSwitchToken: 0,
     adminSectionSwitchFrame: 0,
@@ -545,8 +534,11 @@ const App = (() => {
       business_name: "Tu restaurante",
       subtitle: "Servicio a la mesa rapido y claro",
       accent_color: "#f05a28",
-      currency: DEFAULT_CURRENCY
+      currency: DEFAULT_CURRENCY,
+      tips_enabled: false,
+      tip_percentage: 10
     };
+    applyBusinessTipSettings();
     document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
   };
 
@@ -756,7 +748,10 @@ const App = (() => {
           renderTableFormQr();
         }
         if (section === "brand") renderBusinessForm();
-        if (section === "inventory") renderInventory();
+        if (section === "inventory") {
+          renderInventory();
+          void syncInventoryWithAppsScript();
+        }
         if (section === "movements") {
           renderInventoryMovements();
           if (!state.movementLoaded && !state.movementLoading) void loadInventoryMovements();
@@ -943,7 +938,9 @@ const App = (() => {
         business_name: "Tu restaurante",
         subtitle: "Servicio a la mesa rapido y claro",
         accent_color: "#f05a28",
-        currency: DEFAULT_CURRENCY
+        currency: DEFAULT_CURRENCY,
+        tips_enabled: false,
+        tip_percentage: 10
       };
       state.tables = data.tables || [];
       state.categories = data.categories || [];
@@ -1692,6 +1689,17 @@ const App = (() => {
     }
   };
 
+  function applyBusinessTipSettings() {
+    if (!state.business || !Object.prototype.hasOwnProperty.call(state.business, "tips_enabled")) return false;
+    const percentage = Math.min(100, Math.max(1, Number(state.business.tip_percentage || 10)));
+    state.tipSettings = {
+      enabled: state.business.tips_enabled === true,
+      percentage: Number.isFinite(percentage) ? percentage : 10
+    };
+    try { localStorage.setItem(TIP_SETTINGS_STORAGE_KEY, JSON.stringify(state.tipSettings)); } catch (error) { /* Respaldo local opcional. */ }
+    return true;
+  }
+
   const productAcronym = (name = "") => normalizeText(name)
     .split(" ")
     .filter(Boolean)
@@ -1711,6 +1719,7 @@ const App = (() => {
     const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
     const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
     state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
+    applyBusinessTipSettings();
     state.tipSplitPeople = Math.min(100, Math.max(1, Number(localStorage.getItem(TIP_SPLIT_STORAGE_KEY) || 1)));
     if (state.page === "admin") loadWalkInDrafts();
   };
@@ -1778,7 +1787,7 @@ const App = (() => {
     } catch (error) { /* Historial remoto y memoria siguen disponibles. */ }
   };
 
-  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "" }) => {
+  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost }) => {
     const numericDelta = Number(delta || 0);
     const isNewProduct = String(type || "").toUpperCase() === "NUEVO_PRODUCTO";
     if (!item || !Number.isFinite(numericDelta) || (!numericDelta && !isNewProduct) || state.inventoryMovements.some((movement) => movement.movementId === eventId)) return null;
@@ -1791,6 +1800,7 @@ const App = (() => {
       delta: numericDelta,
       before: Number(before || 0),
       after: Number(after || 0),
+      unitCost: Number.isFinite(Number(unitCost)) ? Math.max(0, Number(unitCost)) : inventoryFor(item).costPrice,
       reference,
       date: occurredAt,
       user: user || state.currentUser?.full_name || state.currentUser?.username || "Sistema"
@@ -1906,7 +1916,7 @@ const App = (() => {
       try { result = JSON.parse(text); } catch (error) {
         throw transientAppsScriptError("La respuesta del respaldo remoto todavía se está confirmando.");
       }
-      if (result?.ok && ["upsert_inventory", "adjust_inventory", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
+      if (result?.ok && ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
         window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
       }
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
@@ -1998,7 +2008,7 @@ const App = (() => {
       createdAt: new Date().toISOString()
     };
     const existingIndex = jobs.findIndex((entry) => entry.dedupeKey === dedupeKey);
-    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock"].includes(action)) jobs[existingIndex] = job;
+    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock", "update_inventory_movement_cost"].includes(action)) jobs[existingIndex] = job;
     else if (existingIndex < 0) jobs.push(job);
     writeAppsScriptOutbox(jobs);
     window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
@@ -2047,7 +2057,7 @@ const App = (() => {
             writeAppsScriptOutbox(jobs);
             toast(
               legacyInventoryService
-                ? `El inventario se conciliara al cerrar la mesa. Publica la actualizacion ${APPS_SCRIPT_REQUIRED_VERSION} para sincronizar cada consumo de inmediato.`
+                ? "El servicio remoto no acepta movimientos individuales; el inventario se conciliara al cerrar la mesa."
                 : (result.error || "No se pudo aplicar un movimiento de inventario."),
               "error",
               legacyInventoryService ? "inventory-service-update-required" : `inventory-job-rejected:${job.id}`
@@ -2104,9 +2114,6 @@ const App = (() => {
           setIncomeRange(state.incomeRangePreset, false);
           if (state.activeAdminSection === "income") void loadIncomeReport();
         }
-      }
-      if (!isAppsScriptVersionCompatible(result.version)) {
-        toast(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para activar movimientos, correcciones y reinicios completos.`, "error", "appscript-version-required");
       }
       setInventorySyncStatus("Respaldo remoto listo", "synced", "cloud-check");
       await syncInventoryWithAppsScript();
@@ -4170,8 +4177,13 @@ const App = (() => {
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
       const excludedInventoryCategories = new Set(["entrada", "entradas", "plato fuerte", "platos fuertes", "postre", "postres"]);
-      const categories = select.closest("#inventoryForm")
-        ? state.categories.filter((category) => !excludedInventoryCategories.has(normalizeText(category.name)))
+      const inventoryForm = select.closest("#inventoryForm");
+      const editingItem = inventoryForm?.product_id?.value
+        ? state.items.find((item) => String(item.id) === String(inventoryForm.product_id.value))
+        : null;
+      const categories = inventoryForm
+        ? state.categories.filter((category) => !excludedInventoryCategories.has(normalizeText(category.name))
+          || String(category.id) === String(editingItem?.category_id || ""))
         : state.categories;
       select.innerHTML = `
         <option value="">Elegir categoria</option>
@@ -4267,6 +4279,24 @@ const App = (() => {
       <span><small>Venta potencial</small><strong>${money(sale * stock)}</strong></span>`;
   };
 
+  const renderInventoryCategoryFilter = () => {
+    const select = $("#inventoryCategoryFilter");
+    if (!select) return;
+    const categories = [...state.categories]
+      .filter((category) => category?.id && state.items.some((item) => String(item.category_id || "") === String(category.id)))
+      .sort((left, right) => Number(left.sort_order || 0) - Number(right.sort_order || 0) || String(left.name || "").localeCompare(String(right.name || ""), "es"));
+    const validIds = new Set(categories.map((category) => String(category.id)));
+    const hasUncategorized = state.items.some((item) => !item.category_id);
+    if (state.inventoryCategoryFilter !== "all" && state.inventoryCategoryFilter !== "uncategorized" && !validIds.has(String(state.inventoryCategoryFilter))) state.inventoryCategoryFilter = "all";
+    if (state.inventoryCategoryFilter === "uncategorized" && !hasUncategorized) state.inventoryCategoryFilter = "all";
+    select.innerHTML = [
+      '<option value="all">Todas</option>',
+      ...categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name || "Sin categoría")}</option>`),
+      ...(hasUncategorized ? ['<option value="uncategorized">Sin categoría</option>'] : [])
+    ].join("");
+    select.value = state.inventoryCategoryFilter;
+  };
+
   const renderInventory = () => {
     const metrics = $("#inventoryMetrics");
     const list = $("#inventoryList");
@@ -4278,9 +4308,12 @@ const App = (() => {
       <article><span>${icon("trending-up", 19)} Venta potencial</span><strong>${money(summary.saleValue)}</strong><small>Estimado al vender todo</small></article>
       <article class="${summary.low || summary.out ? "inventory-alert-metric" : ""}"><span>${icon("triangle-alert", 19)} Alertas</span><strong>${summary.low + summary.out}</strong><small>${summary.out} agotados · ${summary.low} por reponer</small></article>`;
 
+    renderInventoryCategoryFilter();
     const query = state.inventorySearch;
     const products = matchingProducts(query, { includeUnavailable: true })
-      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter);
+      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter)
+      .filter((item) => state.inventoryCategoryFilter === "all"
+        || (state.inventoryCategoryFilter === "uncategorized" ? !item.category_id : String(item.category_id || "") === String(state.inventoryCategoryFilter)));
     list.innerHTML = products.length
       ? products.map((item) => {
           const inventory = inventoryFor(item);
@@ -4317,6 +4350,146 @@ const App = (() => {
   };
 
   const movementKind = (movement) => Number(movement.delta ?? movement.quantityChange ?? 0) >= 0 ? "entry" : "exit";
+
+  const isPurchaseMovement = (movement) => {
+    const type = String(movement?.type || "").trim().toUpperCase();
+    return Number(movement?.delta ?? movement?.quantityChange ?? 0) > 0
+      && (type === "NUEVO_PRODUCTO" || type.startsWith("ENTRADA"));
+  };
+
+  const purchaseUnitCost = (movement) => {
+    const storedCost = Number(movement?.unitCost);
+    if (Number.isFinite(storedCost) && storedCost >= 0) return storedCost;
+    const item = state.items.find((entry) => String(entry.id) === String(movement?.productId));
+    return item ? inventoryFor(item).costPrice : 0;
+  };
+
+  const purchaseMovements = () => {
+    const query = normalizeText(state.purchaseSearch);
+    return state.inventoryMovements
+      .filter(isPurchaseMovement)
+      .filter((movement) => state.purchaseProductFilter === "all" || String(movement.productId) === state.purchaseProductFilter)
+      .filter((movement) => {
+        const movementDate = new Date(movement.date);
+        const dateKey = Number.isNaN(movementDate.getTime()) ? "" : businessDateKey(movementDate);
+        return (!state.purchaseDateFrom || dateKey >= state.purchaseDateFrom)
+          && (!state.purchaseDateTo || dateKey <= state.purchaseDateTo);
+      })
+      .filter((movement) => !query || normalizeText([
+        movement.product,
+        movement.code,
+        movement.reference,
+        movement.user
+      ].join(" ")).includes(query))
+      .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || "")));
+  };
+
+  const renderPurchaseProductOptions = () => {
+    const select = $("#purchaseProductFilter");
+    if (!select) return;
+    const selected = state.purchaseProductFilter;
+    const products = new Map();
+    state.items.forEach((item) => products.set(String(item.id), { id: String(item.id), name: item.name || "Producto", code: inventoryFor(item).code }));
+    state.inventoryMovements.filter(isPurchaseMovement).forEach((movement) => {
+      const id = String(movement.productId || "");
+      if (id && !products.has(id)) products.set(id, { id, name: movement.product || "Producto", code: movement.code || "" });
+    });
+    const options = Array.from(products.values()).sort((left, right) => left.name.localeCompare(right.name, "es"));
+    select.innerHTML = `<option value="all">Todos los productos</option>${options.map((product) => `<option value="${escapeHTML(product.id)}">${escapeHTML(product.name)}${product.code ? ` (${escapeHTML(product.code)})` : ""}</option>`).join("")}`;
+    select.value = options.some((product) => product.id === selected) ? selected : "all";
+    state.purchaseProductFilter = select.value;
+  };
+
+  const savePurchaseUnitCost = (button) => {
+    const record = button?.closest(".purchase-record");
+    const input = record?.querySelector("[data-purchase-unit-cost]");
+    const movementId = String(button?.dataset.savePurchaseCost || "");
+    const movement = state.inventoryMovements.find((entry) => String(entry.movementId) === movementId);
+    if (!movement || !input) return;
+    const unitCost = currencyInputNumber(input);
+    if (!Number.isFinite(unitCost) || unitCost < 0) {
+      toast("Escribe un costo unitario válido.", "error", `purchase-cost-invalid:${movementId}`);
+      input.focus({ preventScroll: true });
+      return;
+    }
+    if (purchaseUnitCost(movement) === unitCost && Number.isFinite(Number(movement.unitCost))) {
+      toast("Ese costo ya está guardado.", "ok", `purchase-cost-unchanged:${movementId}`);
+      return;
+    }
+    movement.unitCost = unitCost;
+    persistInventoryMovements();
+    enqueueAppsScriptJob(
+      "update_inventory_movement_cost",
+      { movementId, unitCost },
+      `purchase-cost:${movementId}`
+    );
+    renderPurchaseHistory();
+    toast(navigator.onLine ? "Costo de la compra actualizado." : "Costo guardado; se sincronizará al volver la conexión.", "ok", `purchase-cost-saved:${movementId}:${unitCost}`);
+  };
+
+  const renderPurchaseHistory = () => {
+    const summary = $("#purchaseSummary");
+    const list = $("#purchaseHistoryList");
+    const feedback = $("#purchaseFilterFeedback");
+    if (!summary || !list || !feedback) return;
+    const invalidRange = state.purchaseDateFrom && state.purchaseDateTo && state.purchaseDateFrom > state.purchaseDateTo;
+    const purchases = invalidRange ? [] : purchaseMovements();
+    const totalUnits = purchases.reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
+    const totalSpent = purchases.reduce((sum, movement) => sum + Number(movement.delta || 0) * purchaseUnitCost(movement), 0);
+    const productCount = new Set(purchases.map((movement) => String(movement.productId || movement.product))).size;
+    summary.innerHTML = `
+      <article><span>${icon("wallet-cards", 20)} Total invertido</span><strong>${money(totalSpent)}</strong><small>Seg&uacute;n los filtros actuales</small></article>
+      <article><span>${icon("package-plus", 20)} Unidades compradas</span><strong>${totalUnits.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><small>En ${purchases.length} ${purchases.length === 1 ? "registro" : "registros"}</small></article>
+      <article><span>${icon("boxes", 20)} Productos</span><strong>${productCount}</strong><small>Productos distintos</small></article>`;
+    feedback.textContent = invalidRange
+      ? "La fecha inicial no puede ser posterior a la fecha final."
+      : `${purchases.length} ${purchases.length === 1 ? "compra encontrada" : "compras encontradas"}${state.movementHasMore ? ". Puedes cargar registros anteriores al final." : "."}`;
+    feedback.classList.toggle("is-error", Boolean(invalidRange));
+    list.innerHTML = purchases.length
+      ? purchases.map((movement) => {
+          const quantity = Number(movement.delta || 0);
+          const unitCost = purchaseUnitCost(movement);
+          const total = quantity * unitCost;
+          const exactCost = Number.isFinite(Number(movement.unitCost));
+          return `<article class="purchase-record" data-purchase-record="${escapeHTML(String(movement.movementId || ""))}">
+            <span class="purchase-record-icon">${icon("shopping-basket", 20)}</span>
+            <div class="purchase-record-main"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "Sin siglas")} &middot; ${escapeHTML(formatIncomeDate(movement.date))}</small></div>
+            <div class="purchase-record-calculation">
+              <span>Agregaste <strong>${quantity.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong> ${quantity === 1 ? "unidad" : "unidades"}</span>
+              <small>${exactCost ? "Costo unitario registrado" : "Calculado con el costo actual"}${movement.user ? ` &middot; ${escapeHTML(movement.user)}` : ""}</small>
+              <div class="purchase-cost-editor">
+                <label>Costo real por unidad<input type="text" inputmode="numeric" autocomplete="off" value="${formattedCurrencyInput(unitCost)}" data-currency-input data-purchase-unit-cost data-purchase-quantity="${quantity}"></label>
+                <button class="primary small" type="button" data-save-purchase-cost="${escapeHTML(String(movement.movementId || ""))}">${icon("save", 15)} Guardar</button>
+              </div>
+            </div>
+            <strong class="purchase-record-total" data-purchase-total>${money(total)}</strong>
+          </article>`;
+        }).join("")
+      : emptyState(invalidRange ? "Revisa las fechas" : "Sin compras", invalidRange ? "Corrige el rango para consultar el historial." : "No hay entradas de unidades que coincidan con estos filtros.", invalidRange ? "calendar-x" : "shopping-cart");
+    const moreButton = $("#morePurchaseHistory");
+    if (moreButton) {
+      moreButton.hidden = !state.movementHasMore;
+      moreButton.disabled = state.movementLoading;
+      moreButton.textContent = state.movementLoading ? "Cargando compras..." : "Cargar compras anteriores";
+    }
+    bindCurrencyInputs(list);
+    refreshIcons();
+  };
+
+  const openPurchaseHistory = async () => {
+    const dialog = $("#purchaseHistoryDialog");
+    if (!dialog) return;
+    renderPurchaseProductOptions();
+    renderPurchaseHistory();
+    if (!dialog.open) dialog.showModal();
+    refreshIcons();
+    window.requestAnimationFrame(() => $("#purchaseSearch")?.focus({ preventScroll: true }));
+    if (isAppsScriptConfigured() && state.currentUser && !state.movementLoading) {
+      await loadInventoryMovements({ background: true });
+      renderPurchaseProductOptions();
+      renderPurchaseHistory();
+    }
+  };
 
   const renderInventoryMovements = (appendFrom = 0) => {
     const list = $("#inventoryMovementList");
@@ -4377,11 +4550,19 @@ const App = (() => {
         refreshAfterStale = true;
         return false;
       }
-      if (typeof result.revision !== "string" || typeof result.hasMore !== "boolean") throw new Error(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para paginar movimientos.`);
+      if (typeof result.revision !== "string" || typeof result.hasMore !== "boolean") throw new Error("El respaldo remoto no devolvió los datos necesarios para paginar movimientos.");
+      const pendingPurchaseCostIds = new Set(readAppsScriptOutbox()
+        .filter((job) => job.action === "update_inventory_movement_cost")
+        .map((job) => String(job.payload?.movementId || ""))
+        .filter(Boolean));
       const newestRemote = result.movements[0]?.date || "";
-      const localRecent = more ? state.inventoryMovements : state.inventoryMovements.filter((movement) => String(movement.date || "") > String(newestRemote));
+      const localRecent = more
+        ? state.inventoryMovements
+        : state.inventoryMovements.filter((movement) => String(movement.date || "") > String(newestRemote) || pendingPurchaseCostIds.has(String(movement.movementId || "")));
       const merged = new Map(localRecent.map((movement) => [movement.movementId, movement]));
-      result.movements.forEach((movement) => merged.set(movement.movementId, movement));
+      result.movements.forEach((movement) => {
+        if (!pendingPurchaseCostIds.has(String(movement.movementId || "")) || !merged.has(movement.movementId)) merged.set(movement.movementId, movement);
+      });
       state.inventoryMovements = Array.from(merged.values());
       state.movementCursor = result.nextCursor || null;
       state.movementRevision = result.revision || "";
@@ -4431,6 +4612,10 @@ const App = (() => {
     form.product_id.value = item.id;
     form.product_name.value = item.name || "";
     form.product_code.value = inventory.code;
+    const assignedCategory = state.categories.find((category) => String(category.id) === String(item.category_id || ""));
+    if (assignedCategory && !Array.from(form.category_id.options).some((option) => option.value === String(assignedCategory.id))) {
+      form.category_id.add(new Option(assignedCategory.name || "Categoría actual", assignedCategory.id));
+    }
     form.category_id.value = item.category_id || "";
     form.new_category.value = "";
     setCurrencyInputValue(form.cost_price, inventory.costPrice);
@@ -4985,7 +5170,7 @@ const App = (() => {
       if (result?.stale) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (result.stale) throw new Error("El historial cambió mientras se calculaba. Actualiza el informe.");
-      if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para paginar ventas.`);
+      if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error("El respaldo remoto no devolvió los datos necesarios para paginar ventas.");
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       state.incomeReport = mergeIncomeReport(result, filters);
@@ -5013,9 +5198,11 @@ const App = (() => {
   const refreshBackgroundReports = async ({ force = false } = {}) => {
     const canCheckIncome = canAccessAdminSection("income");
     const canCheckMovements = canAccessAdminSection("movements");
-    if ((!canCheckIncome && !canCheckMovements) || !state.currentUser || !isAppsScriptConfigured() || !navigator.onLine) return false;
+    const canCheckInventory = canAccessAdminSection("inventory");
+    const canCheckPurchases = canCheckInventory && Boolean($("#purchaseHistoryDialog")?.open);
+    if ((!canCheckIncome && !canCheckMovements && !canCheckInventory) || !state.currentUser || !isAppsScriptConfigured() || !navigator.onLine) return false;
     const now = Date.now();
-    if (state.backgroundReportSyncBusy || (!force && now - state.backgroundReportCheckedAt < 12000)) return false;
+    if (state.backgroundReportSyncBusy || (!force && now - state.backgroundReportCheckedAt < SYNC_INTERVAL_MS)) return false;
     state.backgroundReportSyncBusy = true;
     state.backgroundReportCheckedAt = now;
     try {
@@ -5029,10 +5216,18 @@ const App = (() => {
       if (canCheckIncome && !state.incomeLoading && (!state.incomeReport || (hasIncomeRevision && state.incomeRevision !== historyRevision))) {
         updates.push(loadIncomeReport({ background: Boolean(state.incomeReport) }));
       }
-      if (canCheckMovements && !state.movementLoading && (!state.movementLoaded || (hasMovementRevision && state.movementRevision !== movementRevision))) {
+      if ((canCheckMovements || canCheckPurchases) && !state.movementLoading && (!state.movementLoaded || (hasMovementRevision && state.movementRevision !== movementRevision))) {
         updates.push(loadInventoryMovements({ background: state.movementLoaded || Boolean(state.inventoryMovements.length) }));
       }
+      if (canCheckInventory && state.activeAdminSection === "inventory" && hasMovementRevision
+        && state.appsScriptInventoryRevision !== movementRevision) {
+        updates.push(syncInventoryWithAppsScript().then((synced) => {
+          if (synced) state.appsScriptInventoryRevision = movementRevision;
+          return synced;
+        }));
+      }
       if (updates.length) await Promise.all(updates);
+      if (canCheckPurchases && updates.length) renderPurchaseHistory();
       return updates.length > 0;
     } catch (error) {
       return false;
@@ -5168,9 +5363,11 @@ const App = (() => {
         state.inventoryMeta = {};
         state.inventorySearch = "";
         state.inventoryStatusFilter = "all";
+        state.inventoryCategoryFilter = "all";
         state.productPickerMatches = [];
         if ($("#inventorySearch")) $("#inventorySearch").value = "";
         if ($("#inventoryStatusFilter")) $("#inventoryStatusFilter").value = "all";
+        if ($("#inventoryCategoryFilter")) $("#inventoryCategoryFilter").value = "all";
         persistInventoryStore();
         persistBootstrapCache();
         resetInventoryForm();
@@ -5699,6 +5896,21 @@ const App = (() => {
     return true;
   };
 
+  const saveTipSettingsRemotely = async (settings = state.tipSettings) => {
+    const saved = await retryQuiet(
+      () => state.sb.from("business_settings").update({
+        tips_enabled: settings.enabled === true,
+        tip_percentage: Number(settings.percentage || 10)
+      }).eq("is_primary", true).select("*").maybeSingle(),
+      4
+    );
+    if (!saved) return false;
+    state.business = saved;
+    applyBusinessTipSettings();
+    persistBootstrapCache();
+    return true;
+  };
+
   const saveBusiness = async (form) => {
     if (!updateTipSettingsFromForm(form, { renderForm: false })) return;
     const payload = {
@@ -5708,7 +5920,9 @@ const App = (() => {
       accent_color: form.accent_color.value || "#f05a28",
       currency: DEFAULT_CURRENCY,
       logo_url: form.logo_url.value.trim(),
-      cover_url: form.cover_url.value.trim()
+      cover_url: form.cover_url.value.trim(),
+      tips_enabled: state.tipSettings.enabled === true,
+      tip_percentage: Number(state.tipSettings.percentage || 10)
     };
     const original = state.business;
     state.business = { ...(state.business || {}), ...payload };
@@ -5723,6 +5937,7 @@ const App = (() => {
       );
       if (saved) {
         state.business = saved;
+        applyBusinessTipSettings();
         persistBootstrapCache();
         return;
       }
@@ -7587,14 +7802,30 @@ const App = (() => {
       event.preventDefault();
       await saveBusiness(event.currentTarget);
     });
-    $("#businessForm")?.addEventListener("change", (event) => {
+    $("#businessForm")?.addEventListener("change", async (event) => {
       if (event.target.name === "tips_enabled") {
+        const previous = { ...state.tipSettings };
         if (updateTipSettingsFromForm(event.currentTarget, { toggleChanged: true })) {
-          toast(state.tipSettings.enabled ? `Propina voluntaria activada al ${state.tipSettings.percentage}%.` : "Propina voluntaria desactivada.");
+          const desired = { ...state.tipSettings };
+          if (await saveTipSettingsRemotely(desired)) {
+            toast(desired.enabled ? `Propina voluntaria activada al ${desired.percentage}% en todos los dispositivos.` : "Propina voluntaria desactivada en todos los dispositivos.");
+          } else {
+            state.tipSettings = previous;
+            persistTipSettings();
+            renderBusinessForm();
+            syncTipFeatureVisibility();
+            toast("No se pudo guardar la propina. Se restauró la configuración anterior.", "error", "tip-save-failed");
+          }
         }
       }
       if (event.target.name === "tip_percentage" && !event.currentTarget.tips_enabled.checked) {
-        updateTipSettingsFromForm(event.currentTarget);
+        const previous = { ...state.tipSettings };
+        if (updateTipSettingsFromForm(event.currentTarget) && !await saveTipSettingsRemotely({ ...state.tipSettings })) {
+          state.tipSettings = previous;
+          persistTipSettings();
+          renderBusinessForm();
+          toast("No se pudo guardar el porcentaje. Se restauró el valor anterior.", "error", "tip-percentage-save-failed");
+        }
       }
     });
     $("#tipSplitPeople")?.addEventListener("input", (event) => {
@@ -7682,6 +7913,10 @@ const App = (() => {
       state.inventoryStatusFilter = event.currentTarget.value || "all";
       renderInventory();
     });
+    $("#inventoryCategoryFilter")?.addEventListener("change", (event) => {
+      state.inventoryCategoryFilter = event.currentTarget.value || "all";
+      renderInventory();
+    });
     $("#movementSearch")?.addEventListener("input", (event) => {
       state.movementSearch = event.currentTarget.value;
       renderInventoryMovements();
@@ -7689,6 +7924,29 @@ const App = (() => {
     $("#movementTypeFilter")?.addEventListener("change", (event) => {
       state.movementTypeFilter = event.currentTarget.value || "all";
       renderInventoryMovements();
+    });
+    $("#purchaseFilters")?.addEventListener("submit", (event) => event.preventDefault());
+    $("#purchaseSearch")?.addEventListener("input", (event) => {
+      state.purchaseSearch = event.currentTarget.value;
+      renderPurchaseHistory();
+    });
+    $("#purchaseProductFilter")?.addEventListener("change", (event) => {
+      state.purchaseProductFilter = event.currentTarget.value || "all";
+      renderPurchaseHistory();
+    });
+    $("#purchaseDateFrom")?.addEventListener("change", (event) => {
+      state.purchaseDateFrom = event.currentTarget.value;
+      renderPurchaseHistory();
+    });
+    $("#purchaseDateTo")?.addEventListener("change", (event) => {
+      state.purchaseDateTo = event.currentTarget.value;
+      renderPurchaseHistory();
+    });
+    $("#purchaseHistoryList")?.addEventListener("input", (event) => {
+      const input = event.target.closest("[data-purchase-unit-cost]");
+      if (!input) return;
+      const total = input.closest(".purchase-record")?.querySelector("[data-purchase-total]");
+      if (total) total.textContent = money(currencyInputNumber(input) * Number(input.dataset.purchaseQuantity || 0));
     });
     $("#consumptionForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -7981,6 +8239,19 @@ const App = (() => {
       if (target.id === "refreshIncomeReport") await loadIncomeReport();
       if (target.id === "moreIncomeRecords") await loadMoreIncomeRecords();
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
+      if (target.id === "openPurchases") await openPurchaseHistory();
+      if (target.dataset.savePurchaseCost) savePurchaseUnitCost(target);
+      if (target.id === "clearPurchaseFilters") {
+        state.purchaseSearch = "";
+        state.purchaseProductFilter = "all";
+        state.purchaseDateFrom = "";
+        state.purchaseDateTo = "";
+        if ($("#purchaseSearch")) $("#purchaseSearch").value = "";
+        if ($("#purchaseProductFilter")) $("#purchaseProductFilter").value = "all";
+        if ($("#purchaseDateFrom")) $("#purchaseDateFrom").value = "";
+        if ($("#purchaseDateTo")) $("#purchaseDateTo").value = "";
+        renderPurchaseHistory();
+      }
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
         resetInventoryForm();
@@ -7988,6 +8259,13 @@ const App = (() => {
       }
       if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
       if (target.id === "moreInventoryMovements") await loadInventoryMovements({ more: true });
+      if (target.id === "morePurchaseHistory") {
+        target.disabled = true;
+        target.textContent = "Cargando compras...";
+        await loadInventoryMovements({ more: true, background: true });
+        renderPurchaseProductOptions();
+        renderPurchaseHistory();
+      }
       if (target.dataset.resetSection) {
         await resetSectionData(target.dataset.resetSection);
         return;
@@ -8490,39 +8768,19 @@ const App = (() => {
 
   const waitForAdminLogin = async () => {
     const storedToken = localStorage.getItem("la_licorera_17_admin_token") || "";
-    let cachedUser = null;
-    try { cachedUser = JSON.parse(localStorage.getItem(ADMIN_USER_CACHE_KEY) || "null"); } catch (error) { /* cache opcional */ }
-    if (storedToken && cachedUser?.id) {
-      state.authToken = storedToken;
-      state.currentUser = cachedUser;
-      state.sb.setAuthToken(storedToken);
-      applyCurrentUser();
-      void state.sb.rpc("getCurrentUser", { auth_token: storedToken }).then(({ data, error }) => {
-        if (data) {
-          state.currentUser = data;
-          localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(data));
-          applyCurrentUser();
-          if (isBoss()) void loadUsers().then(renderUsers);
-          return;
-        }
-        if (error && /sesion vencida|autenticacion requerida|usuario inactivo/i.test(String(error.message || ""))) {
-          localStorage.removeItem("la_licorera_17_admin_token");
-          localStorage.removeItem(ADMIN_USER_CACHE_KEY);
-          location.reload();
-        }
-      }).catch(() => undefined);
-      return true;
-    }
     if (storedToken) {
+      state.authToken = storedToken;
+      state.sb.setAuthToken(storedToken);
       const user = await dbQuiet(state.sb.rpc("getCurrentUser", { auth_token: storedToken }), null);
       if (user) {
-        state.authToken = storedToken;
         state.currentUser = user;
-        state.sb.setAuthToken(storedToken);
         localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(user));
         applyCurrentUser();
         return true;
       }
+      state.authToken = "";
+      state.currentUser = null;
+      state.sb.setAuthToken("");
       localStorage.removeItem("la_licorera_17_admin_token");
       localStorage.removeItem(ADMIN_USER_CACHE_KEY);
     }
@@ -8943,6 +9201,12 @@ const App = (() => {
   };
 
   const init = async () => {
+    document.addEventListener("wheel", (event) => {
+      const input = event.target instanceof Element ? event.target.closest('input[type="number"]') : null;
+      if (!input || document.activeElement !== input) return;
+      event.preventDefault();
+      input.blur();
+    }, { capture: true, passive: false });
     state.page = document.body.dataset.page || "";
     void registerPwa();
     if (!connect()) {

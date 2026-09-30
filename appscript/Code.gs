@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.10.0",
+  version: "2.11.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -174,6 +174,10 @@ function apiRequest(payloadText) {
       requireSection_(user, "inventory");
       result = adjustInventory_(payload.adjustment, user);
     }
+    else if (request.action === "update_inventory_movement_cost") {
+      requireSection_(user, "inventory");
+      result = updateInventoryMovementCost_(payload.movementId, payload.unitCost, user);
+    }
     else if (request.action === "set_inventory_stock") {
       requireSection_(user, "inventory");
       result = setInventoryStock_(payload, user);
@@ -208,7 +212,7 @@ function apiRequest(payloadText) {
         && !result.duplicate && result.deleted !== false) {
       PropertiesService.getScriptProperties().setProperty("TN_HISTORY_REVISION", String(new Date().getTime()) + "-" + Math.random());
     }
-    if (["upsert_inventory", "adjust_inventory", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements"].indexOf(request.action) >= 0
+    if (["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements"].indexOf(request.action) >= 0
         && !result.duplicate && result.deleted !== false) {
       PropertiesService.getScriptProperties().setProperty("TN_MOVEMENT_REVISION", String(new Date().getTime()) + "-" + Math.random());
     }
@@ -367,6 +371,32 @@ function getInventoryMovements_(requestedLimit, requestedCursor, requestedRevisi
     hasMore: firstRow > 2,
     revision: revision
   };
+}
+
+function updateInventoryMovementCost_(movementId, unitCost, user) {
+  var id = String(movementId || "").trim();
+  var cost = asNumber_(unitCost);
+  if (!id || !isFinite(cost) || cost < 0) return { ok: false, retryable: false, error: "Costo de compra inválido." };
+  return withScriptLock_(function () {
+    var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
+    var rows = readSheetRows_(sheet, HEADERS.movements.length);
+    var rowIndex = -1;
+    for (var index = 0; index < rows.length; index += 1) {
+      if (String(rows[index][0] || "") === id) {
+        rowIndex = index;
+        break;
+      }
+    }
+    if (rowIndex < 0) return { ok: false, retryable: false, error: "La compra ya no existe en el historial." };
+    var row = rows[rowIndex];
+    var type = String(row[4] || "").trim().toUpperCase();
+    if (asNumber_(row[5]) <= 0 || (type !== "NUEVO_PRODUCTO" && type.indexOf("ENTRADA") !== 0)) {
+      return { ok: false, retryable: false, error: "Solo se puede cambiar el costo de una compra." };
+    }
+    sheet.getRange(rowIndex + 2, 9).setValue(cost);
+    appendAudit_("PURCHASE_COST_UPDATE", id, user.full_name || user.username, "OK", "Costo unitario " + cost);
+    return { movementId: id, unitCost: cost };
+  });
 }
 
 function getIncomeReport_(filters) {

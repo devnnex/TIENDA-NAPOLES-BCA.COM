@@ -12,7 +12,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260924-sales-receipt-1">
+    <link rel="stylesheet" href="style.css?v=20260930-black-input-caret-1">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -263,6 +263,7 @@
           </div>
           <div class="inventory-heading-actions">
             <span class="inventory-sync-status is-local" id="inventorySyncStatus"><i data-lucide="hard-drive"></i> Respaldo local</span>
+            <button class="inventory-purchases-button" id="openPurchases" type="button"><i data-lucide="shopping-cart"></i> Compras</button>
             <button class="primary" id="newInventoryProduct" type="button"><i data-lucide="package-plus"></i> Nuevo producto</button>
             <button class="ghost danger-text section-reset-button" type="button" data-reset-section="inventory" data-boss-only><i data-lucide="trash-2"></i> Eliminar todo</button>
           </div>
@@ -291,6 +292,11 @@
                   <option value="ok">Existencia normal</option>
                   <option value="low">Stock bajo</option>
                   <option value="out">Agotados</option>
+                </select>
+              </label>
+              <label>Categoría
+                <select id="inventoryCategoryFilter">
+                  <option value="all">Todas</option>
                 </select>
               </label>
             </div>
@@ -732,6 +738,30 @@
       </form>
     </dialog>
 
+    <dialog class="modal purchase-history-modal" id="purchaseHistoryDialog">
+      <div class="modal-card purchase-history-card">
+        <div class="section-head purchase-history-head">
+          <div><span class="eyebrow">Inversi&oacute;n en inventario</span><h2>Compras</h2><p>Consulta cu&aacute;ntas unidades agregaste, su costo y el total invertido en cada registro.</p></div>
+          <button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar compras"><i data-lucide="x"></i></button>
+        </div>
+        <form class="purchase-filters" id="purchaseFilters">
+          <label class="purchase-search">Buscar
+            <span class="inventory-search-control"><i data-lucide="search"></i><input id="purchaseSearch" type="search" autocomplete="off" placeholder="Producto, siglas o responsable"></span>
+          </label>
+          <label>Producto
+            <select id="purchaseProductFilter"><option value="all">Todos los productos</option></select>
+          </label>
+          <label>Desde<input id="purchaseDateFrom" type="date"></label>
+          <label>Hasta<input id="purchaseDateTo" type="date"></label>
+          <button class="ghost purchase-clear-filters" id="clearPurchaseFilters" type="button"><i data-lucide="rotate-ccw"></i> Limpiar</button>
+        </form>
+        <p class="purchase-filter-feedback" id="purchaseFilterFeedback" aria-live="polite"></p>
+        <div class="purchase-summary" id="purchaseSummary" aria-live="polite"></div>
+        <div class="purchase-history-list" id="purchaseHistoryList"></div>
+        <button class="ghost history-more-button" id="morePurchaseHistory" type="button" hidden>Cargar compras anteriores</button>
+      </div>
+    </dialog>
+
     <dialog class="modal zero-profit-modal" id="zeroProfitDialog">
       <form class="modal-card zero-profit-card" method="dialog">
         <span class="zero-profit-icon"><i data-lucide="circle-alert"></i></span>
@@ -785,6 +815,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260924-sales-receipt-1"></script>
+    <script src="app.js?v=20260930-requested-inventory-realtime-1"></script>
   </body>
 </html>
