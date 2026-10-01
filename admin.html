@@ -7,12 +7,18 @@
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Admin - Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260930-black-input-caret-1">
+    <script>
+      window.__APP_ASSET_VERSION__ = Date.now().toString(36);
+      document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="admin">
@@ -263,6 +269,7 @@
           </div>
           <div class="inventory-heading-actions">
             <span class="inventory-sync-status is-local" id="inventorySyncStatus"><i data-lucide="hard-drive"></i> Respaldo local</span>
+            <button class="ghost" id="downloadInventoryPdf" type="button"><i data-lucide="download"></i> Descargar PDF</button>
             <button class="inventory-purchases-button" id="openPurchases" type="button"><i data-lucide="shopping-cart"></i> Compras</button>
             <button class="primary" id="newInventoryProduct" type="button"><i data-lucide="package-plus"></i> Nuevo producto</button>
             <button class="ghost danger-text section-reset-button" type="button" data-reset-section="inventory" data-boss-only><i data-lucide="trash-2"></i> Eliminar todo</button>
@@ -815,6 +822,6 @@
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260930-requested-inventory-realtime-1"></script>
+    <script>document.write(`<script src="app.js?v=${window.__APP_ASSET_VERSION__}"><\/script>`);</script>
   </body>
 </html>

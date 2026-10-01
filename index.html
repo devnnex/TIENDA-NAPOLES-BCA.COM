@@ -7,12 +7,18 @@
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Servicio a la mesa</title>
     <link rel="preconnect" href="https://unpkg.com">
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260930-black-input-caret-1">
+    <script>
+      window.__APP_ASSET_VERSION__ = Date.now().toString(36);
+      document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="client">
@@ -78,6 +84,6 @@
     </main>
 
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="app.js?v=20260930-requested-inventory-realtime-1"></script>
+    <script>document.write(`<script src="app.js?v=${window.__APP_ASSET_VERSION__}"><\/script>`);</script>
   </body>
 </html>

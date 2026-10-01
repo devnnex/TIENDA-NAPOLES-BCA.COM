@@ -709,7 +709,7 @@ const App = (() => {
   const syncAdminSectionAccess = () => {
     $$(".admin-sidebar nav a").forEach((link) => {
       const section = link.getAttribute("href")?.replace("#", "") || "";
-      link.hidden = !canAccessAdminSection(section);
+      link.hidden = !canAccessAdminSection(section) || (link.hasAttribute("data-tip-feature") && !tipsEnabled());
     });
   };
 
@@ -1032,7 +1032,11 @@ const App = (() => {
       state.pwaRegistrationPromise = Promise.resolve(null);
       return state.pwaRegistrationPromise;
     }
-    state.pwaRegistrationPromise = navigator.serviceWorker.register("./service-worker.js", { scope: "./" })
+    state.pwaRegistrationPromise = navigator.serviceWorker.register("./service-worker.js", { scope: "./", updateViaCache: "none" })
+      .then((registration) => {
+        void registration.update();
+        return registration;
+      })
       .catch(() => null);
     return state.pwaRegistrationPromise;
   };
@@ -7693,6 +7697,161 @@ const App = (() => {
     }
   };
 
+  const downloadInventoryPdf = () => {
+    const jsPDF = window.jspdf?.jsPDF;
+    if (!jsPDF) {
+      toast("No se pudo cargar el generador de PDF. Revisa la conexion e intenta de nuevo.", "error", "pdf-library-missing");
+      return;
+    }
+    const products = matchingProducts(state.inventorySearch, { includeUnavailable: true })
+      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter)
+      .filter((item) => state.inventoryCategoryFilter === "all"
+        || (state.inventoryCategoryFilter === "uncategorized" ? !item.category_id : String(item.category_id || "") === String(state.inventoryCategoryFilter)))
+      .sort((left, right) => {
+        const categoryComparison = String(left.menu_categories?.name || "").localeCompare(String(right.menu_categories?.name || ""), "es");
+        return categoryComparison || String(left.name || "").localeCompare(String(right.name || ""), "es");
+      });
+    if (!products.length) {
+      toast("No hay productos que coincidan con los filtros activos.", "error", "empty-inventory-pdf");
+      return;
+    }
+
+    const button = $("#downloadInventoryPdf");
+    if (button) {
+      button.disabled = true;
+      button.innerHTML = `${icon("loader-circle", 18)} Generando PDF...`;
+      refreshIcons();
+    }
+
+    try {
+      const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+      const [red, green, blue] = pdfAccentColor();
+      const summary = products.reduce((totals, item) => {
+        const inventory = inventoryFor(item);
+        totals.units += inventory.stock;
+        totals.costValue += inventory.stock * inventory.costPrice;
+        totals.saleValue += inventory.stock * Number(item.price || 0);
+        return totals;
+      }, { units: 0, costValue: 0, saleValue: 0 });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 11;
+      const rowHeight = 18;
+      const columns = [
+        { label: "Codigo", x: 13 },
+        { label: "Producto", x: 35 },
+        { label: "Existencia", x: 112 },
+        { label: "Costo", x: 151 },
+        { label: "Venta", x: 188 },
+        { label: "Utilidad", x: 225 }
+      ];
+
+      const drawPageHeading = (includeSummary) => {
+        pdf.setTextColor(20, 23, 29);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(15);
+        pdf.text(pdfSafeText(state.business?.business_name || "Inventario"), margin, 12);
+        pdf.setFontSize(9);
+        pdf.setTextColor(red, green, blue);
+        pdf.text("INVENTARIO COMPLETO", margin, 18);
+        pdf.setFont("helvetica", "normal");
+        pdf.setTextColor(92, 99, 112);
+        pdf.setFontSize(8);
+        pdf.text(`Generado: ${pdfSafeText(new Date().toLocaleString("es-CO"))}`, pageWidth - margin, 12, { align: "right" });
+        if (includeSummary) {
+          pdf.text(
+            `${products.length} productos  |  ${summary.units.toLocaleString("es-CO", { maximumFractionDigits: 2 })} unidades  |  Inversion ${pdfSafeText(money(summary.costValue))}  |  Venta potencial ${pdfSafeText(money(summary.saleValue))}`,
+            margin,
+            24
+          );
+        }
+        const headerY = includeSummary ? 29 : 23;
+        pdf.setFillColor(27, 31, 38);
+        pdf.roundedRect(margin, headerY, pageWidth - margin * 2, 8, 1.5, 1.5, "F");
+        pdf.setTextColor(255, 255, 255);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(7.5);
+        columns.forEach((column) => pdf.text(column.label, column.x, headerY + 5.2));
+        return headerY + 8;
+      };
+
+      let y = drawPageHeading(true);
+      products.forEach((item, index) => {
+        if (y + rowHeight > pageHeight - 10) {
+          pdf.addPage("a4", "landscape");
+          y = drawPageHeading(false);
+        }
+        const inventory = inventoryFor(item);
+        const status = inventoryStatus(item);
+        const statusLabel = status === "out" ? "AGOTADO" : status === "low" ? "STOCK BAJO" : "DISPONIBLE";
+        const statusColor = status === "out" ? [206, 47, 47] : status === "low" ? [224, 151, 25] : [34, 197, 94];
+        const salePrice = Number(item.price || 0);
+        const profit = salePrice - inventory.costPrice;
+        const marginPercent = salePrice > 0 ? profit / salePrice * 100 : 0;
+        if (index % 2 === 1) {
+          pdf.setFillColor(249, 250, 251);
+          pdf.rect(margin, y, pageWidth - margin * 2, rowHeight, "F");
+        }
+        pdf.setFillColor(...statusColor);
+        pdf.rect(margin, y, 1.2, rowHeight, "F");
+        pdf.setDrawColor(225, 228, 232);
+        pdf.line(margin, y + rowHeight, pageWidth - margin, y + rowHeight);
+
+        pdf.setTextColor(20, 23, 29);
+        pdf.setFont("helvetica", "bold");
+        fitPdfText(pdf, pdfSafeText(inventory.code), 18, 9.5, 6.5);
+        pdf.text(pdfSafeText(inventory.code), 13, y + 10.5);
+        fitPdfText(pdf, pdfSafeText(item.name), 73, 9.5, 6.5);
+        pdf.text(pdfSafeText(item.name), 35, y + 7.4);
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(7);
+        pdf.setTextColor(92, 99, 112);
+        pdf.text(`${pdfSafeText(item.menu_categories?.name || "Sin categoria")} - ${pdfSafeText(inventory.unit)}`, 35, y + 12.5);
+
+        pdf.setTextColor(20, 23, 29);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(11.5);
+        pdf.text(inventory.stock.toLocaleString("es-CO", { maximumFractionDigits: 2 }), 112, y + 8.4);
+        pdf.setFontSize(6.7);
+        pdf.setTextColor(...statusColor);
+        pdf.text(statusLabel, 112, y + 13.1);
+
+        pdf.setTextColor(20, 23, 29);
+        pdf.setFontSize(9.5);
+        pdf.text(pdfSafeText(money(inventory.costPrice)), 151, y + 9.9);
+        pdf.text(pdfSafeText(money(salePrice)), 188, y + 9.9);
+        pdf.text(pdfSafeText(money(profit)), 225, y + 7.5);
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(7);
+        pdf.setTextColor(92, 99, 112);
+        pdf.text(`${marginPercent.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% margen`, 225, y + 12.4);
+        y += rowHeight;
+      });
+
+      const pageCount = pdf.getNumberOfPages();
+      for (let page = 1; page <= pageCount; page += 1) {
+        pdf.setPage(page);
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(7);
+        pdf.setTextColor(120, 126, 136);
+        pdf.text(`Pagina ${page} de ${pageCount}`, pageWidth - margin, pageHeight - 4.5, { align: "right" });
+      }
+      const date = new Date();
+      const filenameDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+      pdf.save(`inventario-${filenameDate}.pdf`);
+      toast(`Inventario completo descargado: ${products.length} productos.`);
+    } catch (error) {
+      console.error(error);
+      toast("No se pudo generar el PDF del inventario. Intenta de nuevo.", "error", "inventory-pdf-failed");
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.innerHTML = `${icon("download", 18)} Descargar PDF`;
+        refreshIcons();
+      }
+    }
+  };
+
   const downloadQr = async (id) => {
     const table = state.tables.find((entry) => String(entry.id) === String(id));
     if (table) await downloadQrPdf([table]);
@@ -7891,6 +8050,7 @@ const App = (() => {
       await saveInventoryProduct(event.currentTarget);
     });
     $("#inventoryForm")?.addEventListener("input", renderInventoryLiveCalculation);
+    $("#downloadInventoryPdf")?.addEventListener("click", downloadInventoryPdf);
     $("#inventoryAdjustForm")?.addEventListener("input", renderInventoryAdjustmentPreview);
     $("#inventoryAdjustForm")?.addEventListener("change", renderInventoryAdjustmentPreview);
     $("#inventoryAdjustForm")?.addEventListener("submit", (event) => {
