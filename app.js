@@ -4179,23 +4179,20 @@ const App = (() => {
     return buttons[index];
   };
 
-  const renderMenuManager = () => {
+  const renderCategorySelects = () => {
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
-      const excludedInventoryCategories = new Set(["entrada", "entradas", "plato fuerte", "platos fuertes", "postre", "postres"]);
-      const inventoryForm = select.closest("#inventoryForm");
-      const editingItem = inventoryForm?.product_id?.value
-        ? state.items.find((item) => String(item.id) === String(inventoryForm.product_id.value))
-        : null;
-      const categories = inventoryForm
-        ? state.categories.filter((category) => !excludedInventoryCategories.has(normalizeText(category.name))
-          || String(category.id) === String(editingItem?.category_id || ""))
-        : state.categories;
+      const selectedCategoryId = select.value;
       select.innerHTML = `
         <option value="">Elegir categoria</option>
-        ${categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name)}</option>`).join("")}
+        ${state.categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name)}</option>`).join("")}
       `;
+      if (Array.from(select.options).some((option) => option.value === selectedCategoryId)) select.value = selectedCategoryId;
     });
+  };
+
+  const renderMenuManager = () => {
+    renderCategorySelects();
 
     renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
 
@@ -4624,6 +4621,7 @@ const App = (() => {
     const form = $("#inventoryForm");
     if (!form) return;
     form.reset();
+    renderCategorySelects();
     form.product_id.value = "";
     form.stock.value = "";
     form.min_stock.value = 5;
@@ -4641,6 +4639,7 @@ const App = (() => {
     const item = state.items.find((entry) => entry.id === id);
     const form = $("#inventoryForm");
     if (!item || !form) return;
+    renderCategorySelects();
     const inventory = inventoryFor(item);
     form.product_id.value = item.id;
     form.product_name.value = item.name || "";
