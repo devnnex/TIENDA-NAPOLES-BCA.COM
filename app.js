@@ -2137,7 +2137,7 @@ const App = (() => {
   };
 
   let inventorySyncPromise = null;
-  const syncInventoryWithAppsScript = () => {
+  const syncInventoryWithAppsScript = ({ reconcileDeletions = false } = {}) => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
     if (inventorySyncPromise) return inventorySyncPromise;
     inventorySyncPromise = (async () => {
@@ -2145,13 +2145,16 @@ const App = (() => {
       try {
         const result = await appsScriptRequest("get_inventory");
         if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
+        if (reconcileDeletions && !Array.isArray(result.items)) throw new Error("El respaldo remoto no devolvió el inventario.");
         if (Array.isArray(result.items) && result.items.length) {
           applyRemoteInventoryItems(result.items, baseline);
-        } else if (result.everInitialized) {
+        }
+        if (result.everInitialized && (reconcileDeletions || !result.items?.length)) {
+          const remoteIds = new Set((result.items || []).map((item) => String(item.productId || "")).filter(Boolean));
           const pendingIds = pendingInventoryIds();
           let changed = false;
           Object.keys(state.inventoryMeta).forEach((id) => {
-            if (pendingIds.has(String(id)) || baseline.get(id) !== state.inventoryMeta[id]?.updatedAt) return;
+            if (remoteIds.has(String(id)) || pendingIds.has(String(id)) || baseline.get(id) !== state.inventoryMeta[id]?.updatedAt) return;
             delete state.inventoryMeta[id];
             changed = true;
           });
@@ -2159,7 +2162,7 @@ const App = (() => {
             persistInventoryStore();
             if (state.activeAdminSection === "inventory") renderInventory();
           }
-        } else {
+        } else if (!result.items?.length) {
           const localItems = state.items
             .filter((item) => Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id))
             .map(inventoryPayload);
@@ -4559,8 +4562,8 @@ const App = (() => {
     refreshIcons();
   };
 
-  const loadInventoryMovements = async ({ more = false, background = false } = {}) => {
-    if (!isAppsScriptConfigured() || !state.currentUser || state.movementLoading) return false;
+  const loadInventoryMovements = async ({ more = false, background = false, force = false } = {}) => {
+    if (!isAppsScriptConfigured() || !state.currentUser || (state.movementLoading && !force)) return false;
     if (more && !state.movementHasMore) return false;
     const requestId = ++state.movementRequestId;
     state.movementLoading = true;
@@ -4574,24 +4577,39 @@ const App = (() => {
       : [];
     try {
       const result = await appsScriptRequest("get_inventory_movements", { limit: 800, cursor: more ? state.movementCursor : null, revision: state.movementRevision });
-      if (!result?.ok || !Array.isArray(result.movements)) return false;
+      if (!result?.ok || !Array.isArray(result.movements)) throw new Error(result?.error || "No se pudieron consultar los movimientos.");
       if (requestId !== state.movementRequestId) return false;
       if (result.stale) {
         refreshAfterStale = true;
         return false;
       }
       if (typeof result.revision !== "string" || typeof result.hasMore !== "boolean") throw new Error("El respaldo remoto no devolvió los datos necesarios para paginar movimientos.");
-      const pendingPurchaseCostIds = new Set(readAppsScriptOutbox()
+      const pendingJobs = readAppsScriptOutbox();
+      const pendingPurchaseCostIds = new Set(pendingJobs
         .filter((job) => job.action === "update_inventory_movement_cost")
         .map((job) => String(job.payload?.movementId || ""))
         .filter(Boolean));
+      const pendingMovementIds = new Set(pendingPurchaseCostIds);
+      if (force) pendingJobs.forEach((job) => {
+        if (job.action === "adjust_inventory" && job.payload?.adjustment?.eventId) pendingMovementIds.add(String(job.payload.adjustment.eventId));
+        if (job.action === "upsert_inventory" && job.payload?.item?.movementEventId) pendingMovementIds.add(String(job.payload.item.movementEventId));
+        if (job.action === "record_sale") {
+          const invoice = job.payload?.invoice;
+          (invoice?.items || []).forEach((line) => {
+            if (invoice.id && line.menu_item_id) pendingMovementIds.add(`SALE-${invoice.id}-${line.menu_item_id}`);
+          });
+        }
+      });
       const newestRemote = result.movements[0]?.date || "";
       const localRecent = more
         ? state.inventoryMovements
-        : state.inventoryMovements.filter((movement) => String(movement.date || "") > String(newestRemote) || pendingPurchaseCostIds.has(String(movement.movementId || "")));
+        : state.inventoryMovements.filter((movement) => force
+          ? pendingMovementIds.has(String(movement.movementId || ""))
+          : String(movement.date || "") > String(newestRemote) || pendingPurchaseCostIds.has(String(movement.movementId || "")));
       const merged = new Map(localRecent.map((movement) => [movement.movementId, movement]));
       result.movements.forEach((movement) => {
-        if (!pendingPurchaseCostIds.has(String(movement.movementId || "")) || !merged.has(movement.movementId)) merged.set(movement.movementId, movement);
+        if (force && !movement.movementId) return;
+        if (!pendingMovementIds.has(String(movement.movementId || "")) || !merged.has(movement.movementId)) merged.set(movement.movementId, movement);
       });
       state.inventoryMovements = Array.from(merged.values());
       state.movementCursor = result.nextCursor || null;
@@ -5177,7 +5195,7 @@ const App = (() => {
     refreshIcons();
   };
 
-  const loadIncomeReport = async ({ background = false } = {}) => {
+  const loadIncomeReport = async ({ background = false, manual = false } = {}) => {
     if (!$("#income") || !canAccessAdminSection("income")) return false;
     clearTimeout(state.incomeSearchTimer);
     state.incomeSearchTimer = null;
@@ -5194,6 +5212,8 @@ const App = (() => {
       state.incomeReport = localIncomeReport(filters);
       renderIncomeReport();
       setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
+    } else if (manual) {
+      setIncomeReportStatus("Actualizando informe desde el respaldo", "loading", "loader-circle");
     }
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
@@ -5215,12 +5235,17 @@ const App = (() => {
       state.incomeLoading = false;
       if (background && previousReport) {
         state.incomeReport = previousReport;
+        if (manual) {
+          setIncomeReportStatus("No se pudo actualizar desde el respaldo", "warning", "hard-drive");
+          toast(String(error?.message || error), "error", "manual-income-refresh-failed");
+        }
         return false;
       }
       state.incomeReport = localIncomeReport(filters, String(error?.message || error));
       state.incomeFetchedAt = Date.now();
       renderIncomeReport();
       setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
+      if (manual) toast(String(error?.message || error), "error", "manual-income-refresh-failed");
       return false;
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
@@ -8417,14 +8442,15 @@ const App = (() => {
       }
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
-        await syncInventoryWithAppsScript();
         await flushAppsScriptOutbox();
+        if (inventorySyncPromise) await inventorySyncPromise;
+        await syncInventoryWithAppsScript({ reconcileDeletions: true });
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.printIncome) printIncomeReceipt(target.dataset.printIncome);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
-      if (target.id === "refreshIncomeReport") await loadIncomeReport();
+      if (target.id === "refreshIncomeReport") await loadIncomeReport({ background: true, manual: true });
       if (target.id === "moreIncomeRecords") await loadMoreIncomeRecords();
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "openPurchases") await openPurchaseHistory();
@@ -8492,7 +8518,7 @@ const App = (() => {
         resetInventoryForm();
         $("#inventoryDialog")?.close();
       }
-      if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
+      if (target.id === "refreshInventoryMovements") await loadInventoryMovements({ force: true });
       if (target.id === "moreInventoryMovements") await loadInventoryMovements({ more: true });
       if (target.id === "morePurchaseHistory") {
         target.disabled = true;
