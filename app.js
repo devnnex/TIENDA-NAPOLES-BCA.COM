@@ -8008,6 +8008,25 @@ const App = (() => {
     })();
   };
 
+  const runManualRefreshButton = async (button, action) => {
+    if (button.disabled) return;
+    const originalMarkup = button.innerHTML;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.classList.add("is-refreshing");
+    button.innerHTML = `${icon("loader-circle", 17)} Actualizando...`;
+    refreshIcons();
+    try {
+      return await action();
+    } finally {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.classList.remove("is-refreshing");
+      button.innerHTML = originalMarkup;
+      refreshIcons();
+    }
+  };
+
   const bindAdmin = () => {
     bindCurrencyInputs();
     $("#businessForm")?.addEventListener("submit", async (event) => {
@@ -8442,15 +8461,17 @@ const App = (() => {
       }
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
-        await flushAppsScriptOutbox();
-        if (inventorySyncPromise) await inventorySyncPromise;
-        await syncInventoryWithAppsScript({ reconcileDeletions: true });
+        await runManualRefreshButton(target, async () => {
+          await flushAppsScriptOutbox();
+          if (inventorySyncPromise) await inventorySyncPromise;
+          return syncInventoryWithAppsScript({ reconcileDeletions: true });
+        });
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.printIncome) printIncomeReceipt(target.dataset.printIncome);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
-      if (target.id === "refreshIncomeReport") await loadIncomeReport({ background: true, manual: true });
+      if (target.id === "refreshIncomeReport") await runManualRefreshButton(target, () => loadIncomeReport({ background: true, manual: true }));
       if (target.id === "moreIncomeRecords") await loadMoreIncomeRecords();
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "openPurchases") await openPurchaseHistory();
@@ -8518,7 +8539,7 @@ const App = (() => {
         resetInventoryForm();
         $("#inventoryDialog")?.close();
       }
-      if (target.id === "refreshInventoryMovements") await loadInventoryMovements({ force: true });
+      if (target.id === "refreshInventoryMovements") await runManualRefreshButton(target, () => loadInventoryMovements({ force: true }));
       if (target.id === "moreInventoryMovements") await loadInventoryMovements({ more: true });
       if (target.id === "morePurchaseHistory") {
         target.disabled = true;

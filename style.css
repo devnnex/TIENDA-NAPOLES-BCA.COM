@@ -3458,6 +3458,10 @@ button:disabled {
 
 @keyframes inventorySyncSpin { to { transform: rotate(360deg); } }
 
+#syncAppsScriptInventory.is-refreshing svg,
+#refreshInventoryMovements.is-refreshing svg,
+#refreshIncomeReport.is-refreshing svg { animation: inventorySyncSpin 1s linear infinite; }
+
 .apps-script-setup {
   overflow: hidden;
   border: 1px solid rgba(18, 24, 31, .09);

@@ -128,7 +128,30 @@ vm.runInContext(`${section("  const loadIncomeReport =", "  const refreshBackgro
   assert.ok(saleMessages.some((message) => message.includes("Sin conexión al respaldo")));
 
   assert.match(source, /target\.id === "syncAppsScriptInventory"[\s\S]*?await flushAppsScriptOutbox\(\);[\s\S]*?reconcileDeletions: true/);
-  assert.match(source, /target\.id === "refreshInventoryMovements"\) await loadInventoryMovements\(\{ force: true \}\)/);
-  assert.match(source, /target\.id === "refreshIncomeReport"\) await loadIncomeReport\(\{ background: true, manual: true \}\)/);
+  assert.match(source, /target\.id === "refreshInventoryMovements"\) await runManualRefreshButton\(target, \(\) => loadInventoryMovements\(\{ force: true \}\)\)/);
+  assert.match(source, /target\.id === "refreshIncomeReport"\) await runManualRefreshButton\(target, \(\) => loadIncomeReport\(\{ background: true, manual: true \}\)\)/);
+  assert.match(source, /button\.innerHTML = `\$\{icon\("loader-circle", 17\)\} Actualizando\.\.\.`/);
+  const buttonClasses = new Set();
+  const refreshButton = {
+    disabled: false, innerHTML: "Actualizar",
+    attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    removeAttribute(name) { this.attributes.delete(name); },
+    classList: { add: (name) => buttonClasses.add(name), remove: (name) => buttonClasses.delete(name) }
+  };
+  const buttonContext = vm.createContext({ icon: () => "[icono]", refreshIcons: () => undefined });
+  vm.runInContext(`${section("  const runManualRefreshButton =", "  const bindAdmin =")}globalThis.runManualRefreshButton = runManualRefreshButton;`, buttonContext);
+  let finishRefresh;
+  const refreshPending = buttonContext.runManualRefreshButton(refreshButton, () => new Promise((resolve) => { finishRefresh = resolve; }));
+  assert.equal(refreshButton.disabled, true);
+  assert.equal(refreshButton.innerHTML, "[icono] Actualizando...");
+  assert.equal(refreshButton.attributes.get("aria-busy"), "true");
+  assert.equal(buttonClasses.has("is-refreshing"), true);
+  finishRefresh(true);
+  await refreshPending;
+  assert.equal(refreshButton.disabled, false);
+  assert.equal(refreshButton.innerHTML, "Actualizar");
+  assert.equal(refreshButton.attributes.has("aria-busy"), false);
+  assert.equal(buttonClasses.has("is-refreshing"), false);
   console.log("Manual refresh buttons and deleted-row reconciliation OK");
 })().catch((error) => { console.error(error); process.exitCode = 1; });
