@@ -7271,6 +7271,42 @@ const App = (() => {
     return sessionId;
   };
 
+  const bindConsumptionConfirmShortcut = () => {
+    const dialog = $("#consumptionDialog");
+    const form = $("#consumptionForm");
+    const submit = $("#consumptionSubmitButton");
+    if (!dialog || !form || !submit) return;
+    let lastSpaceAt = 0;
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== " " || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
+        lastSpaceAt = 0;
+        return;
+      }
+      if (!dialog.open || form.session_item_id.value || submit.disabled) {
+        lastSpaceAt = 0;
+        return;
+      }
+      const target = event.target;
+      if (target !== document.body && target !== document && !dialog.contains(target)) {
+        lastSpaceAt = 0;
+        return;
+      }
+      const emptySearch = target === $("#consumptionProductSearch") && !target.value.trim();
+      const quantity = target === form.quantity;
+      const neutralFocus = !target?.closest?.('input, textarea, select, button, a[href], summary, [contenteditable], [role="button"]');
+      if ((!emptySearch && !quantity && !neutralFocus) || (!state.consumptionDrafts.length && !currentConsumptionDraft(form, { quiet: true }))) {
+        lastSpaceAt = 0;
+        return;
+      }
+      const now = Date.now();
+      const doubleSpace = now - lastSpaceAt <= 500;
+      event.preventDefault();
+      lastSpaceAt = doubleSpace ? 0 : now;
+      if (doubleSpace) submit.click();
+    });
+    dialog.addEventListener("close", () => { lastSpaceAt = 0; });
+  };
+
   const openConsumptionDialog = (sessionId = "", { pendingTableId = "", quickCheckout = false } = {}) => {
     const dialog = $("#consumptionDialog");
     const form = $("#consumptionForm");
@@ -8184,6 +8220,7 @@ const App = (() => {
       event.preventDefault();
       await confirmConsumptionSelection(event.currentTarget);
     });
+    bindConsumptionConfirmShortcut();
     $("#consumptionForm")?.elements.quantity?.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
