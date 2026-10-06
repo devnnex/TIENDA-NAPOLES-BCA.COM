@@ -98,6 +98,7 @@ const App = (() => {
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
+  const QR_REGENERATION_STORAGE_KEY = "tienda_napoles_qr_regeneration_enabled_v1";
   const TIP_SETTINGS_STORAGE_KEY = "tienda_napoles_tip_settings_v1";
   const TIP_SPLIT_STORAGE_KEY = "tienda_napoles_tip_split_people_v1";
   const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
@@ -350,6 +351,8 @@ const App = (() => {
     backgroundReportCheckedAt: 0,
     appsScriptInventoryRevision: "",
     activeAdminSection: "dashboard",
+    dashboardTableGroupFilter: "all",
+    tableManagerGroupFilter: "all",
     adminSectionSwitchToken: 0,
     adminSectionSwitchFrame: 0,
     adminSectionSwitchTimer: 0,
@@ -601,6 +604,9 @@ const App = (() => {
     : originalQrImageUrl(table);
 
   const servicePointKind = (table) => {
+    const qrCode = String(table?.qr_code || "");
+    if (qrCode.startsWith("interno-bar-")) return "bar";
+    if (qrCode.startsWith("interno-planter-")) return "planter";
     const name = normalizeText(table?.table_name || "");
     if (/^barra\s+\d+$/.test(name)) return "bar";
     if (/^matera\s+\d+$/.test(name)) return "planter";
@@ -610,6 +616,39 @@ const App = (() => {
   const isServicePoint = (table) => Boolean(servicePointKind(table));
 
   const normalTables = () => state.tables.filter((table) => !isServicePoint(table));
+
+  const tableGroupKey = (table) => {
+    const name = normalizeText(table?.table_name || "mesa").replace(/\s*\d+\s*$/, "").trim() || "mesa";
+    if (/^mesas?$/.test(name)) return "mesa";
+    if (/^terrazas?$/.test(name)) return "terraza";
+    return name;
+  };
+
+  const isTerraceTable = (table) => /^terrazas?(?:\s|$)/.test(tableGroupKey(table));
+  const tableMatchesGroup = (table, group) => group === "all" || tableGroupKey(table) === group;
+  const tableMatchesSearch = (table, query) => {
+    const term = normalizeText(query).replace(/\s+/g, "");
+    if (!term) return true;
+    const number = String(table.table_number || "");
+    if (/^(?:m|mesa)?\d+$/.test(term)) return ["m" + number, "mesa" + number, number].includes(term);
+    return [`m${number}`, `mesa${number}`, number, tableLabel(table)]
+      .some((value) => normalizeText(value).replace(/\s+/g, "").includes(term));
+  };
+  const syncTableGroupOptions = (select, selected) => {
+    if (!select) return selected;
+    const groups = [...new Set(normalTables().map(tableGroupKey))].sort((a, b) => a.localeCompare(b, "es"));
+    const signature = JSON.stringify(groups);
+    if (select.dataset.groups !== signature) {
+      select.innerHTML = '<option value="all">Todos los nombres</option>' + groups.map((group) =>
+        `<option value="${escapeHTML(group)}">${escapeHTML(group === "mesa" ? "MESAS" : group === "terraza" ? "TERRAZAS" : group.toLocaleUpperCase("es-CO"))}</option>`
+      ).join("");
+      select.dataset.groups = signature;
+    }
+    const value = selected === "all" || groups.includes(selected) ? selected : "all";
+    select.value = value;
+    return value;
+  };
+  const qrRegenerationEnabled = () => localStorage.getItem(QR_REGENERATION_STORAGE_KEY) === "1";
 
   const sessionLabel = (session) => session?.sale_channel === "walk_in" || !session?.table_id
     ? "Venta individual"
@@ -3666,7 +3705,8 @@ const App = (() => {
         sessionTotal(session),
         (session.session_items || []).length
       ]),
-      requests: activeRequests().map((request) => [request.id, request.table_id, request.request_type, request.status])
+      requests: activeRequests().map((request) => [request.id, request.table_id, request.request_type, request.status]),
+      filters: [state.dashboardTableGroupFilter, $("#dashboardTableSearch")?.value || ""]
     });
 
   const groupedActiveRequests = () => {
@@ -3741,13 +3781,14 @@ const App = (() => {
     refreshIcons();
   };
 
-  const compactTableTiles = () => normalTables()
+  const compactTableTiles = (groupFilter = "all", query = "") => normalTables()
     .filter((table) => table.is_active !== false)
+    .filter((table) => tableMatchesGroup(table, groupFilter) && tableMatchesSearch(table, query))
     .map((table) => {
       const session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
       const pending = state.requests.filter((request) => request.table_id === table.id && request.status === "pending").length;
       const occupied = Boolean(session);
-      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
+      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${isTerraceTable(table) ? "terrace" : ""} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
     }).join("");
 
   const renderTables = () => {
@@ -3755,7 +3796,11 @@ const App = (() => {
     if (!box) return;
     state.tableRenderSignature = tablesSignature();
     box.classList.add("compact-tables-grid");
-    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea las mesas del negocio para comenzar.", "layout-grid");
+    state.dashboardTableGroupFilter = syncTableGroupOptions($("#dashboardTableGroupFilter"), state.dashboardTableGroupFilter);
+    const emptyText = normalTables().some((table) => table.is_active !== false)
+      ? "No hay mesas que coincidan con este filtro."
+      : "Crea las mesas del negocio para comenzar.";
+    box.innerHTML = compactTableTiles(state.dashboardTableGroupFilter, $("#dashboardTableSearch")?.value || "") || emptyState("Sin mesas", emptyText, "layout-grid");
     refreshIcons();
   };
 
@@ -3785,14 +3830,15 @@ const App = (() => {
     const points = state.tables
       .filter((table) => table.is_active !== false && servicePointKind(table) === state.activeServiceZone)
       .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
-    const kindLabel = state.activeServiceZone === "bar" ? "barra" : "matera";
+    const kindLabel = state.activeServiceZone === "bar" ? "terraza" : "matera";
     box.innerHTML = points.length ? points.map((table) => {
+      const displayLabel = state.activeServiceZone === "bar" ? tableLabel(table).replace(/^Barra\b/i, "Terraza") : tableLabel(table);
       const session = state.sessions.find((entry) => String(entry.table_id) === String(table.id) && entry.status === "open");
       const occupied = Boolean(session);
       return `<article class="service-point-tile ${occupied ? "occupied" : "free"}">
-        <button type="button" data-open-table="${escapeHTML(table.id)}" title="Atender ${escapeHTML(tableLabel(table))}">
+        <button type="button" data-open-table="${escapeHTML(table.id)}" title="Atender ${escapeHTML(displayLabel)}">
           ${icon(state.activeServiceZone === "bar" ? "wine" : "flower-2", 22)}
-          <span><strong>${escapeHTML(tableLabel(table))}</strong><small>${occupied ? money(sessionTotal(session)) : "Libre"}</small></span>
+          <span><strong>${escapeHTML(displayLabel)}</strong><small>${occupied ? money(sessionTotal(session)) : "Libre"}</small></span>
         </button>
         ${isBoss() ? `<button class="icon-btn danger" type="button" data-delete-service-point="${escapeHTML(table.id)}" data-boss-only aria-label="Eliminar ${escapeHTML(tableLabel(table))}">${icon("trash-2", 15)}</button>` : ""}
       </article>`;
@@ -3812,7 +3858,7 @@ const App = (() => {
     }, 0) + 1;
     const id = uid();
     const tableNumber = state.tables.reduce((largest, table) => Math.max(largest, Number(table.table_number || 0)), 0) + 1;
-    const label = kind === "bar" ? `Barra ${sequence}` : `Matera ${sequence}`;
+    const label = kind === "bar" ? `Terraza ${sequence}` : `Matera ${sequence}`;
     const point = { id, table_number: tableNumber, table_name: label, qr_code: `interno-${kind}-${id.slice(0, 8)}`, qr_image_url: null, is_active: true };
     const original = [...state.tables];
     state.tables = [...state.tables, point].sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
@@ -3841,6 +3887,7 @@ const App = (() => {
     form.accent_color.value = state.business?.accent_color || "#f05a28";
     form.currency.value = DEFAULT_CURRENCY;
     form.tips_enabled.checked = tipsEnabled();
+    form.qr_regeneration_enabled.checked = qrRegenerationEnabled();
     form.tip_percentage.value = String(state.tipSettings?.percentage || 10);
     form.tip_percentage.readOnly = tipsEnabled();
     form.tip_percentage.closest(".tip-percentage-field")?.classList.toggle("is-locked", tipsEnabled());
@@ -3859,41 +3906,47 @@ const App = (() => {
     });
   };
 
+  const visibleManagerTables = () => normalTables()
+    .filter((table) => tableMatchesGroup(table, state.tableManagerGroupFilter))
+    .filter((table) => tableMatchesSearch(table, $("#tableManagerSearch")?.value || ""));
+
   const renderTableManager = () => {
     const list = $("#tableManagerList");
     if (!list) return;
     const qrTables = normalTables();
-    const validIds = new Set(qrTables.map((table) => String(table.id)));
+    state.tableManagerGroupFilter = syncTableGroupOptions($("#tableManagerGroupFilter"), state.tableManagerGroupFilter);
+    const visibleTables = visibleManagerTables();
+    const validIds = new Set(visibleTables.map((table) => String(table.id)));
     state.selectedTableQrIds = new Set(
       [...state.selectedTableQrIds].filter((id) => validIds.has(String(id)))
     );
-    const query = normalizeText($("#tableManagerSearch")?.value || "");
     const renderSignature = JSON.stringify({
-      query,
+      query: $("#tableManagerSearch")?.value || "",
+      group: state.tableManagerGroupFilter,
+      qrRegenerationEnabled: qrRegenerationEnabled(),
       selected: [...state.selectedTableQrIds].sort(),
       tables: qrTables.map((table) => [table.id, table.table_number, table.table_name, table.is_active, table.qr_code, table.qr_image_url])
     });
     if (renderSignature === state.tableManagerRenderSignature) return;
     state.tableManagerRenderSignature = renderSignature;
-    const visibleTables = qrTables.filter((table) => !query || normalizeText(`${table.table_number} ${table.table_name || ""}`).includes(query));
     list.innerHTML = visibleTables.length
       ? visibleTables
           .map(
             (table) => `
-              <div class="manager-row table-manager-row${state.selectedTableQrIds.has(String(table.id)) ? " is-selected" : ""}${isOutdoorTable(table) ? " is-outdoor" : ""}">
+              <div class="manager-row table-manager-row${state.selectedTableQrIds.has(String(table.id)) ? " is-selected" : ""}${isOutdoorTable(table) ? " is-outdoor" : ""}${isTerraceTable(table) ? " is-terrace" : ""}">
                 <label class="qr-table-checkbox" title="Seleccionar ${escapeHTML(tableLabel(table))}">
                   <input type="checkbox" data-select-table-qr="${table.id}" ${state.selectedTableQrIds.has(String(table.id)) ? "checked" : ""}>
                   <span>${icon("check", 16)}</span>
                 </label>
                 <div class="qr-mini" data-table-qr="${table.id}"></div>
                 <div class="table-manager-copy">
-                  <strong>${escapeHTML(tableLabel(table))}${isOutdoorTable(table) ? ' <span class="table-outdoor-badge">Exterior</span>' : ""}</strong>
+                  <strong>${escapeHTML(tableLabel(table))}${isTerraceTable(table) ? ' <span class="table-terrace-badge">TERRAZA</span>' : ""}${isOutdoorTable(table) ? ' <span class="table-outdoor-badge">Exterior</span>' : ""}</strong>
                   <span>${qrTextForTable(table)}</span>
                 </div>
                 <div class="row-actions">
                   <button class="icon-btn" data-edit-table="${table.id}" title="Editar" aria-label="Editar mesa">${icon("pencil", 17)}</button>
                   <button class="icon-btn" data-download-qr="${table.id}" title="Descargar" aria-label="Descargar QR en PDF de 9 por 9 centimetros">${icon("file-down", 17)}</button>
-                  <button class="icon-btn" data-regenerate-qr="${table.id}" title="Regenerar" aria-label="Rehacer QR">${icon("refresh-cw", 17)}</button>
+                  <button class="icon-btn" data-regenerate-qr="${table.id}" title="${qrRegenerationEnabled() ? "Regenerar QR" : "Habilita la regeneración en Marca"}" aria-label="Rehacer QR" ${qrRegenerationEnabled() ? "" : "disabled"}>${icon("refresh-cw", 17)}</button>
                   <button class="icon-btn danger" data-delete-table="${table.id}" data-boss-only title="Eliminar" aria-label="Eliminar mesa">${icon("trash-2", 17)}</button>
                 </div>
               </div>
@@ -3917,14 +3970,14 @@ const App = (() => {
       downloadButton.disabled = count === 0;
       downloadButton.innerHTML = `${icon("file-down", 18)} Descargar PDF${count ? ` (${count})` : ""}`;
     }
-    const qrTableCount = normalTables().length;
+    const qrTableCount = visibleManagerTables().length;
     if (selectAllButton) selectAllButton.disabled = !qrTableCount || count === qrTableCount;
     if (clearButton) clearButton.disabled = count === 0;
     refreshIcons();
   };
 
   const setAllQrSelections = (selected) => {
-    const ids = normalTables().map((table) => String(table.id));
+    const ids = visibleManagerTables().map((table) => String(table.id));
     state.selectedTableQrIds = selected ? new Set(ids) : new Set();
     $$('[data-select-table-qr]').forEach((checkbox) => {
       checkbox.checked = selected;
@@ -6038,8 +6091,8 @@ const App = (() => {
     const currentTable = state.tables.find((table) => table.id === targetId);
     const payload = {
       table_number: number,
-      table_name: form.table_name.value.trim() || null,
-      qr_code: `mesa-${number}`,
+      table_name: form.table_name.value.trim().toLocaleUpperCase("es-CO") || null,
+      qr_code: currentTable?.qr_code || `mesa-${number}`,
       qr_image_url: outdoorQrImageValue(currentTable, form.is_outdoor.checked),
       is_active: form.is_active.checked
     };
@@ -7918,11 +7971,12 @@ const App = (() => {
   };
 
   const downloadSelectedQrs = async () => {
-    const tables = normalTables().filter((table) => state.selectedTableQrIds.has(String(table.id)));
+    const tables = visibleManagerTables().filter((table) => state.selectedTableQrIds.has(String(table.id)));
     await downloadQrPdf(tables);
   };
 
   const regenerateQr = async (id) => {
+    if (!qrRegenerationEnabled()) return;
     const table = state.tables.find((entry) => entry.id === id);
     if (!table) return;
     if (!await askForConfirmation({
@@ -7956,7 +8010,7 @@ const App = (() => {
     if (!table || !form) return;
     form.table_id.value = table.id;
     form.table_number.value = table.table_number;
-    form.table_name.value = table.table_name || "";
+    form.table_name.value = (table.table_name || "").toLocaleUpperCase("es-CO");
     form.is_active.checked = table.is_active;
     form.is_outdoor.checked = isOutdoorTable(table);
     renderTableFormQr();
@@ -8070,6 +8124,16 @@ const App = (() => {
       await saveBusiness(event.currentTarget);
     });
     $("#businessForm")?.addEventListener("change", async (event) => {
+      if (event.target.name === "qr_regeneration_enabled") {
+        try {
+          localStorage.setItem(QR_REGENERATION_STORAGE_KEY, event.target.checked ? "1" : "0");
+          renderTableManager();
+        } catch (error) {
+          event.target.checked = false;
+          toast("No se pudo guardar el permiso local para regenerar QR.", "error");
+        }
+        return;
+      }
       if (event.target.name === "tips_enabled") {
         const previous = { ...state.tipSettings };
         if (updateTipSettingsFromForm(event.currentTarget, { toggleChanged: true })) {
@@ -8108,6 +8172,16 @@ const App = (() => {
     });
     $("#tableForm")?.addEventListener("input", (event) => {
       if (event.target.name === "table_number") renderTableFormQr();
+      if (event.target.name === "table_name") {
+        const input = event.target;
+        const start = input.selectionStart;
+        const end = input.selectionEnd;
+        const uppercase = input.value.toLocaleUpperCase("es-CO");
+        if (input.value !== uppercase) {
+          input.value = uppercase;
+          if (start !== null && end !== null) input.setSelectionRange(start, end);
+        }
+      }
     });
     $("#tableForm")?.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && event.target.matches('input[name="table_number"], input[name="table_name"]')) {
@@ -8116,6 +8190,15 @@ const App = (() => {
       }
     });
     $("#tableManagerSearch")?.addEventListener("input", renderTableManager);
+    $("#tableManagerGroupFilter")?.addEventListener("change", (event) => {
+      state.tableManagerGroupFilter = event.currentTarget.value || "all";
+      renderTableManager();
+    });
+    $("#dashboardTableGroupFilter")?.addEventListener("change", (event) => {
+      state.dashboardTableGroupFilter = event.currentTarget.value || "all";
+      renderTables();
+    });
+    $("#dashboardTableSearch")?.addEventListener("input", renderTables);
     $("#categoryForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveCategory(event.currentTarget);
