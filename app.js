@@ -2147,7 +2147,11 @@ const App = (() => {
       if (result?.ok && ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
         window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
       }
-      if (result?.ok && action !== "status" && !action.startsWith("get_")) notifyAdminPeers({ reports:true });
+      if (result?.ok && action !== "status" && !action.startsWith("get_")) notifyAdminPeers({
+        reports: true,
+        inventory: ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock",
+          "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(action)
+      });
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
       if (error?.name === "AbortError") throw transientAppsScriptError("La sincronización remota continúa en segundo plano.");
@@ -2399,6 +2403,29 @@ const App = (() => {
       }
     })().finally(() => { inventorySyncPromise = null; });
     return inventorySyncPromise;
+  };
+
+  let inventoryPeerRefreshPending = false;
+  let inventoryPeerRefreshPromise = null;
+  const refreshInventoryFromPeer = () => {
+    if (!navigator.onLine || !isAppsScriptConfigured() || !state.currentUser) return Promise.resolve(false);
+    inventoryPeerRefreshPending = true;
+    if (inventoryPeerRefreshPromise) return inventoryPeerRefreshPromise;
+    inventoryPeerRefreshPromise = (async () => {
+      do {
+        inventoryPeerRefreshPending = false;
+        if (inventorySyncPromise) await inventorySyncPromise;
+        // La consulta que sigue ya incluye los avisos recibidos durante la lectura anterior.
+        inventoryPeerRefreshPending = false;
+        await syncInventoryWithAppsScript({ reconcileDeletions: true });
+      } while (inventoryPeerRefreshPending);
+      if (state.activeAdminSection === "movements") await loadInventoryMovements();
+      return true;
+    })().finally(() => {
+      inventoryPeerRefreshPromise = null;
+      if (inventoryPeerRefreshPending) void refreshInventoryFromPeer();
+    });
+    return inventoryPeerRefreshPromise;
   };
 
   const queueInventoryUpsert = (item, movement = {}) => {
@@ -3065,9 +3092,30 @@ const App = (() => {
     assistantSay("bot", `Perfecto. Ya envié tu solicitud de ${order.quantity} x ${order.item.name}. El mesero te atenderá para confirmar los detalles.`);
   };
 
+  const songTurnCount = () => {
+    const tableId = String(state.currentTable?.id || "");
+    if (!tableId) return 0;
+    const pending = new Set();
+    [...state.clientRequests, ...readRequestOutbox()]
+      .filter((row) => String(row.table_id) === tableId && isSongRequest(row)
+        && ["sending", "pending", undefined].includes(row.status))
+      .forEach((row) => pending.add(String(row.id || row.request_id)));
+    (state.clientQueuePositions || []).filter((row) => row.kind === "song")
+      .forEach((row) => pending.add(String(row.id)));
+    return pending.size;
+  };
+
+  const showSongLimitNotice = () => {
+    const notice = $("#songLimitNotice");
+    if (!notice) return;
+    notice.hidden = false;
+    notice.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
+
   const handleAssistantMessage = async (message) => {
     const text = message.trim();
     if (!text) return;
+    if (songTurnCount() >= 5) { showSongLimitNotice(); return; }
     assistantSay("user", text);
     if (state.currentTable) {
       const session = state.currentSession || await ensureOpenSession(state.currentTable.id);
@@ -3151,18 +3199,17 @@ const App = (() => {
   const handleSongRequest = async (message) => {
     const song = String(message || "").trim().replace(/\s+/g, " ").slice(0, 180);
     if (!song) return;
-    assistantSay("user", song);
     if (!state.currentTable) {
       assistantSay("bot", "Primero selecciona tu mesa para poder enviar la canción.");
       return;
     }
-    const queuedSongs = state.clientRequests.filter((row) => isSongRequest(row) && ["sending","pending"].includes(row.status));
-    if (queuedSongs.length >= 5) { assistantSay("bot", "Puedes pedir máximo 5 canciones por turno. Espera a que termine tu turno."); return; }
+    if (songTurnCount() >= 5) { showSongLimitNotice(); return; }
+    assistantSay("user", song);
     const request = await createServiceNotification(
       "other",
       `${tableLabel(state.currentTable)} solicita la canción: ${song}`
     );
-    if (request) { assistantSay("bot", `La canción “${song}” fue solicitada. Puedes pedir máximo 5 por turno; tu posición aparecerá al confirmarse el envío.`); void refreshClientPosData(); }
+    if (request) { assistantSay("bot", `La canción “${song}” fue solicitada. Puedes pedir máximo 5 por turno; tu posición aparecerá al confirmarse el envío.`); if (songTurnCount() >= 5) showSongLimitNotice(); void refreshClientPosData(); }
   };
 
   const addItemToSession = async (itemId) => {
@@ -3298,6 +3345,8 @@ const App = (() => {
         state.tableLocked = false;
         state.sessionItems = [];
         state.clientRequests = [];
+        state.clientQueuePositions = [];
+        if ($("#songLimitNotice")) $("#songLimitNotice").hidden = true;
         state.sb.setTableAccess("", "");
         renderTablePicker();
         renderAccount();
@@ -3315,6 +3364,8 @@ const App = (() => {
           state.currentSession = null;
           state.sessionItems = [];
           state.clientRequests = [];
+          state.clientQueuePositions = [];
+          if ($("#songLimitNotice")) $("#songLimitNotice").hidden = true;
           state.clientSnapshotSignature = "";
           state.tableAccountStatus = "checking";
           state.tableAccountTotal = 0;
@@ -3766,7 +3817,7 @@ const App = (() => {
     if (!state.authToken || !state.currentUser) return;
     const channel = state.adminBroadcastChannel;
     if (!channel?.send) return;
-    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.users,"users-refresh"]]) {
+    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.inventory,"inventory-refresh"],[detail.users,"users-refresh"]]) {
       if (enabled) {
         try { Promise.resolve(channel.send({type:"broadcast",event,payload:{}})).catch(() => undefined); }
         catch (_) { /* La consulta periódica recupera un canal desconectado. */ }
@@ -4048,7 +4099,7 @@ const App = (() => {
           p_table_id: table.id, p_table_access_code: tableCode(table), auth_token: "" }), null) : null
       ]);
       if (state.currentTable?.id !== table.id || (state.currentSession?.id || "") !== sessionId) return false;
-      if (Array.isArray(queue?.requests)) { state.clientQueuePositions = queue.requests; renderClientQueue(); }
+      if (Array.isArray(queue?.requests)) { state.clientQueuePositions = queue.requests; renderClientQueue(); if (songTurnCount() < 5 && $("#songLimitNotice")) $("#songLimitNotice").hidden = true; }
       if (!Array.isArray(payments?.payments)) return false;
       const changed = JSON.stringify(state.currentSession.session_payments) !== JSON.stringify(payments.payments);
       state.currentSession.session_payments = payments.payments;
@@ -9410,6 +9461,7 @@ const App = (() => {
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
       .on("broadcast", { event: "reports-refresh" }, () => void refreshBackgroundReports({ force:true }))
+      .on("broadcast", { event: "inventory-refresh" }, () => void refreshInventoryFromPeer())
       .on("broadcast", { event: "users-refresh" }, () => { if (isBoss()) void loadUsers(); })
       .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
