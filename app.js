@@ -55,7 +55,22 @@ const SupabaseDb = (() => {
       if (authToken) headers.set("x-app-token", authToken);
       if (clientTableAccess.table_id) headers.set("x-table-id", clientTableAccess.table_id);
       if (clientTableAccess.code) headers.set("x-table-code", clientTableAccess.code);
-      return fetch(input, { ...options, headers });
+      return fetch(input, { ...options, headers }).then((response) => {
+        try {
+          const url = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url);
+          const method = String(options.method || input?.method || "GET").toUpperCase();
+          const entity = url.pathname.replace(/^.*\/rest\/v1\//, "");
+          const core = ["business_settings", "restaurant_tables", "menu_categories", "menu_items"].includes(entity);
+          const operational = ["table_sessions", "session_items", "service_requests"].includes(entity)
+            || /^rpc\/(save_table_zones|record_session_payment|replay_table_session_change|acknowledge_service_requests|resolve_bill|create_service_requests?(?:_batch)?)$/.test(entity);
+          const users = entity === "app_users" || /^rpc\/(save_user|delete_user)$/.test(entity);
+          if (response.ok && !response.headers.get("X-Offline-Queued") && ["POST","PATCH","DELETE"].includes(method)
+            && (core || operational || users) && typeof window.dispatchEvent === "function") {
+            window.dispatchEvent(new CustomEvent("napoles-remote-change", { detail: { core, operational, users } }));
+          }
+        } catch (_) { /* El aviso no interrumpe una respuesta ya confirmada. */ }
+        return response;
+      });
     };
     client = window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -534,40 +549,9 @@ const App = (() => {
     }
   };
 
-  const loadBusiness = async () => {
-    const data = await db(
-      state.sb.from("business_settings").select("*").eq("is_primary", true).maybeSingle(),
-      null
-    );
-    state.business = data || {
-      business_name: "Tu restaurante",
-      subtitle: "Servicio a la mesa rapido y claro",
-      accent_color: "#f05a28",
-      currency: DEFAULT_CURRENCY,
-      tips_enabled: false,
-      tip_percentage: 10
-    };
-    applyBusinessTipSettings();
-    document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
-  };
+  const loadBusiness = async () => refreshCoreNow();
 
-  const loadCore = async () => {
-    const [tables, categories, items] = await Promise.all([
-      db(state.sb.from("restaurant_tables").select("*").order("table_number", { ascending: true }), []),
-      db(state.sb.from("menu_categories").select("*").order("sort_order", { ascending: true }), []),
-      db(
-        state.sb
-          .from("menu_items")
-          .select("*, menu_categories(name)")
-          .order("sort_order", { ascending: true }),
-        []
-      )
-    ]);
-    state.tables = tables || [];
-    state.categories = categories || [];
-    state.items = items || [];
-    loadInventoryStore();
-  };
+  const loadCore = async () => { const loaded = await refreshCoreNow(); if (loaded) loadInventoryStore(); return loaded; };
 
   const ensurePresetCategories = async () => {
     if (!canAccessAdminSection("menu") && !canAccessAdminSection("inventory")) return;
@@ -1362,7 +1346,7 @@ const App = (() => {
           <span>${icon("receipt", 18)} Cuenta actual</span>
           <strong>${money(Math.max(0,subtotal-sessionPaid(state.currentSession)))}</strong>
         </div>
-        ${sessionPaid(state.currentSession) ? `<div class="account-abono-summary">Consumo: ${money(subtotal)} · Abonos: −${money(sessionPaid(state.currentSession))}</div>` : ""}
+        ${subtotal > 0 && sessionPaid(state.currentSession) ? `<div class="account-abono-summary">Consumo: ${money(subtotal)} · Abonos: −${money(sessionPaid(state.currentSession))}</div>` : ""}
         <div class="account-list">
           ${[...state.sessionItems]
             .sort((left, right) => new Date(right.created_at || right.updated_at || 0) - new Date(left.created_at || left.updated_at || 0))
@@ -1411,8 +1395,8 @@ const App = (() => {
       tax: totals.tax,
       service_fee: totals.serviceFee,
       consumption_total: totals.total,
-      paid: sessionPaid(session),
-      payments: sessionPayments(session),
+      paid: totals.total > 0 ? sessionPaid(session) : 0,
+      payments: totals.total > 0 ? sessionPayments(session) : [],
       total: sessionBalance(session)
     });
   };
@@ -2163,6 +2147,7 @@ const App = (() => {
       if (result?.ok && ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
         window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
       }
+      if (result?.ok && action !== "status" && !action.startsWith("get_")) notifyAdminPeers({ reports:true });
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
       if (error?.name === "AbortError") throw transientAppsScriptError("La sincronización remota continúa en segundo plano.");
@@ -3445,7 +3430,7 @@ const App = (() => {
     renderBillChat();
     renderAssistant();
     bindClient();
-    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self: false }, private: false } }).subscribe();
+    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self:false }, private:false } }).on("broadcast", {event:"refresh"}, () => void refreshClientPosData()).on("broadcast", {event:"core-refresh"}, () => void refreshCoreNow()).subscribe();
     subscribeClient();
     setLoading(false);
     // La pantalla queda usable tras el bootstrap; la cuenta se hidrata en segundo plano.
@@ -3471,10 +3456,13 @@ const App = (() => {
   const mergeOptimisticSessions = (serverSessions = []) => {
     const merged = new Map(serverSessions.map((session) => [session.id, session]));
     state.optimisticSessionStates.forEach((overlay, sessionId) => {
+      const now = Date.now();
       const serverSession = merged.get(sessionId);
       if (overlay.mode === "remove") {
         merged.delete(sessionId);
-        if (!serverSession) state.optimisticSessionStates.delete(sessionId);
+        if (!serverSession && Date.now() >= Number(overlay.retainUntil || 0)) {
+          state.optimisticSessionStates.delete(sessionId);
+        }
         return;
       }
       const expectedItems = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
@@ -3486,10 +3474,23 @@ const App = (() => {
         String(serverSession?.assigned_waiter_id || "") === String(overlay.expectedSession.assigned_waiter_id || "")
       );
       if (serverSession && expectedItemConfirmed && expectedSessionConfirmed) {
-        state.optimisticSessionStates.delete(sessionId);
+        const confirmedAt = Number(overlay.confirmedAt || now);
+        if (now - confirmedAt >= REMOTE_CONFIRMATION_HOLD_MS) {
+          state.optimisticSessionStates.delete(sessionId);
+        } else {
+          state.optimisticSessionStates.set(sessionId, { ...overlay, session: serverSession, confirmedAt });
+        }
         merged.set(sessionId, serverSession);
       } else {
-        merged.set(sessionId, overlay.session);
+        if (!serverSession || overlay.localOnly) { merged.set(sessionId, overlay.session); return; }
+        const items = new Map((serverSession.session_items || []).map((item) => [item.id,item]));
+        expectedItems.forEach((item) => items.set(item.id,item));
+        const pending = { ...serverSession, session_items: [...items.values()] };
+        Object.keys(overlay.expectedSession || {}).forEach((field) => {
+          if (Object.prototype.hasOwnProperty.call(overlay.session || {},field)) pending[field] = overlay.session[field];
+        });
+        if (overlay.expectedSession && Object.prototype.hasOwnProperty.call(overlay.expectedSession,'assigned_waiter_id')) pending.assigned_waiter = overlay.session?.assigned_waiter;
+        merged.set(sessionId,pending);
       }
     });
     return Array.from(merged.values());
@@ -3761,8 +3762,21 @@ const App = (() => {
     }, 12000);
   };
 
+  const notifyAdminPeers = (detail = {}) => {
+    if (!state.authToken || !state.currentUser) return;
+    const channel = state.adminBroadcastChannel;
+    if (!channel?.send) return;
+    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.users,"users-refresh"]]) {
+      if (enabled) {
+        try { Promise.resolve(channel.send({type:"broadcast",event,payload:{}})).catch(() => undefined); }
+        catch (_) { /* La consulta periódica recupera un canal desconectado. */ }
+      }
+    }
+  };
+
+  let adminRefreshPending = false;
   const refreshAdminNow = async () => {
-    if (state.adminSyncBusy) return false;
+    if (state.adminSyncBusy) { adminRefreshPending = true; return false; }
     state.adminSyncBusy = true;
     try {
       const changed = await loadAdminData();
@@ -3771,52 +3785,120 @@ const App = (() => {
       return changed;
     } finally {
       state.adminSyncBusy = false;
+      if (adminRefreshPending) { adminRefreshPending = false; window.setTimeout(() => void refreshAdminNow(),0); }
     }
   };
 
   const startAdminPolling = () => {
     clearInterval(state.adminPollTimer);
-    state.adminPollTimer = setInterval(refreshAdminNow, SYNC_INTERVAL_MS);
+    state.adminPollTimer = setInterval(() => {
+      void refreshAdminNow();
+      if (Date.now()-Number(state.coreRefreshedAt || 0) >= 5000) {
+        void refreshCoreNow();
+        if (isBoss()) void loadUsers();
+      }
+    }, SYNC_INTERVAL_MS);
   };
 
   const loadAdminData = async () => {
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
-    if (!snapshot) {
-      const [requests, sessions] = await Promise.all([
-        db(
-          state.sb.from("service_requests").select("*, restaurant_tables(table_number, table_name)")
-            .in("status", ["pending", "acknowledged"]).order("created_at", { ascending: false }),
-          []
-        ),
-        db(
-          state.sb.from("table_sessions").select("*, restaurant_tables(table_number, table_name), session_items(*)")
-            .eq("status", "open").order("opened_at", { ascending: false }),
-          []
-        )
-      ]);
-      state.requests = mergeOptimisticRequests(requests || []);
-      state.sessions = mergeOptimisticSessions(sessions || []);
-      return true;
-    }
+    if (!snapshot) return false;
     const requests = mergeOptimisticRequests(snapshot.requests || []);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
-    const signature = JSON.stringify([
-      requests.map((request) => [request.id, request.status, request.updated_at]),
-      sessions.map((session) => [
-        session.id,
-        session.status,
-        session.updated_at,
-        session.session_payments,
-        ...(session.session_items || []).map((item) => [item.id, item.status, item.quantity, item.updated_at])
-      ])
-    ]);
+    const signature = JSON.stringify([requests,sessions]);
     if (signature === state.adminSnapshotSignature) return false;
     state.adminSnapshotSignature = signature;
     state.requests = requests;
     state.sessions = sessions;
     return true;
+  };
+
+  const mergePendingCoreData = (remote,queue) => {
+    const records = queue?.blockingRecords || [];
+    const result = { ...remote };
+    for (const [entity,key] of [['restaurant_tables','tables'],['menu_categories','categories'],['menu_items','items']]) {
+      const pending = records.filter((record) => record.entity === entity);
+      const rows = new Map((remote[key] || []).map((row) => [row.id,row]));
+      const local = state[key] || [];
+      pending.forEach((record) => {
+        const ids = record.recordIds || [];
+        if (!ids.length) { local.forEach((row) => rows.set(row.id,row)); return; }
+        ids.forEach((id) => {
+          if (record.method === 'DELETE') { rows.delete(id); return; }
+          const saved = local.find((row) => row.id === id);
+          if (!saved) return;
+          if (!rows.has(id) || !Array.isArray(record.changedFields)) { rows.set(id,saved); return; }
+          if (record.method === 'POST') return;
+          const row = { ...rows.get(id) };
+          record.changedFields.filter((field) => field !== 'id').forEach((field) => { if (Object.prototype.hasOwnProperty.call(saved,field)) row[field] = saved[field]; });
+          rows.set(id,row);
+        });
+      });
+      if (entity === 'restaurant_tables' && records.some((record) => record.entity === 'rpc:save_table_zones')) {
+        local.forEach((row) => { if (rows.has(row.id)) rows.set(row.id,{...rows.get(row.id),is_outdoor:row.is_outdoor}); });
+      }
+      result[key] = [...rows.values()];
+    }
+    const businessChanges = records.filter((record) => record.entity === 'business_settings');
+    businessChanges.forEach((record) => {
+      if (!state.business) return;
+      if (!Array.isArray(record.changedFields)) { result.business = state.business; return; }
+      result.business = { ...result.business };
+      record.changedFields.filter((field) => field !== 'id').forEach((field) => { if (Object.prototype.hasOwnProperty.call(state.business,field)) result.business[field] = state.business[field]; });
+    });
+    return result;
+  };
+
+  let coreRefreshPromise = null;
+  let coreRefreshPending = false;
+  const refreshCoreNow = () => {
+    if (coreRefreshPromise) { coreRefreshPending = true; return coreRefreshPromise; }
+    state.coreSyncBusy = true;
+    coreRefreshPromise = (async () => {
+      const queue = typeof getOfflineSyncStatus === 'function' ? await getOfflineSyncStatus() : {blockingRecords:[]};
+      if (typeof setScopedCoreRead === 'function') await setScopedCoreRead(Array.isArray(queue.blockingRecords));
+      const params = new URLSearchParams(location.search);
+      const data = await dbQuiet(state.sb.rpc('getBootstrapData',{
+        auth_token:state.authToken || '',
+        table_access_code:state.currentTable ? tableCode(state.currentTable) : params.get('mesa') || params.get('table') || params.get('t') || params.get('qr') || ''
+      }),null);
+      const businessLoaded = Boolean(data?.business);
+      const coreLoaded = Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items);
+      state.syncFresh ||= {};
+      if (businessLoaded && coreLoaded) {
+        const fresh = mergePendingCoreData(data,queue);
+        state.business = fresh.business; state.tables = fresh.tables; state.categories = fresh.categories; state.items = fresh.items;
+        state.coreRefreshedAt = Date.now();
+      }
+      if (businessLoaded && coreLoaded) state.coreDirectReadSucceeded = true;
+      state.syncFresh.core = Boolean(businessLoaded && coreLoaded);
+      applyBusinessTipSettings();
+      if (!state.outdoorTableDraftDirty) state.outdoorTableDraftIds = null;
+      if (businessLoaded && coreLoaded) persistBootstrapCache();
+      if (state.page === "admin") {
+        renderBrand();
+        syncTipFeatureVisibility();
+        renderTables();
+        renderServiceTables();
+        renderTableManager();
+        renderMenuManager();
+        renderInventory();
+        if (state.activeAdminSection === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
+      }
+      else {
+        renderBrand();
+        renderMenu();
+      }
+      return businessLoaded && coreLoaded;
+    })().finally(() => {
+      state.coreSyncBusy = false;
+      coreRefreshPromise = null;
+      if (coreRefreshPending) { coreRefreshPending = false; window.setTimeout(() => void refreshCoreNow(),0); }
+      if (typeof updateGlobalSyncStatus === 'function') void updateGlobalSyncStatus();
+    });
+    return coreRefreshPromise;
   };
 
   const updateNavRequestBadge = () => {
@@ -3888,13 +3970,24 @@ const App = (() => {
   const sessionPayments = (session) => [...new Map((session?.session_payments || []).map((row) => [row.id, row])).values()];
   const sessionPaid = (session) => sessionPayments(session).reduce((sum, row) => sum + integerMoney(row.amount), 0);
   const sessionBalance = (session) => Math.max(0, sessionTotal(session) - sessionPaid(session));
+
+  const consumptionChangeAllowed = (session, itemId, replacement) => {
+    const projected = { ...session, session_items: (session?.session_items || []).map((item) =>
+      item.id === itemId ? { ...item, ...replacement } : item) };
+    const total = sessionTotal(projected);
+    return total === 0 || total >= sessionPaid(session);
+  };
+
+  const clearPaymentsWithoutConsumption = (session) => sessionTotal(session) === 0
+    ? { ...session, session_payments: [] } : session;
+
   const aggregateAccountPayments = (session, finalPayments) => {
     const totals = new Map();
     [...sessionPayments(session).map((row) => ({ method: row.payment_method, amount: row.amount })), ...finalPayments]
       .forEach((row) => totals.set(row.method, (totals.get(row.method) || 0) + integerMoney(row.amount)));
     return [...totals].filter(([, amount]) => amount > 0).map(([method, amount]) => ({ method, amount }));
   };
-  const abonoRowsHtml = (session) => sessionPayments(session).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
+  const abonoRowsHtml = (session) => (Array.isArray(session?.session_items) && sessionTotal(session) === 0 ? [] : sessionPayments(session)).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
     .map((row) => '<div class="account-abono-line"><div><strong>Abono · ' + escapeHTML(paymentMethodLabel(row.payment_method)) + '</strong><small>'
       + escapeHTML(new Date(row.created_at).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "medium" }))
       + (row.reference ? ' · ' + escapeHTML(row.reference) : '') + (row._offline_pending ? ' · Pendiente de sincronizar' : '')
@@ -3927,6 +4020,7 @@ const App = (() => {
       if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
       delete form.dataset.paymentId; $("#abonoDialog")?.close();
       state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
+      if (!data.payment._offline_pending) notifyAdminPeers({ operational:true });
       renderAdminLive(); renderAccountDetail();
       if ($("#consumptionDialog")?.open && $("#consumptionForm")?.session_id?.value === session.id) {
         const wasVisible = !$("#tableConsumptionPreview")?.hidden;
@@ -6214,7 +6308,7 @@ const App = (() => {
         </div>
         ${suggestedTip ? `<div class="account-detail-tip"><span><small>Propina voluntaria (${state.tipSettings.percentage}%)</small><strong>${money(suggestedTip)}</strong></span><span><small>Total sugerido con propina</small><strong>${money(suggestedTotal)}</strong></span></div>` : ""}
         ${abonoRowsHtml(session)}
-        ${sessionPaid(session) ? `<div class="account-detail-total"><span>Consumo / abonado</span><strong>${money(sessionTotal(session))} / −${money(sessionPaid(session))}</strong></div>` : ""}
+        ${sessionTotal(session) > 0 && sessionPaid(session) ? `<div class="account-detail-total"><span>Consumo / abonado</span><strong>${money(sessionTotal(session))} / −${money(sessionPaid(session))}</strong></div>` : ""}
         <div class="account-detail-total"><span>Saldo pendiente</span><strong>${money(total)}</strong></div>
       </div>
       <div class="invoice-actions account-detail-actions">
@@ -6290,7 +6384,7 @@ const App = (() => {
               <article class="account-summary-card ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
                 <div class="account-summary-head"><div><span>${escapeHTML(sessionLabel(session))}</span><small>#${sessionReference(session)}</small></div><span class="account-summary-status">${items.length ? `${items.length} ${items.length === 1 ? "consumo" : "consumos"}` : "Cuenta en $0"}</span></div>
                 <div class="account-summary-total"><small>Saldo pendiente</small><strong>${money(total)}</strong></div>
-                ${sessionPaid(session) ? `<div class="account-abono-summary">Abonado: −${money(sessionPaid(session))} · Consumo: ${money(sessionTotal(session))}</div>` : ""}
+                ${sessionTotal(session) > 0 && sessionPaid(session) ? `<div class="account-abono-summary">Abonado: −${money(sessionPaid(session))} · Consumo: ${money(sessionTotal(session))}</div>` : ""}
                 ${suggestedTip ? `<div class="account-summary-tip"><span>Propina voluntaria (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong><small>Total sugerido: ${money(total + suggestedTip)}</small></div>` : ""}
                 <div class="account-summary-meta"><span>${icon("user-round", 15)} ${escapeHTML(session.payer_name || "Por definir")}</span><span>${icon("contact", 15)} ${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</span><span>${icon("clock-3", 15)} ${opened.date} · ${opened.time}</span></div>
                 <div class="account-summary-actions">
@@ -7937,9 +8031,13 @@ const App = (() => {
       accept: "Sí, quitar producto",
       cancel: "Conservar producto"
     })) return;
+    if (!consumptionChangeAllowed(session, itemId, { status: "cancelled" })) {
+      toast("No puedes quitar este producto: el consumo restante quedaría por debajo de los abonos.", "error", "consumption-below-payments");
+      return;
+    }
     const originalSession = session;
     state.sessions = state.sessions.map((entry) => entry.id === sessionId
-      ? { ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) }
+      ? clearPaymentsWithoutConsumption({ ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) })
       : entry);
     state.accountsRenderSignature = "";
     renderAdminLive();
@@ -8005,6 +8103,10 @@ const App = (() => {
       form.quantity.focus({ preventScroll: true });
       return;
     }
+    if (session && itemId && !consumptionChangeAllowed(session, itemId, { quantity, unit_price: price, status: "served" })) {
+      toast("No puedes reducir este consumo por debajo de los abonos registrados.", "error", "consumption-below-payments");
+      return;
+    }
     if (!session && !pendingTableId) return;
     if (!session && pendingTableId) {
       const table = state.tables.find((entry) => String(entry.id) === String(pendingTableId) && entry.is_active !== false);
@@ -8049,6 +8151,8 @@ const App = (() => {
             : [...(entry.session_items || []), optimisticItem]
         })
       : entry);
+    optimisticSession = clearPaymentsWithoutConsumption(optimisticSession);
+    state.sessions = state.sessions.map((entry) => entry.id === sessionId ? optimisticSession : entry);
     state.optimisticSessionStates.set(sessionId, {
       mode: "upsert",
       session: optimisticSession,
@@ -9298,9 +9402,16 @@ const App = (() => {
   };
 
   const subscribeAdmin = () => {
+    if (!state.peerSyncListener) {
+      state.peerSyncListener = (event) => notifyAdminPeers(event.detail);
+      window.addEventListener("napoles-remote-change", state.peerSyncListener);
+    }
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("broadcast", { event: "reports-refresh" }, () => void refreshBackgroundReports({ force:true }))
+      .on("broadcast", { event: "users-refresh" }, () => { if (isBoss()) void loadUsers(); })
+      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
@@ -9311,6 +9422,7 @@ const App = (() => {
         }
       });
     state.subscriptions.push(channel);
+    state.adminBroadcastChannel = channel;
   };
 
   const tableFromScannedValue = (value) => {
