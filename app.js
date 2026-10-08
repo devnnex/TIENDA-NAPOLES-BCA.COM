@@ -314,6 +314,8 @@ const App = (() => {
     consumptionDrafts: [],
     consumptionDraftEditIndex: -1,
     activePaymentTotal: 0,
+    posFeatures: {},
+    clientQueuePositions: [],
     activePaymentBase: 0,
     activePaymentTip: 0,
     tipSettings: { enabled: false, percentage: 10 },
@@ -337,6 +339,8 @@ const App = (() => {
     alarmToneFinish: null,
     speechFinish: null,
     alertRenderSignature: null,
+    outdoorTableDraftIds: null,
+    outdoorTableDraftDirty: false,
     accountsRenderSignature: null,
     activeAccountDetailId: "",
     adminSnapshotSignature: "",
@@ -592,7 +596,7 @@ const App = (() => {
   const tableLabel = (table) => table?.table_name || `Mesa ${table?.table_number || ""}`.trim();
 
   const OUTDOOR_TABLE_PREFIX = "tn-outdoor:v1:";
-  const isOutdoorTable = (table) => String(table?.qr_image_url || "").startsWith(OUTDOOR_TABLE_PREFIX);
+  const isOutdoorTable = (table) => typeof table?.is_outdoor === "boolean" ? table.is_outdoor : String(table?.qr_image_url || "").startsWith(OUTDOOR_TABLE_PREFIX);
   const originalQrImageUrl = (table) => {
     const value = String(table?.qr_image_url || "");
     if (!value.startsWith(OUTDOOR_TABLE_PREFIX)) return value || null;
@@ -1032,6 +1036,7 @@ const App = (() => {
   };
 
   const loadClientSnapshot = async () => {
+    void refreshClientPosData();
     if (!state.currentSession) return;
     const snapshot = await dbQuiet(
       state.sb.rpc("getClientSnapshot", {
@@ -1352,8 +1357,9 @@ const App = (() => {
       ? `
         <div class="account-head">
           <span>${icon("receipt", 18)} Cuenta actual</span>
-          <strong>${money(subtotal)}</strong>
+          <strong>${money(Math.max(0,subtotal-sessionPaid(state.currentSession)))}</strong>
         </div>
+        ${sessionPaid(state.currentSession) ? `<div class="account-abono-summary">Consumo: ${money(subtotal)} · Abonos: −${money(sessionPaid(state.currentSession))}</div>` : ""}
         <div class="account-list">
           ${[...state.sessionItems]
             .sort((left, right) => new Date(right.created_at || right.updated_at || 0) - new Date(left.created_at || left.updated_at || 0))
@@ -1367,6 +1373,7 @@ const App = (() => {
             )
             .join("")}
         </div>
+        ${abonoRowsHtml(state.currentSession)}
       `
       : emptyState("Sin consumos", "Agrega platos o llama al mesero para ordenar.", "shopping-bag");
     refreshIcons();
@@ -1702,6 +1709,7 @@ const App = (() => {
       await hydrateSelectedTable(state.currentTable.id);
       state.localBillOpen = true;
       renderBillChat();
+      void refreshClientPosData();
     } finally {
       button?.classList.remove("is-pending");
     }
@@ -1906,6 +1914,185 @@ const App = (() => {
     breb: "Bre-B",
     mixed: "Pago mixto"
   }[method] || "Pago");
+
+  const CASH_DRAWER_SETTINGS_KEY = "tienda-napoles-cash-drawer-printer-v1";
+  const cashDrawerRequest = async (method, body) => {
+    const response = await fetch(location.hostname === "127.0.0.1" ? "/__tienda_napoles_drawer" : "http://127.0.0.1:8766/__tienda_napoles_drawer", {
+      method,
+      cache: "no-store",
+      signal: AbortSignal.timeout(2500),
+      headers: { "X-Tienda-Napoles-Drawer": "1", ...(body ? { "Content-Type": "application/json" } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {})
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "No se pudo conectar con el controlador local de caja.");
+    return data;
+  };
+
+  const configureCashDrawer = async () => {
+    const dialog = $("#cashDrawerDialog");
+    const form = $("#cashDrawerForm");
+    if (!dialog || !form) return;
+    try {
+      const data = await cashDrawerRequest("GET");
+      const printers = Array.isArray(data.printers) ? data.printers : [];
+      if (!printers.length) throw new Error("Windows no tiene impresoras instaladas. Instala primero el controlador de la impresora POS.");
+      const printerField = form.elements.namedItem("printer");
+      const pinField = form.elements.namedItem("pin");
+      printerField.innerHTML = printers.map((name) => `<option value="${escapeHTML(name)}">${escapeHTML(name)}</option>`).join("");
+      const saved = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null");
+      if (saved && printers.includes(saved.printer)) printerField.value = saved.printer;
+      pinField.value = saved?.pin === 1 ? "1" : "0";
+      dialog.showModal();
+    } catch (error) {
+      toast(String(error.message || error), "error", "cash-drawer-setup-failed");
+    }
+  };
+
+  const sendCashDrawerPulse = async (settings, save = false) => {
+    const button = $("#openCashDrawer");
+    if (button) button.disabled = true;
+    try {
+      await cashDrawerRequest("POST", settings);
+      if (save) { localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(settings)); void pollDrawerReceiver(); }
+      $("#cashDrawerDialog")?.close();
+      toast("Orden de apertura enviada a la impresora POS.", "ok", "cash-drawer-opened");
+      return true;
+    } catch (error) {
+      toast(String(error.message || error), "error", "cash-drawer-failed");
+      return false;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  };
+
+  const openLocalCashDrawer = async () => {
+    const bridge = window.posCashDrawer;
+    if (bridge && typeof bridge.open === "function") {
+      try {
+        const result = await bridge.open({ source: "tienda-napoles-pos", requestedAt: new Date().toISOString() });
+        if (result === false) throw new Error("El controlador rechazó la apertura.");
+        toast("Orden de apertura enviada al cajón.", "ok", "cash-drawer-opened");
+        return true;
+      } catch (error) {
+        toast(String(error?.message || "No se pudo abrir el cajón."), "error", "cash-drawer-failed");
+        return false;
+      }
+    }
+    let settings = null;
+    try { settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {}
+    if (!settings?.printer) {
+      await configureCashDrawer();
+      return false;
+    }
+    const opened = await sendCashDrawerPulse(settings);
+    if (!opened) await configureCashDrawer();
+    return opened;
+  };
+
+  const canHostCashDrawer = () => !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+  let drawerSignalChannel = null;
+  let drawerSignalReady = null;
+  let drawerSignalAuth = "";
+  const prepareDrawerSignal = () => {
+    if (!state.authToken || !state.sb?.channel) return Promise.resolve(false);
+    if (drawerSignalAuth !== state.authToken) {
+      if (drawerSignalChannel) void state.sb.removeChannel?.(drawerSignalChannel);
+      drawerSignalChannel = null; drawerSignalReady = null; drawerSignalAuth = state.authToken;
+    }
+    if (drawerSignalReady) return drawerSignalReady;
+    drawerSignalReady = new Promise((resolve) => {
+      const timer = window.setTimeout(() => resolve(false), 2000);
+      drawerSignalChannel = state.sb.channel("tienda-napoles-drawer-control", { config: { broadcast: { self: false } } })
+        .on("broadcast", { event: "wake" }, () => void pollDrawerReceiver())
+        .on("broadcast", { event: "open" }, () => void pollDrawerReceiver())
+        .subscribe((status) => {
+          if (status === "SUBSCRIBED") { window.clearTimeout(timer); resolve(true); }
+          else if (["CHANNEL_ERROR","TIMED_OUT","CLOSED"].includes(status)) { window.clearTimeout(timer); resolve(false); }
+        });
+    });
+    return drawerSignalReady;
+  };
+  let drawerReceiverBusy = false;
+  let drawerReceiverData = null;
+  let drawerOpenBusy = false;
+  const pollDrawerReceiver = async () => {
+    if (!canHostCashDrawer() || drawerReceiverBusy || !state.authToken || !state.currentUser || !navigator.onLine || !state.posFeatures?.remote_drawer) return;
+    drawerReceiverBusy = true;
+    void prepareDrawerSignal();
+    const receiverAuth = state.authToken;
+    try {
+      const local = await cashDrawerRequest("GET");
+      if (!local.settings) { try { local.settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {} }
+      if (!local.deviceId || !local.secret || !local.settings?.printer || !local.printers?.includes(local.settings.printer)) { drawerReceiverData = null; return; }
+      drawerReceiverData = local;
+      localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(local.settings));
+      const registered = await dbQuiet(state.sb.rpc("register_pos_drawer", { auth_token: state.authToken,
+        p_device_id: local.deviceId, p_secret: local.secret, p_label: local.settings.printer }), null);
+      if (!registered?.ok) return;
+      const next = await dbQuiet(state.sb.rpc("claim_pos_drawer", { auth_token: state.authToken, p_device_id: local.deviceId, p_secret: local.secret }), null);
+      if (!next?.command?.id) return;
+      if (state.authToken !== receiverAuth || !state.currentUser) return;
+      let accepted = false, error = "";
+      try { await cashDrawerRequest("POST", local.settings); accepted = true; }
+      catch (failure) { error = String(failure.message || "No se pudo enviar la orden a la impresora POS."); }
+      // A claimed command is never pulsed again, even if its acknowledgment is interrupted.
+      await retryQuiet(() => state.sb.rpc("finish_pos_drawer", { auth_token: state.authToken, p_device_id: local.deviceId,
+        p_secret: local.secret, p_command_id: next.command.id, p_accepted: accepted, p_error: error }), 3);
+      if (!accepted) toast(error, "error", "drawer-command:" + next.command.id);
+    } catch (_) { drawerReceiverData = null; }
+    finally { drawerReceiverBusy = false; }
+  };
+  const openRemoteCashDrawer = async () => {
+    const id = uid();
+    const signalReady = await prepareDrawerSignal();
+    if (signalReady) { await drawerSignalChannel.send({ type: "broadcast", event: "wake", payload: {} }); await new Promise((resolve) => setTimeout(resolve, 350)); }
+    let data = null, error = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      ({ data, error } = await state.sb.rpc("request_pos_drawer", { auth_token: state.authToken, p_command_id: id, p_device_id: drawerReceiverData?.deviceId || null }));
+      if (data?.command?.id || !signalReady || !/No hay una caja conectada/i.test(error?.message || "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 550));
+    }
+    if (error || !data?.command?.id) throw new Error(error?.message || "No hay una caja conectada.");
+    if (signalReady) await drawerSignalChannel.send({ type: "broadcast", event: "open", payload: { deviceId: data.command.device_id } });
+    toast("Orden enviada a " + (data.device || "la caja conectada") + ". Esperando confirmación…", "ok", "remote-drawer:" + id);
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      const result = await dbQuiet(state.sb.rpc("get_pos_drawer_command", { auth_token: state.authToken, p_command_id: id }), null);
+      if (result?.command?.status === "accepted") { toast("El PC de la caja confirmó la orden de apertura.", "ok", "remote-drawer:" + id); return true; }
+      if (["failed","expired"].includes(result?.command?.status)) throw new Error(result.command.error || "La caja no pudo recibir la orden. Comprueba el PC conectado.");
+    }
+    throw new Error("No se recibió confirmación de la caja. Comprueba el PC conectado antes de volver a intentarlo.");
+  };
+  const startDrawerReceiver = () => {
+    window.clearInterval(state.drawerReceiverTimer);
+    state.drawerReceiverTimer = window.setInterval(() => void pollDrawerReceiver(), 1500);
+    void prepareDrawerSignal();
+    void pollDrawerReceiver();
+  };
+
+  const openCashDrawer = async () => {
+    if (!state.currentUser || !state.authToken || drawerOpenBusy) return false;
+    drawerOpenBusy = true;
+    try {
+      if (window.posCashDrawer?.open) return await openLocalCashDrawer();
+      if (drawerReceiverData?.settings) return await sendCashDrawerPulse(drawerReceiverData.settings);
+      let local = null;
+      if (canHostCashDrawer()) { try { local = await cashDrawerRequest("GET"); } catch (_) {} }
+      if (local && !local.settings) { try { local.settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {} }
+      if (local?.settings?.printer && local.printers?.includes(local.settings.printer)) {
+        drawerReceiverData = local;
+        return await sendCashDrawerPulse(local.settings);
+      }
+      if (state.posFeatures?.remote_drawer && navigator.onLine) {
+        try { return await openRemoteCashDrawer(); }
+        catch (error) { if (!local?.printers?.length) { toast(error.message, "error", "remote-drawer-failed"); return false; } }
+      }
+      if (local?.printers?.length) { await configureCashDrawer(); return false; }
+      toast("No hay una caja conectada. Abre el offline en el PC de la caja, configura la impresora e inicia sesión.", "error", "cash-drawer-unavailable");
+      return false;
+    } finally { drawerOpenBusy = false; }
+  };
 
   const getAppsScriptUrl = () => String(APPS_SCRIPT_CONFIG.webAppUrl || "").trim();
 
@@ -2972,11 +3159,13 @@ const App = (() => {
       assistantSay("bot", "Primero selecciona tu mesa para poder enviar la canción.");
       return;
     }
+    const queuedSongs = state.clientRequests.filter((row) => isSongRequest(row) && ["sending","pending"].includes(row.status));
+    if (queuedSongs.length >= 5) { assistantSay("bot", "Puedes pedir máximo 5 canciones por turno. Espera a que termine tu turno."); return; }
     const request = await createServiceNotification(
       "other",
       `${tableLabel(state.currentTable)} solicita la canción: ${song}`
     );
-    if (request) assistantSay("bot", `Listo. La canción “${song}” fue solicitada al equipo.`);
+    if (request) { assistantSay("bot", `La canción “${song}” fue solicitada. Puedes pedir máximo 5 por turno; tu posición aparecerá al confirmarse el envío.`); void refreshClientPosData(); }
   };
 
   const addItemToSession = async (itemId) => {
@@ -3580,6 +3769,8 @@ const App = (() => {
 
   const loadAdminData = async () => {
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
+    if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
+    else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
         db(
@@ -3605,6 +3796,7 @@ const App = (() => {
         session.id,
         session.status,
         session.updated_at,
+        session.session_payments,
         ...(session.session_items || []).map((item) => [item.id, item.status, item.quantity, item.updated_at])
       ])
     ]);
@@ -3681,6 +3873,106 @@ const App = (() => {
 
   const sessionTotal = (session) => sessionTotals(session).total;
 
+  const sessionPayments = (session) => [...new Map((session?.session_payments || []).map((row) => [row.id, row])).values()];
+  const sessionPaid = (session) => sessionPayments(session).reduce((sum, row) => sum + integerMoney(row.amount), 0);
+  const sessionBalance = (session) => Math.max(0, sessionTotal(session) - sessionPaid(session));
+  const aggregateAccountPayments = (session, finalPayments) => {
+    const totals = new Map();
+    [...sessionPayments(session).map((row) => ({ method: row.payment_method, amount: row.amount })), ...finalPayments]
+      .forEach((row) => totals.set(row.method, (totals.get(row.method) || 0) + integerMoney(row.amount)));
+    return [...totals].filter(([, amount]) => amount > 0).map(([method, amount]) => ({ method, amount }));
+  };
+  const abonoRowsHtml = (session) => sessionPayments(session).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
+    .map((row) => '<div class="account-abono-line"><div><strong>Abono · ' + escapeHTML(paymentMethodLabel(row.payment_method)) + '</strong><small>'
+      + escapeHTML(new Date(row.created_at).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "medium" }))
+      + (row.reference ? ' · ' + escapeHTML(row.reference) : '') + (row._offline_pending ? ' · Pendiente de sincronizar' : '')
+      + '</small></div><strong>−' + money(row.amount) + '</strong></div>').join('');
+
+  const openAbonoDialog = (sessionId) => {
+    const session = state.sessions.find((row) => row.id === sessionId);
+    const form = $("#abonoForm"), dialog = $("#abonoDialog");
+    if (!session || !form || !dialog) return;
+    if (!state.posFeatures?.abonos) { toast("Primero activa los abonos ejecutando la migración SQL en Supabase y actualiza la sesión.", "error", "abonos-backend"); return; }
+    if (sessionBalance(session) <= 0) { toast("Esta cuenta no tiene saldo pendiente.", "error"); return; }
+    form.reset(); form.session_id.value = session.id;
+    $("#abonoTitle").textContent = "Abonar a " + sessionLabel(session);
+    $("#abonoBalance").textContent = "Saldo pendiente: " + money(sessionBalance(session));
+    dialog.showModal(); setTimeout(() => form.amount.focus(), 0);
+  };
+  const recordAbono = async (form) => {
+    if (form.dataset.saving === "1") return;
+    const session = state.sessions.find((row) => row.id === form.session_id.value);
+    const amount = currencyInputNumber(form.amount);
+    if (!session || amount <= 0 || amount > sessionBalance(session)) { toast("El abono debe ser mayor a cero y no superar el saldo pendiente.", "error"); return; }
+    const id = form.dataset.paymentId || uid(); form.dataset.paymentId = id;
+    form.dataset.saving = "1"; const button = form.querySelector('[type="submit"]'); button.disabled = true;
+    try {
+      const { data, error } = await state.sb.rpc("record_session_payment", { auth_token: state.authToken, payment_id: id,
+        p_session_id: session.id, p_amount: amount, p_method: form.payment_method.value, p_reference: form.reference.value.trim(), p_created_at: new Date().toISOString() });
+      if (error || !data?.payment) { toast(error?.message || "El abono no pudo guardarse. La cuenta conserva su saldo.", "error", "abono-failed"); return; }
+      session.session_payments = [...sessionPayments(session).filter((row) => row.id !== id), data.payment];
+      if (typeof persistOfflineAdminSnapshot === "function") persistOfflineAdminSnapshot();
+      if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
+      delete form.dataset.paymentId; $("#abonoDialog")?.close();
+      state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
+      renderAdminLive(); renderAccountDetail();
+      if ($("#consumptionDialog")?.open && $("#consumptionForm")?.session_id?.value === session.id) {
+        const wasVisible = !$("#tableConsumptionPreview")?.hidden;
+        renderTableConsumptionPreview(session);
+        if (wasVisible) setTableConsumptionPreviewVisible(true);
+      }
+      toast("Abono guardado: " + money(amount) + ". Saldo: " + money(sessionBalance(session)), "ok", "abono:" + id);
+      if (form.payment_method.value === "cash") void openCashDrawer();
+    } catch (error) {
+      toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
+    } finally { delete form.dataset.saving; button.disabled = false; }
+  };
+  let clientPosReadBusy = false;
+  const refreshClientPosData = async () => {
+    if (!state.currentTable || clientPosReadBusy) return;
+    clientPosReadBusy = true;
+    try {
+      const table = state.currentTable;
+      const sessionId = state.currentSession?.id || "";
+      const [queue, payments] = await Promise.all([
+        dbQuiet(state.sb.rpc("get_service_request_queue", { p_table_id: table.id, p_table_access_code: tableCode(table) }), null),
+        state.currentSession ? dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: state.currentSession.id,
+          p_table_id: table.id, p_table_access_code: tableCode(table), auth_token: "" }), null) : null
+      ]);
+      if (state.currentTable?.id !== table.id) return;
+      state.clientQueuePositions = Array.isArray(queue?.requests) ? queue.requests : [];
+      if (payments && state.currentSession?.id === sessionId) state.currentSession.session_payments = payments.payments || [];
+      renderClientQueue(); renderAccount();
+    } finally { clientPosReadBusy = false; }
+  };
+  const renderClientQueue = () => {
+    const box = $("#clientQueueStatus"); if (!box) return;
+    const rows = state.clientQueuePositions || [];
+    const groups = new Map(); rows.forEach((row) => groups.set(row.kind, row));
+    box.hidden = !groups.size;
+    box.innerHTML = [...groups].map(([kind,row]) => '<div><strong>' + (kind === "song" ? "Canciones" : "Solicitudes")
+      + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position)-1) + ' turno(s) antes del tuyo.')
+      + (kind === "song" ? ' · ' + rows.filter((entry) => entry.kind === "song").length + '/5 canciones en este turno.' : '') + '</small></div>').join('');
+  };
+  const bindAccountFeatures = () => {
+    $("#abonoForm")?.addEventListener("submit", (event) => { event.preventDefault(); void recordAbono(event.currentTarget); });
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-abono-session]"); if (button) openAbonoDialog(button.dataset.abonoSession);
+      if (event.target.closest("#abonoTableAccount")) openAbonoDialog($("#consumptionForm")?.session_id?.value || "");
+    });
+    let lastNumpadZero = 0;
+    document.addEventListener("keydown", (event) => {
+      if (event.code !== "Numpad0" || event.key !== "0" || event.repeat || event.ctrlKey || event.altKey || event.metaKey
+        || document.querySelector("dialog[open], [aria-modal='true']")
+        || event.target.closest?.("input,textarea,select,[contenteditable]")
+        || document.activeElement?.closest?.("input,textarea,select,[contenteditable]")) { lastNumpadZero = 0; return; }
+      const now = Date.now();
+      if (lastNumpadZero && now-lastNumpadZero <= 450) { lastNumpadZero = 0; event.preventDefault(); void openCashDrawer(); }
+      else lastNumpadZero = now;
+    });
+    document.addEventListener("focusin", () => { lastNumpadZero = 0; });
+  };
+
   const newestSessionItems = (session) => [...(session?.session_items || [])]
     .filter((item) => item.status !== "cancelled")
     .sort((left, right) => {
@@ -3711,7 +4003,7 @@ const App = (() => {
 
   const groupedActiveRequests = () => {
     const groups = new Map();
-    activeRequests().forEach((request) => {
+    [...activeRequests()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id))).forEach((request) => {
       const kind = requestKind(request);
       const key = `${request.table_id}:${request.session_id || "no-session"}:${kind}`;
       if (!groups.has(key)) {
@@ -3720,6 +4012,7 @@ const App = (() => {
       const group = groups.get(key);
       group.request_ids.push(request.id);
       group.count += 1;
+      if (kind === "song" && group.count > 1) { group.message += "\n" + (request.message || ""); group.latest_message = group.message; }
     });
     return Array.from(groups.values());
   };
@@ -3879,6 +4172,58 @@ const App = (() => {
     })();
   };
 
+  const renderOutdoorTableConfigurator = () => {
+    const selector = $("#outdoorTableSelector");
+    const from = $("#outdoorTableFrom");
+    const to = $("#outdoorTableTo");
+    if (!selector || !from || !to) return;
+    const tables = normalTables()
+      .filter((table) => table.is_active !== false)
+      .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+    const validIds = new Set(tables.map((table) => String(table.id)));
+    if (!(state.outdoorTableDraftIds instanceof Set)) {
+      state.outdoorTableDraftIds = new Set(tables.filter(isOutdoorTable).map((table) => String(table.id)));
+    } else {
+      state.outdoorTableDraftIds = new Set([...state.outdoorTableDraftIds].filter((id) => validIds.has(String(id))));
+    }
+    const options = tables.map((table) => `<option value="${escapeHTML(table.id)}">M${escapeHTML(table.table_number)} · ${escapeHTML(table.table_name || "Mesa")}</option>`).join("");
+    const previousFrom = from.value;
+    const previousTo = to.value;
+    from.innerHTML = options || '<option value="">Sin mesas</option>';
+    to.innerHTML = options || '<option value="">Sin mesas</option>';
+    if (validIds.has(previousFrom)) from.value = previousFrom;
+    if (validIds.has(previousTo)) to.value = previousTo;
+    else if (tables.length) to.value = String(tables[tables.length - 1].id);
+    selector.innerHTML = tables.length
+      ? tables.map((table) => `
+          <label class="outdoor-table-option">
+            <input type="checkbox" data-outdoor-table="${escapeHTML(table.id)}" ${state.outdoorTableDraftIds.has(String(table.id)) ? "checked" : ""}>
+            <span>${icon("armchair", 16)} M${escapeHTML(table.table_number)}</span>
+          </label>`).join("")
+      : emptyState("Sin mesas", "Crea una mesa para poder asignar su ubicación.", "armchair");
+    const status = $("#tableZoneSettingStatus");
+    if (status) {
+      const count = state.outdoorTableDraftIds.size;
+      status.textContent = count
+        ? `${count} mesa${count === 1 ? "" : "s"} marcada${count === 1 ? "" : "s"} como afuera. Las demás se consideran de adentro.`
+        : "Todas las mesas están configuradas como mesas de adentro.";
+    }
+    refreshIcons();
+  };
+
+  const saveOutdoorChoice = async () => {
+    const ids = state.outdoorTableDraftIds || new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
+    const changed = normalTables().filter((table) => isOutdoorTable(table) !== ids.has(String(table.id)));
+    for (const table of changed) {
+      const saved = await retryQuiet(() => state.sb.from("restaurant_tables").update({ is_outdoor: ids.has(String(table.id)), qr_image_url: outdoorQrImageValue(table, ids.has(String(table.id))) }).eq("id", table.id).select("*").single(), 3);
+      if (!saved) { toast("No se pudo guardar la ubicación de " + tableLabel(table) + ". Intenta nuevamente.", "error"); return false; }
+      state.tables = state.tables.map((row) => row.id === table.id ? saved : row);
+    }
+    state.outdoorTableDraftDirty = false;
+    renderTables(); renderServiceTables(); renderOutdoorTableConfigurator();
+    return true;
+  };
+
   const renderBusinessForm = () => {
     const form = $("#businessForm");
     if (!form) return;
@@ -3886,6 +4231,7 @@ const App = (() => {
     form.subtitle.value = state.business?.subtitle || "";
     form.accent_color.value = state.business?.accent_color || "#f05a28";
     form.currency.value = DEFAULT_CURRENCY;
+    renderOutdoorTableConfigurator();
     form.tips_enabled.checked = tipsEnabled();
     form.qr_regeneration_enabled.checked = qrRegenerationEnabled();
     form.tip_percentage.value = String(state.tipSettings?.percentage || 10);
@@ -5819,8 +6165,8 @@ const App = (() => {
       return;
     }
     const items = newestSessionItems(session);
-    const total = sessionTotal(session);
-    const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(total) : 0;
+    const total = sessionBalance(session);
+    const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(sessionTotal(session)) : 0;
     const suggestedTotal = total + suggestedTip;
     const opened = accountDateParts(session);
     const billRequest = state.requests.find((request) => request.session_id === session.id && request.request_type === "bill");
@@ -5848,9 +6194,12 @@ const App = (() => {
             </div>`).join("") || `<div class="invoice-empty">${icon("clipboard-list", 18)} Sin consumos registrados</div>`}
         </div>
         ${suggestedTip ? `<div class="account-detail-tip"><span><small>Propina voluntaria (${state.tipSettings.percentage}%)</small><strong>${money(suggestedTip)}</strong></span><span><small>Total sugerido con propina</small><strong>${money(suggestedTotal)}</strong></span></div>` : ""}
-        <div class="account-detail-total"><span>Total del consumo</span><strong>${money(total)}</strong></div>
+        ${abonoRowsHtml(session)}
+        ${sessionPaid(session) ? `<div class="account-detail-total"><span>Consumo / abonado</span><strong>${money(sessionTotal(session))} / −${money(sessionPaid(session))}</strong></div>` : ""}
+        <div class="account-detail-total"><span>Saldo pendiente</span><strong>${money(total)}</strong></div>
       </div>
       <div class="invoice-actions account-detail-actions">
+        ${items.length ? `<button class="ghost abono-button" type="button" data-abono-session="${session.id}">${icon("hand-coins", 16)} Abonar</button>` : ""}
         ${items.length ? `<button class="ghost small" type="button" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>` : `<button class="ghost small danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 15)} Liberar mesa</button>`}
         ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" type="button" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
         ${items.length ? `<button class="ghost small" type="button" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>` : ""}
@@ -5868,11 +6217,30 @@ const App = (() => {
     if (!dialog.open) dialog.showModal();
   };
 
+  const compareAccountNumbers = (left, right) => {
+    const table = (session) => state.tables.find((row) => String(row.id) === String(session.table_id)) || session.restaurant_tables;
+    const number = (session) => Number(String(sessionLabel(session)).match(/\d+/)?.[0] || table(session)?.table_number || Number.MAX_SAFE_INTEGER);
+    return number(left) - number(right) || sessionLabel(left).localeCompare(sessionLabel(right), "es", { numeric: true }) || String(left.opened_at || "").localeCompare(String(right.opened_at || ""));
+  };
+  const matchesAccountSearch = (session, query) => {
+    const normalized = normalizeText(query).trim();
+    if (!normalized) return true;
+    const digits = normalized.match(/^(?:mesa\s*|m\s*)?(\d+)$/);
+    if (digits) {
+      const table = state.tables.find((row) => String(row.id) === String(session.table_id)) || session.restaurant_tables;
+      const number = String(sessionLabel(session)).match(/\d+/)?.[0] || String(table?.table_number || "");
+      return Number(number) === Number(digits[1]);
+    }
+    return normalizeText(sessionLabel(session)).includes(normalized);
+  };
+
   const renderAccounts = () => {
     const box = $("#accountsPanel");
     if (!box) return;
-    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session));
+    const accountSearch = $("#accountsSearch")?.value || "";
+    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session) && matchesAccountSearch(session, accountSearch)).sort(compareAccountNumbers);
     const renderSignature = JSON.stringify([
+      accountSearch,
       state.business?.tax_rate,
       state.business?.service_fee,
       state.tipSettings?.enabled,
@@ -5883,6 +6251,8 @@ const App = (() => {
         session.payer_name,
         session.assigned_waiter_id,
         session.assigned_waiter?.full_name,
+        session.session_payments,
+        sessionLabel(session),
         (session.session_items || []).map((item) => [
           item.id, item.item_name, item.quantity, item.unit_price, item.notes, item.status, item.updated_at
         ])
@@ -5894,16 +6264,18 @@ const App = (() => {
       ? accountSessions
           .map((session) => {
             const items = newestSessionItems(session);
-            const total = sessionTotal(session);
-            const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(total) : 0;
+            const total = sessionBalance(session);
+            const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(sessionTotal(session)) : 0;
             const opened = accountDateParts(session);
             return `
               <article class="account-summary-card ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
                 <div class="account-summary-head"><div><span>${escapeHTML(sessionLabel(session))}</span><small>#${sessionReference(session)}</small></div><span class="account-summary-status">${items.length ? `${items.length} ${items.length === 1 ? "consumo" : "consumos"}` : "Cuenta en $0"}</span></div>
-                <div class="account-summary-total"><small>Total actual</small><strong>${money(total)}</strong></div>
+                <div class="account-summary-total"><small>Saldo pendiente</small><strong>${money(total)}</strong></div>
+                ${sessionPaid(session) ? `<div class="account-abono-summary">Abonado: −${money(sessionPaid(session))} · Consumo: ${money(sessionTotal(session))}</div>` : ""}
                 ${suggestedTip ? `<div class="account-summary-tip"><span>Propina voluntaria (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong><small>Total sugerido: ${money(total + suggestedTip)}</small></div>` : ""}
                 <div class="account-summary-meta"><span>${icon("user-round", 15)} ${escapeHTML(session.payer_name || "Por definir")}</span><span>${icon("contact", 15)} ${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</span><span>${icon("clock-3", 15)} ${opened.date} · ${opened.time}</span></div>
                 <div class="account-summary-actions">
+                  ${items.length ? `<button class="ghost abono-button" type="button" data-abono-session="${session.id}">${icon("hand-coins",16)} Abonar</button>` : ""}
                   <button class="ghost" type="button" data-view-account="${session.id}">${icon("list-collapse", 16)} Ver desglose</button>
                   ${items.length ? `<button class="primary" type="button" data-charge-session="${session.id}">${icon("badge-dollar-sign", 16)} Cobrar</button>` : `<button class="ghost danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 16)} Liberar mesa</button>`}
                 </div>
@@ -5911,7 +6283,7 @@ const App = (() => {
             `;
           })
           .join("")
-      : emptyState("No hay cuentas abiertas", "Las mesas con consumos apareceran aqui.", "receipt-text");
+      : emptyState(accountSearch ? "No hay cuentas que coincidan" : "No hay cuentas abiertas", accountSearch ? "Busca por Mesa y número, o solo por el número." : "Las mesas con consumos apareceran aqui.", "receipt-text");
     if (state.activeAccountDetailId) renderAccountDetail();
     refreshIcons();
   };
@@ -6094,6 +6466,7 @@ const App = (() => {
       table_name: form.table_name.value.trim().toLocaleUpperCase("es-CO") || null,
       qr_code: currentTable?.qr_code || `mesa-${number}`,
       qr_image_url: outdoorQrImageValue(currentTable, form.is_outdoor.checked),
+      is_outdoor: form.is_outdoor.checked,
       is_active: form.is_active.checked
     };
     if (!payload.table_number) {
@@ -6359,10 +6732,13 @@ const App = (() => {
     toast(`Cuenta movida a ${tableLabel(table)}.`, "ok", `moved-table:${sessionId}`);
   };
 
-  const closeSession = async (id) => {
+  const closeSession = async (id, checkout = null) => {
     const session = state.sessions.find((entry) => entry.id === id);
     if (!session) return null;
     const totals = sessionTotals(session);
+    if (checkout && (Number(checkout.totals.total) !== Number(totals.total) || checkout.paid !== sessionPaid(session))) {
+      toast("La cuenta cambió durante el cobro. Actualiza y revisa el saldo.", "error", "close-session-changed"); return null;
+    }
     if (isLocalWalkInSession(session)) {
       const closedAt = new Date().toISOString();
       const saved = {
@@ -6389,18 +6765,18 @@ const App = (() => {
     state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
     renderAdminLive();
     const closedAt = new Date().toISOString();
-    let saved = await retryQuiet(
-      () => state.sb.from("table_sessions").update({
-        status: "closed",
-        closed_at: closedAt,
-        subtotal: totals.subtotal,
-        discount: totals.discount,
-        tax: totals.tax,
-        service_fee: totals.serviceFee,
-        total: totals.total
-      }).eq("id", id).eq("status", "open").select("*").single(),
-      4
-    );
+    const closure = { status: "closed", closed_at: closedAt, subtotal: totals.subtotal,
+      discount: totals.discount, tax: totals.tax, service_fee: totals.serviceFee, total: totals.total };
+    let saved;
+    if (state.posFeatures?.abonos) {
+      const result = await retryQuiet(() => state.sb.rpc("replay_table_session_change", {
+        auth_token: state.authToken, p_session_id: id, p_patch: closure,
+        p_expected_status: "open", p_expected_paid: checkout?.paid ?? sessionPaid(session)
+      }), 4);
+      saved = result?.session || null;
+    } else {
+      saved = await retryQuiet(() => state.sb.from("table_sessions").update(closure).eq("id",id).eq("status","open").select("*").single(), 4);
+    }
     if (!saved) {
       const confirmed = await dbQuiet(state.sb.from("table_sessions").select("*").eq("id", id).maybeSingle(), null);
       if (confirmed?.status === "closed" && String(confirmed.closed_at || "") === closedAt) saved = confirmed;
@@ -6436,8 +6812,8 @@ const App = (() => {
       <html lang="es"><head><meta charset="utf-8"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
       <style>
         @page { size: 80mm auto; margin: 3mm; }
-        * { box-sizing: border-box; }
-        body { width: 72mm; margin: 0 auto; color: #000; background: #fff; font: 12px/1.35 "Courier New", monospace; }
+        * { box-sizing: border-box; color: #000; font-weight: 800; }
+        body { width: 72mm; margin: 0 auto; color: #000; background: #fff; font: 800 12px/1.35 "Courier New", monospace; }
         .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
         .subtitle, .center { text-align: center; }
         .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
@@ -6445,7 +6821,12 @@ const App = (() => {
         .meta, .totals { display: grid; grid-template-columns: 1fr auto; gap: 1mm 3mm; }
         .items { display: grid; gap: 2mm; }
         .item { display: grid; grid-template-columns: 1fr auto; gap: 2mm; }
-        .item small { display: block; }
+        .item small { display: block; font-weight: 800; }
+        strong { font-weight: 900; }
+        .meta > *, .totals > *, .item > * { min-width: 0; overflow-wrap: anywhere; }
+        .totals strong, .item > strong { white-space: nowrap; }
+        .meta, .totals, .item { grid-template-columns: minmax(0, 1fr) max-content; }
+        @media print { body { margin: 0 auto; padding: 0; width: 72mm; color: #000 !important; font-weight: 800 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
         .total { margin-top: 1.5mm; font-size: 16px; font-weight: 900; }
         .paid { padding: 1.5mm; border: 2px solid #000; text-align: center; font-weight: 900; }
         .footer { margin-top: 3mm; text-align: center; }
@@ -6475,16 +6856,17 @@ const App = (() => {
           ${totals.discount ? `<span>Descuento</span><strong>-${money(totals.discount)}</strong>` : ""}
           ${totals.tax ? `<span>Impuestos</span><strong>${money(totals.tax)}</strong>` : ""}
           ${totals.serviceFee ? `<span>Servicio</span><strong>${money(totals.serviceFee)}</strong>` : ""}
-          ${chargedTip ? `<span>Propina voluntaria (${Number(invoice.tipPercentage || 0)}%)</span><strong>${money(chargedTip)}</strong>` : ""}
+          ${chargedTip ? `<span>Propina voluntaria${invoice.tipPercentage ? ` (${Number(invoice.tipPercentage)}%)` : ""}</span><strong>${money(chargedTip)}</strong>` : ""}
           ${suggestedTip ? `<span>Propina voluntaria sugerida (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong>` : ""}
+          ${(invoice?.prepayments?.length || sessionPaid(session)) ? `<span>Abonos previos</span><strong>−${money((invoice?.prepayments || sessionPayments(session)).reduce((sum,row) => sum + Number(row.amount || 0),0))}</strong><span>Saldo ${isPaid ? "cobrado al cierre" : "pendiente"}</span><strong>${money(invoice?.remainingPaid ?? Math.max(0,receiptTotal-sessionPaid(session)))}</strong>` : ""}
           <span class="total">${suggestedTip ? "TOTAL SUGERIDO" : "TOTAL"}</span><strong class="total">${money(receiptTotal)}</strong>
         </div>
         ${suggestedTip ? `<p class="center"><strong>La propina es voluntaria.</strong><br>El cliente puede pagar el consumo sin propina: ${money(baseTotal)}.</p>` : ""}
-        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
+        ${isPaid && invoice.prepayments?.length ? `<div class="rule"></div><div class="center">ABONOS REGISTRADOS</div>${invoice.prepayments.map((row) => `<div class="meta"><span>${escapeHTML(new Date(row.created_at).toLocaleString("es-CO"))} · ${escapeHTML(paymentMethodLabel(row.payment_method))}</span><strong>${money(row.amount)}</strong></div>`).join("")}` : ""}
+        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
         <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
-        ${isPaid ? `<div class="devnex-credit"><strong>Devnex Soluciones Tecnologicas - Devnex.tech</strong><span class="devnex-contact"><svg viewBox="0 0 24 24" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="5"></rect><circle cx="12" cy="12" r="4"></circle><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"></circle></svg>3246394689</span></div>` : ""}
-        <script>window.onload=function(){setTimeout(function(){window.print()},250)}<\/script>
+        ${isPaid ? `<div class="devnex-credit"><strong>Devnex Soluciones Tecnologicas - Devnex.tech</strong><span class="devnex-contact"><svg viewBox="0 0 24 24" aria-label="Instagram"><rect width="18" height="18" x="3" y="3" rx="5"></rect><circle cx="12" cy="12" r="4"></circle><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"></circle></svg>3246394689 <svg viewBox="0 0 24 24" aria-label="WhatsApp"><path d="M20.5 11.6a8.6 8.6 0 0 1-12.7 7.6L3 20.5l1.3-4.7a8.6 8.6 0 1 1 16.2-4.2Z"></path><path d="M8 7.5c-.8 1.2-.2 3.3 1.8 5.3s4.1 2.6 5.3 1.8l.5-1.7-2.2-1-1 1c-1.2-.5-2.6-1.9-3.1-3.1l1-1-1-2.2Z"></path></svg></span></div>` : ""}
       </body></html>`;
   };
 
@@ -6497,6 +6879,41 @@ const App = (() => {
     popup.document.open();
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();
+    const receiptDocument = popup.document;
+    const waitForReceiptLoad = () => {
+      if (receiptDocument.readyState === "complete") return Promise.resolve();
+      return new Promise((resolve) => {
+        const complete = () => {
+          if (receiptDocument.readyState !== "complete") return;
+          popup.removeEventListener("load", complete);
+          receiptDocument.removeEventListener("readystatechange", complete);
+          resolve();
+        };
+        popup.addEventListener("load", complete, { once: true });
+        receiptDocument.addEventListener("readystatechange", complete);
+      });
+    };
+    const printWhenReady = async () => {
+      await waitForReceiptLoad();
+      try {
+        if (receiptDocument.fonts?.ready) await receiptDocument.fonts.ready;
+        const images = Array.from(receiptDocument.images || []);
+        await Promise.all(images.map((image) => {
+          if (image.complete) return image.decode?.().catch(() => undefined);
+          return new Promise((resolve) => {
+            image.addEventListener("load", resolve, { once: true });
+            image.addEventListener("error", resolve, { once: true });
+          });
+        }));
+        await new Promise((resolve) => popup.requestAnimationFrame(() => popup.requestAnimationFrame(resolve)));
+      } finally {
+        if (!popup.closed) {
+          popup.focus();
+          popup.print();
+        }
+      }
+    };
+    void printWhenReady();
     return true;
   };
 
@@ -6544,9 +6961,12 @@ const App = (() => {
     const enabled = tipsEnabled();
     const choice = form.tip_choice?.value || "";
     const tip = enabled && choice === "with" ? tipAmountFor(baseTotal) : 0;
-    const total = baseTotal + tip;
+    const activeSession = state.sessions.find((row) => row.id === form.session_id.value);
+    const paid = sessionPaid(activeSession);
+    const total = Math.max(0, baseTotal + tip - paid);
     state.activePaymentTip = tip;
     state.activePaymentTotal = total;
+    if ($("#paymentAbonoSummary")) $("#paymentAbonoSummary").textContent = paid ? "Consumo: " + money(baseTotal) + " · Abonos: −" + money(paid) + " · Saldo por cobrar: " + money(total) : "";
     if ($("#paymentTotal")) $("#paymentTotal").textContent = money(total);
     if ($("#paymentTotalHint")) $("#paymentTotalHint").textContent = enabled && !choice
       ? "Selecciona si el cliente paga con o sin propina para continuar."
@@ -6709,12 +7129,13 @@ const App = (() => {
     return printThermalReceipt(receipt.session, receipt.invoice);
   };
 
-  const printIncomeReceipt = (saleId) => {
+  const printIncomeReceipt = async (saleId) => {
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     if (!record) {
       toast("No se encontro la venta para imprimir.", "error", `income-receipt-missing:${saleId}`);
       return false;
     }
+    const receiptWindow = window.open("", "_blank", "width=420,height=720");
     const storedInvoice = state.invoiceHistory.find((entry) => String(entry.id || entry.sessionId) === String(record.saleId));
     const tableName = String(record.table || storedInvoice?.table || "Venta individual").trim() || "Venta individual";
     const isWalkIn = normalizeText(tableName) === "venta individual";
@@ -6766,7 +7187,24 @@ const App = (() => {
       restaurant_tables: isWalkIn ? null : { table_name: tableName },
       session_items: items
     };
-    return printThermalReceipt(session, invoice);
+    const ledger = invoice.sessionId ? await dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: invoice.sessionId, auth_token: state.authToken }), null) : null;
+    if (ledger?.payments?.length) { invoice.prepayments = ledger.payments; invoice.remainingPaid = Math.max(0, Number(invoice.totals.total || 0) - ledger.payments.reduce((sum,row) => sum + Number(row.amount || 0),0)); }
+    return printThermalReceipt(session, invoice, receiptWindow);
+  };
+
+  const bindPaymentConfirmShortcut = () => {
+    const dialog = $("#paymentDialog");
+    const form = $("#paymentForm");
+    const save = form?.querySelector('button[type="submit"][value="save"]');
+    if (!dialog || !form || !save) return;
+    dialog.addEventListener("keydown", (event) => {
+      if (!dialog.open || event.isComposing || event.ctrlKey || event.altKey || event.metaKey
+        || (event.key !== "Enter" && event.code !== "NumpadEnter")) return;
+      // Evita que Enter active Imprimir si ese boton conserva el foco.
+      event.preventDefault();
+      if (event.repeat || state.paymentProcessing || save.disabled) return;
+      form.requestSubmit(save);
+    }, { capture: true });
   };
 
   const processPayment = async (form, submitter) => {
@@ -6779,6 +7217,16 @@ const App = (() => {
     if (!(session.session_items || []).some((item) => item.status !== "cancelled")) {
       toast("Agrega al menos un producto antes de cobrar.", "error", `empty-payment:${session.id}`);
       return;
+    }
+    const checkoutPaid = sessionPaid(session);
+    const checkoutBase = integerMoney(sessionTotals(session).total);
+    if (checkoutPaid > checkoutBase) { toast("Los abonos superan el consumo actual. Revisa la cuenta antes de cobrar.", "error", "payment-credit"); return; }
+    const expectedBalance = Math.max(0, checkoutBase + Number(state.activePaymentTip || 0) - checkoutPaid);
+    if ((state.activePaymentBase != null && checkoutBase !== state.activePaymentBase) || expectedBalance !== integerMoney(state.activePaymentTotal)) {
+      state.activePaymentBase = checkoutBase; updatePaymentTipChoice();
+      const lines = $("#paymentSaleLines");
+      if (lines) lines.innerHTML = (session.session_items || []).filter((row) => row.status !== "cancelled").map((row) => '<div><span>' + row.quantity + ' × ' + escapeHTML(row.item_name) + '</span><strong>' + money(Number(row.quantity) * Number(row.unit_price)) + '</strong></div>').join('');
+      toast("La cuenta cambió en otra sesión. Revisa el saldo actualizado y confirma nuevamente.", "error", "payment-refreshed"); return;
     }
     if (tipsEnabled() && !form.tip_choice?.value) {
       toast("Selecciona si el cliente paga con o sin propina.", "error", "tip-choice-required");
@@ -6807,7 +7255,7 @@ const App = (() => {
       state.paymentProcessing = false;
       return;
     }
-    const closed = await closeSession(session.id);
+    const closed = await closeSession(session.id, { paid: checkoutPaid, totals: sessionTotals(session) });
     buttons.forEach((button) => { button.disabled = false; });
     if (!closed) {
       receiptWindow?.close();
@@ -6834,15 +7282,17 @@ const App = (() => {
       createdAt,
       payerName: session.payer_name || "",
       waiterName: state.currentUser?.full_name || session.assigned_waiter?.full_name || "",
-      paymentMethod: payment.method,
-      payments: payment.payments,
+      paymentMethod: aggregateAccountPayments(session, payment.payments).length > 1 ? "mixed" : (aggregateAccountPayments(session, payment.payments)[0]?.method || payment.method),
+      payments: aggregateAccountPayments(session, payment.payments),
+      prepayments: sessionPayments(session),
+      remainingPaid: integerMoney(state.activePaymentTotal),
       withTip: tipAmount > 0,
       tipPercentage,
       tipAmount,
       baseTotal: integerMoney(closed.totals.total),
       reference: form.payment_reference.value.trim(),
       cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
-      changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - invoiceTotals.total : 0,
+      changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - integerMoney(state.activePaymentTotal) : 0,
       inventoryAdjustedOnConsumption: false,
       totals: invoiceTotals,
       items: (session.session_items || []).filter((item) => item.status !== "cancelled").map((item) => ({
@@ -6860,6 +7310,7 @@ const App = (() => {
     $("#paymentDialog")?.close();
     renderInventory();
     renderTips();
+    void openCashDrawer();
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
@@ -7082,6 +7533,7 @@ const App = (() => {
       return;
     }
     preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    if (session) preview.innerHTML += abonoRowsHtml(session) + (sessionPaid(session) ? `<div class="account-abono-summary">Saldo pendiente: ${money(sessionBalance(session))}</div>` : "");
     setTableConsumptionPreviewVisible(false);
   };
 
@@ -8118,10 +8570,20 @@ const App = (() => {
   };
 
   const bindAdmin = () => {
+    bindAccountFeatures();
+    $("#accountsSearch")?.addEventListener("input", () => renderAccounts());
+    $("#openCashDrawer")?.addEventListener("click", () => void openCashDrawer());
+    $("#configureCashDrawer")?.addEventListener("click", () => void configureCashDrawer());
+    $("#cashDrawerForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      await sendCashDrawerPulse({ printer: form.elements.namedItem("printer").value, pin: Number(form.elements.namedItem("pin").value) }, true);
+    });
     bindCurrencyInputs();
     $("#businessForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveBusiness(event.currentTarget);
+      await saveOutdoorChoice();
     });
     $("#businessForm")?.addEventListener("change", async (event) => {
       if (event.target.name === "qr_regeneration_enabled") {
@@ -8324,6 +8786,7 @@ const App = (() => {
       event.preventDefault();
       await processPayment(event.currentTarget, event.submitter);
     });
+    bindPaymentConfirmShortcut();
     $("#paymentForm")?.addEventListener("change", (event) => {
       if (event.target.name === "tip_choice") updatePaymentTipChoice();
       if (event.target.name === "payment_method") {
@@ -8491,6 +8954,15 @@ const App = (() => {
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
     document.addEventListener("change", async (event) => {
+      if (event.target.matches("[data-outdoor-table]")) {
+        if (!(state.outdoorTableDraftIds instanceof Set)) state.outdoorTableDraftIds = new Set();
+        const id = String(event.target.dataset.outdoorTable || "");
+        if (event.target.checked) state.outdoorTableDraftIds.add(id);
+        else state.outdoorTableDraftIds.delete(id);
+        state.outdoorTableDraftDirty = true;
+        renderOutdoorTableConfigurator();
+        return;
+      }
       if (event.target.matches("[data-user-access]")) {
         await toggleUserAccess(event.target.dataset.userAccess, event.target.checked, event.target);
         return;
@@ -8575,6 +9047,26 @@ const App = (() => {
       }
       if (target.id === "selectAllTableQrs") {
         setAllQrSelections(true);
+      }
+      if (target.id === "selectOutdoorRange" || target.id === "clearOutdoorRange") {
+        const fromId = $("#outdoorTableFrom")?.value || "";
+        const toId = $("#outdoorTableTo")?.value || "";
+        const ordered = normalTables()
+          .filter((table) => table.is_active !== false)
+          .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+        const fromIndex = ordered.findIndex((table) => String(table.id) === String(fromId));
+        const toIndex = ordered.findIndex((table) => String(table.id) === String(toId));
+        if (fromIndex >= 0 && toIndex >= 0) {
+          if (!(state.outdoorTableDraftIds instanceof Set)) state.outdoorTableDraftIds = new Set();
+          const first = Math.min(fromIndex, toIndex);
+          const last = Math.max(fromIndex, toIndex);
+          ordered.slice(first, last + 1).forEach((table) => {
+            if (target.id === "selectOutdoorRange") state.outdoorTableDraftIds.add(String(table.id));
+            else state.outdoorTableDraftIds.delete(String(table.id));
+          });
+          state.outdoorTableDraftDirty = true;
+          renderOutdoorTableConfigurator();
+        }
       }
       if (target.id === "clearTableQrs") {
         setAllQrSelections(false);

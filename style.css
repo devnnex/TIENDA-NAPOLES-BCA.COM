@@ -5154,3 +5154,72 @@ body[data-page="admin"] { overflow-x: hidden; }
       "walk-in";
   }
 }
+
+/* Búsqueda y lectura de cuentas por número. */
+.accounts-search { display: grid; gap: .45rem; max-width: 28rem; margin-bottom: 1rem; font-weight: 700; }
+.accounts-search > span { display: flex; align-items: center; gap: .6rem; }
+.accounts-search input { flex: 1; min-width: 0; }
+.account-summary-head > div > span { font-size: 1.45rem; font-weight: 900; }
+.accounts-drawer-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+
+/* Abonos y turnos compartidos. */
+.account-abono-line { display:flex; justify-content:space-between; gap:.8rem; margin:.55rem 0; padding:.85rem; background:#f2eaff; color:#5b2194; border:1px solid #d9c0f1; border-radius:12px; }
+.account-abono-line > div { display:grid; gap:.3rem; }
+.account-abono-line small { color:#65348e; }
+.account-abono-summary { color:#5b2194; font-weight:800; }
+.abono-button { color:#5b2194; border-color:#cfadeb; }
+.client-queue-status { display:grid; gap:.65rem; margin:1rem 0; padding:1rem; background:#eef4ff; border:1px solid #b6cef4; border-radius:16px; }
+.client-queue-status[hidden] { display:none; }
+.client-queue-status > div { display:grid; gap:.3rem; }
+
+.table-zone-setting-card {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: .85rem;
+  padding: 1rem;
+  border: 1px solid rgba(20, 111, 209, .22);
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(20, 111, 209, .08), rgba(255, 255, 255, .97));
+}
+.table-zone-setting-head { min-width: 0; display: flex; align-items: center; gap: .75rem; }
+.table-zone-setting-head > div { min-width: 0; display: grid; gap: .2rem; }
+.table-zone-setting-head small,
+.table-zone-setting-status { color: #667085; font-size: .75rem; line-height: 1.4; }
+.table-zone-setting-icon {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #1976dd, #0b56bc);
+  box-shadow: 0 10px 22px rgba(11, 86, 188, .2);
+}
+.table-zone-range { display: grid; grid-template-columns: minmax(120px, 180px) minmax(120px, 180px) auto; align-items: end; gap: .65rem; }
+.table-zone-range label { display: grid; gap: .35rem; color: #4f5967; font-size: .75rem; font-weight: 800; }
+.table-zone-range-actions { display: flex; align-items: center; gap: .45rem; }
+.outdoor-table-selector { display: grid; grid-template-columns: repeat(auto-fill, minmax(105px, 1fr)); gap: .55rem; }
+.outdoor-table-option { position: relative; min-width: 0; }
+.outdoor-table-option input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.outdoor-table-option span {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .42rem;
+  padding: .6rem;
+  color: #344054;
+  border: 1px solid rgba(18, 24, 31, .12);
+  border-radius: 12px;
+  background: #fff;
+  cursor: pointer;
+  font-size: .78rem;
+  font-weight: 850;
+  text-align: center;
+}
+.outdoor-table-option input:checked + span { color: #fff; border-color: #0b56bc; background: #146fd1; box-shadow: 0 0 0 3px rgba(20, 111, 209, .13); }
+.outdoor-table-option input:focus-visible + span { outline: 3px solid rgba(20, 111, 209, .28); outline-offset: 2px; }
+.table-zone-setting-status { margin: 0; }
+
+@media(max-width:600px){.table-zone-range{grid-template-columns:1fr 1fr}.table-zone-range-actions{grid-column:1/-1}}

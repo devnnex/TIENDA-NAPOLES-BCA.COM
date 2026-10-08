@@ -157,6 +157,22 @@
             <span><i data-lucide="image-up"></i> Portada</span>
             <small data-upload-status="cover_url">Seleccionar imagen</small>
           </label>
+          <div class="table-zone-setting-card wide">
+            <div class="table-zone-setting-head">
+              <span class="table-zone-setting-icon"><i data-lucide="map-pinned"></i></span>
+              <div><strong>Mesas de afuera</strong><small>Márcalas una por una o selecciona un rango. Se verán azules cuando estén libres y conservarán un borde azul cuando tengan consumo.</small></div>
+            </div>
+            <div class="table-zone-range">
+              <label>Desde<select id="outdoorTableFrom" aria-label="Primera mesa del rango"></select></label>
+              <label>Hasta<select id="outdoorTableTo" aria-label="Última mesa del rango"></select></label>
+              <div class="table-zone-range-actions">
+                <button class="ghost" id="selectOutdoorRange" type="button"><i data-lucide="tree-pine"></i> Afuera</button>
+                <button class="ghost" id="clearOutdoorRange" type="button"><i data-lucide="house"></i> Adentro</button>
+              </div>
+            </div>
+            <div class="outdoor-table-selector" id="outdoorTableSelector" aria-label="Seleccionar mesas de afuera"></div>
+            <small class="table-zone-setting-status" id="tableZoneSettingStatus">Las mesas no marcadas se consideran mesas de adentro.</small>
+          </div>
           <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar marca</button>
           <div class="tip-setting-card wide">
             <div class="tip-setting-copy">
@@ -433,6 +449,8 @@
             <h2>Cuentas abiertas</h2>
           </div>
         </div>
+        <label class="accounts-search">Buscar mesa<span><i data-lucide="search"></i><input id="accountsSearch" type="search" placeholder="Mesa 8 o 8" autocomplete="off"></span></label>
+        <div class="accounts-drawer-actions"><button id="openCashDrawer" class="ghost" type="button"><i data-lucide="archive"></i> Abrir caja</button><button id="configureCashDrawer" class="ghost" type="button"><i data-lucide="settings"></i> Configurar caja</button></div>
         <div class="accounts-panel" id="accountsPanel"></div>
       </section>
 
@@ -579,6 +597,7 @@
         </div>
         <div class="table-session-actions" id="tableSessionActions" hidden>
           <button class="ghost" id="viewTableConsumption" type="button"><i data-lucide="receipt-text"></i> Ver consumo</button>
+          <button class="ghost abono-button" id="abonoTableAccount" type="button"><i data-lucide="hand-coins"></i> Abonar</button>
           <button class="primary" id="chargeTableAccount" type="button"><i data-lucide="badge-dollar-sign"></i> Cobrar cuenta</button>
           <button class="ghost danger-text" id="releaseEmptyTable" type="button" hidden><i data-lucide="door-open"></i> Liberar mesa</button>
         </div>
@@ -645,6 +664,26 @@
       </form>
     </dialog>
 
+    <dialog class="modal" id="cashDrawerDialog">
+      <form class="modal-card" id="cashDrawerForm">
+        <div class="section-head"><div><span class="eyebrow">Caja registradora</span><h2>Configurar apertura</h2></div><button class="icon-btn" type="button" data-close-cash-drawer aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <p>Selecciona la impresora POS a la que está conectado el cajón. Windows administra el puerto USB, de red o serie.</p>
+        <label>Impresora de recibos<select name="printer" id="cashDrawerPrinter" required></select></label>
+        <label>Salida del cajón<select name="pin"><option value="0">Pin 2 (habitual)</option><option value="1">Pin 5</option></select></label>
+        <small>Compatible con impresoras que aceptan el comando ESC/POS de apertura. Si tu cajón usa un controlador USB/OPOS propio, consulta el modelo.</small>
+        <div class="modal-actions"><button class="ghost" type="button" data-close-cash-drawer>Cancelar</button><button class="primary" type="submit">Probar y guardar</button></div>
+      </form>
+    </dialog>
+
+    <dialog class="modal" id="abonoDialog"><form class="modal-card" id="abonoForm">
+      <input name="session_id" type="hidden"><div class="section-head"><div><span class="eyebrow">Pago parcial</span><h2 id="abonoTitle">Abonar</h2><p id="abonoBalance"></p></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+      <label>Valor del abono<input name="amount" type="text" inputmode="numeric" data-currency-input autocomplete="off" required></label>
+      <label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option></select></label>
+      <label>Referencia (opcional)<input name="reference" type="text" maxlength="100"></label>
+      <p>El abono reduce el saldo y deja fecha y hora en el desglose. La cuenta continúa abierta.</p>
+      <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Cancelar</button><button class="primary" type="submit">Confirmar abono</button></div>
+    </form></dialog>
+
     <dialog class="modal payment-modal" id="paymentDialog">
       <form class="modal-card payment-card" id="paymentForm">
         <input type="hidden" name="session_id">
@@ -656,6 +695,7 @@
           <button class="icon-btn" type="button" data-cancel-payment aria-label="Cerrar"><i data-lucide="x"></i></button>
         </div>
 
+        <p id="paymentAbonoSummary" class="account-abono-summary"></p>
         <div class="payment-summary">
           <span id="paymentTableLabel">Mesa</span>
           <strong id="paymentTotal">$0</strong>
