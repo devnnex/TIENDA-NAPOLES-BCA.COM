@@ -3044,6 +3044,7 @@ const App = (() => {
       const requestIds = Array.from(new Set([...chat.requestIds, ...relatedIds]));
       await broadcastChatEvent("chat-closed", {}, targetSessionId);
       state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
+      rememberCompletedAdminRequests([...requestIds, ...readPendingAdminRequests().filter((request) => String(request.session_id || "") === targetSessionId && requestKind(request) === "chat").map((request) => request.id)]);
       persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
       if (chat.channel) state.sb.removeChannel(chat.channel);
       window.clearInterval(chat.pollTimer);
@@ -3857,17 +3858,36 @@ const App = (() => {
 
   const pendingAdminRequestsStorageKey = () => `napoles_pending_admin_requests_v1:${SUPABASE_CONFIG.url}`;
 
+  const rememberCompletedAdminRequests = (ids = []) => {
+    const completed = state.completedAdminRequestIds ||= new Set();
+    const key = `${pendingAdminRequestsStorageKey()}:completed`;
+    try {
+      const stored = JSON.parse(localStorage.getItem(key) || "[]");
+      if (Array.isArray(stored)) stored.filter((id) => typeof id === "string").forEach((id) => completed.add(id));
+    } catch (_) { /* La memoria conserva las confirmaciones de esta pantalla. */ }
+    let changed = false;
+    ids.forEach((id) => {
+      if (!completed.has(id)) { completed.add(id); changed = true; }
+    });
+    if (changed) {
+      try { localStorage.setItem(key, JSON.stringify([...completed])); } catch (_) { /* La confirmación remota sigue siendo válida. */ }
+    }
+    return completed;
+  };
+
   const readPendingAdminRequests = () => {
     try {
       const stored = JSON.parse(localStorage.getItem(pendingAdminRequestsStorageKey()) || "[]");
-      return Array.isArray(stored) ? stored.filter((request) => request?.id && request.status === "pending") : [];
+      const completed = rememberCompletedAdminRequests();
+      return Array.isArray(stored) ? stored.filter((request) => request?.id && request.status === "pending" && !completed.has(request.id)) : [];
     } catch (_) { return []; }
   };
 
   const persistPendingAdminRequests = (requests) => {
     try {
       const unique = [...new Map(requests.map((request) => [request.id, request])).values()];
-      localStorage.setItem(pendingAdminRequestsStorageKey(), JSON.stringify(unique.filter((request) => request.status === "pending")));
+      const completed = rememberCompletedAdminRequests();
+      localStorage.setItem(pendingAdminRequestsStorageKey(), JSON.stringify(unique.filter((request) => request.status === "pending" && !completed.has(request.id))));
     } catch (_) { /* La cola del servidor y la memoria siguen conservando las solicitudes. */ }
   };
 
@@ -3880,15 +3900,23 @@ const App = (() => {
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) return false;
     if (!Array.isArray(snapshot.requests) || !Array.isArray(snapshot.sessions)) return false;
+    const livePending = new Set(state.requests.filter((request) => request.status === "pending").map((request) => request.id));
     const knownPending = new Map([...readPendingAdminRequests(), ...state.requests.filter((request) => request.status === "pending")].map((request) => [request.id, request]));
     const incoming = new Map(snapshot.requests.map((request) => [request.id, request]));
     // Una omisión del snapshot no confirma que alguien haya aceptado la solicitud.
-    const missingIds = [...knownPending.keys()].filter((id) => !incoming.has(id));
+    const missingIds = [...knownPending.keys()].filter((id) => !incoming.has(id) || !livePending.has(id));
     for (let offset = 0; offset < missingIds.length; offset += 100) {
       const confirmed = await dbQuiet(state.sb.from("service_requests").select("*").in("id", missingIds.slice(offset, offset + 100)), null);
       if (Array.isArray(confirmed)) confirmed.forEach((request) => incoming.set(request.id, request));
     }
+    // Al recargar, la caché sola no prueba que una solicitud siga pendiente.
+    knownPending.forEach((request, id) => {
+      if (!livePending.has(id) && !incoming.has(id)) knownPending.delete(id);
+    });
+    const completed = rememberCompletedAdminRequests([...incoming.values()].filter((request) => ["acknowledged", "resolved"].includes(request.status) || request.acknowledged_at).map((request) => request.id));
+    completed.forEach((id) => knownPending.delete(id));
     incoming.forEach((request, id) => {
+      if (request.status === "pending" && completed.has(id)) return;
       const previous = knownPending.get(id);
       const accepted = ["acknowledged", "resolved"].includes(request.status) || Boolean(request.acknowledged_at);
       knownPending.set(id, {
@@ -3898,8 +3926,9 @@ const App = (() => {
       });
     });
     const merged = [...knownPending.values()].sort(compareRequestArrival);
-    persistPendingAdminRequests(merged);
     const requests = mergeOptimisticRequests(merged);
+    const inFlightPending = merged.filter((request) => request.status === "pending" && state.optimisticRequestStates.has(request.id));
+    persistPendingAdminRequests([...requests, ...inFlightPending]);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
     const signature = JSON.stringify([requests,sessions]);
     if (signature === state.adminSnapshotSignature) return false;
@@ -6789,19 +6818,24 @@ const App = (() => {
       );
       const savedMap = new Map((Array.isArray(saved) ? saved : []).map((request) => [request.id, request]));
       const restored = new Map(state.requests.map((request) => [request.id, request]));
+      const completed = rememberCompletedAdminRequests();
       originals.forEach((request) => {
         const confirmed = savedMap.get(request.id);
         if (confirmed?.status === "acknowledged" || confirmed?.acknowledged_at) {
           // Mantener la aceptación hasta que el snapshot también la confirme.
           state.optimisticRequestStates.set(request.id, { ...optimistic, ...confirmed });
           restored.set(request.id, { ...request, ...confirmed, restaurant_tables: request.restaurant_tables });
+        } else if (completed.has(request.id)) {
+          state.optimisticRequestStates.delete(request.id);
+          if (restored.get(request.id)?.status === "pending") restored.delete(request.id);
         } else {
           state.optimisticRequestStates.delete(request.id);
           restored.set(request.id, request);
         }
       });
       state.requests = [...restored.values()].sort(compareRequestArrival);
-      const confirmedIds = new Set(originals.filter((request) => savedMap.get(request.id)?.status === "acknowledged" || savedMap.get(request.id)?.acknowledged_at).map((request) => request.id));
+      const confirmedIds = new Set(originals.filter((request) => completed.has(request.id) || savedMap.get(request.id)?.status === "acknowledged" || savedMap.get(request.id)?.acknowledged_at).map((request) => request.id));
+      rememberCompletedAdminRequests([...confirmedIds]);
       persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !confirmedIds.has(request.id)), ...state.requests.filter((request) => request.status === "pending")]);
       if (confirmedIds.size !== originals.length) toast(failureMessage, "error", `request-write-failed:${ids.join(":")}`);
       renderAdminLive();
@@ -6998,6 +7032,7 @@ const App = (() => {
     state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
     await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq(session.table_id ? "table_id" : "session_id", session.table_id || id), null);
     state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
+    rememberCompletedAdminRequests([...originalRequests, ...readPendingAdminRequests(), ...state.requests].filter(belongsToClosingTable).map((request) => request.id));
     persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !belongsToClosingTable(request)), ...state.requests]);
     return { session, saved, totals };
   };

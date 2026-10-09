@@ -137,9 +137,20 @@ function harness(storage = new Map()) {
   await h.api.loadAdminData();
   assert.deepEqual([...h.ids()], ['first', 'second', 'chat'], 'Un snapshot vacío conserva las pendientes.');
   const reloaded = harness(new Map(h.storage));
+  reloaded.backend.rows = [first, second, chat].map(row => ({ ...row }));
+  await reloaded.api.loadAdminData();
+  assert.deepEqual([...reloaded.ids()], ['first', 'second', 'chat'], 'Recargar conserva el orden de las solicitudes confirmadas como pendientes.');
+
+  const unverified = harness(new Map(h.storage));
+  await unverified.api.loadAdminData();
+  assert.deepEqual([...unverified.ids()], [], 'Recargar no muestra registros viejos de la caché que el servidor ya no confirma.');
+  const unverifiedOffline = harness(new Map(h.storage));
+  unverifiedOffline.backend.readsFail = true;
+  await unverifiedOffline.api.loadAdminData();
+  assert.deepEqual([...unverifiedOffline.ids()], [], 'Una lectura fallida al recargar no convierte la caché antigua en nuevas solicitudes.');
   reloaded.backend.readsFail = true;
   await reloaded.api.loadAdminData();
-  assert.deepEqual([...reloaded.ids()], ['first', 'second', 'chat'], 'Recargar conserva el orden de las solicitudes conocidas.');
+  assert.deepEqual([...reloaded.ids()], ['first', 'second', 'chat'], 'Un fallo posterior conserva las solicitudes ya confirmadas en pantalla.');
 
   h.backend.snapshot = { sessions: [] };
   assert.equal(await h.api.loadAdminData(), false, 'Un snapshot incompleto no sustituye la cola.');
@@ -158,9 +169,19 @@ function harness(storage = new Map()) {
   assert.deepEqual([...accept.ids()], ['second'], 'Aceptar retira únicamente la solicitud pulsada.');
   await accept.api.loadAdminData();
   assert.deepEqual([...accept.ids()], ['second'], 'Un snapshot atrasado no vuelve a mostrar la solicitud aceptada.');
+  const acceptedReload = harness(new Map(accept.storage));
+  acceptedReload.backend.snapshot.requests = [first, second].map(row => ({ ...row }));
+  acceptedReload.backend.readsFail = true;
+  await acceptedReload.api.loadAdminData();
+  assert.deepEqual([...acceptedReload.ids()], ['second'], 'Una respuesta atrasada tras recargar no vuelve a mostrar una aceptación confirmada.');
+  const pendingKey = 'napoles_pending_admin_requests_v1:test-project';
+  assert.ok(!JSON.parse(acceptedReload.storage.get(pendingKey)).some(row => row.id === 'first'), 'La aceptación no se vuelve a guardar como pendiente en la caché.');
   accept.backend.snapshot.requests = accept.backend.rows.map(row => ({ ...row }));
   await accept.api.loadAdminData();
   assert.equal(accept.state.optimisticRequestStates.size, 0, 'La confirmación remota libera la protección optimista.');
+  accept.backend.snapshot.requests = [first, second].map(row => ({ ...row }));
+  await accept.api.loadAdminData();
+  assert.deepEqual([...accept.ids()], ['second'], 'Una respuesta vieja posterior a la confirmación tampoco revive la solicitud.');
   accept.backend.writesFail = true;
   await accept.api.acceptRequest('second');
   await tick();
@@ -183,12 +204,28 @@ function harness(storage = new Map()) {
   await tick();
   assert.deepEqual([...missingOnFailure.ids()], ['first'], 'Un fallo de escritura restaura incluso una solicitud omitida por una actualización concurrente.');
 
+  const confirmedDespiteError = harness();
+  confirmedDespiteError.state.requests = [{ ...first }];
+  confirmedDespiteError.backend.writesFail = true;
+  confirmedDespiteError.backend.beforeWrite = async () => {
+    confirmedDespiteError.backend.snapshot.requests = [{ ...first, status: 'acknowledged' }];
+    await confirmedDespiteError.api.loadAdminData();
+  };
+  await confirmedDespiteError.api.acceptRequest('first');
+  await tick();
+  assert.deepEqual([...confirmedDespiteError.ids()], [], 'Un error en la respuesta de escritura no revive una aceptación que otra lectura ya confirmó.');
+
   const peer = harness(reloaded.storage);
   peer.backend.rows = [
     { ...first, status: 'acknowledged' }, { ...second, status: 'resolved' }, chat
   ];
   await peer.api.loadAdminData();
   assert.deepEqual([...peer.ids()], ['chat'], 'La lectura directa confirma aceptaciones y cierres de otro equipo.');
+  const stalePeer = harness(new Map(reloaded.storage));
+  stalePeer.backend.snapshot.requests = [first, second, chat].map(row => ({ ...row }));
+  stalePeer.backend.rows = peer.backend.rows.map(row => ({ ...row }));
+  await stalePeer.api.loadAdminData();
+  assert.deepEqual([...stalePeer.ids()], ['chat'], 'Al recargar, la verificación de la caché también descarta aceptaciones de otro equipo aunque el snapshot esté atrasado.');
 
   const closing = harness();
   const orphan = request('no-session', 4, 'waiter', 'table-a', null);
@@ -200,6 +237,11 @@ function harness(storage = new Map()) {
   await closing.api.closeSession('session-a');
   assert.deepEqual([...closing.ids()], ['other-table'], 'Cerrar la cuenta retira todos los tipos de esa mesa, incluyendo solicitudes sin sesión.');
   assert.ok(closing.backend.rows.filter(row => row.table_id === 'table-a').every(row => row.status === 'resolved'));
+  const closedReload = harness(new Map(closing.storage));
+  closedReload.backend.snapshot.requests = [first, chat, orphan, other].map(row => ({ ...row }));
+  closedReload.backend.readsFail = true;
+  await closedReload.api.loadAdminData();
+  assert.deepEqual([...closedReload.ids()], ['other-table'], 'Recargar con una respuesta atrasada no revive las solicitudes de una mesa cerrada.');
 
   const failedClose = harness();
   failedClose.backend.rows = [{ ...first }];
