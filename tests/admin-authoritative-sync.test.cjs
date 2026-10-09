@@ -12,6 +12,7 @@ const context=vm.createContext({state,Date,navigator:{onLine:true},
  pendingAdminReadScope:()=>({safe:true,sessionIds:new Set(),requestIds:new Set(),closedIds:new Set()}),
  setScopedAdminRead:async()=>true,mergePendingAdminRows:s=>s,
  mergeOptimisticRequests:r=>r,mergeOptimisticSessions:r=>r,persistOfflineAdminSnapshot(){},
+ readRealtimeData:async q=>(await q)?.data,
  dbQuiet:async q=>(await q)?.data});
 vm.runInContext(source.slice(from,to)+';globalThis.read=loadAdminData;',context);
 (async()=>{

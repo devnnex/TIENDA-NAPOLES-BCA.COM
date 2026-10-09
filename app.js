@@ -406,6 +406,9 @@ const App = (() => {
     tableLocked: false,
     qrLocked: false,
     clientChannel: null,
+    clientSubscribedTableId: "",
+    clientReconnectTimer: null,
+    clientRealtimeNeedsReconnect: false,
     clientPollTimer: null,
     clientSyncBusy: false,
     requestOutboxBusy: false,
@@ -852,7 +855,9 @@ const App = (() => {
       );
     }
     if (state.currentSession?.id !== session?.id) state.clientSnapshotSignature = "";
+    if (state.page === "client" && state.currentTable?.id !== tableId) return session;
     state.currentSession = session;
+    if (state.page === "client" && session) subscribeClient();
     return session;
   };
 
@@ -871,15 +876,16 @@ const App = (() => {
   const hydrateSelectedTable = async (tableId) => {
     const table = state.currentTable;
     if (!table || table.id !== tableId) return null;
+    subscribeClient();
     const token = ++state.clientHydrationToken;
     state.tableAccountStatus = "checking";
     state.tableAccountTotal = 0;
     renderTablePicker();
-    const snapshot = await dbQuiet(state.sb.rpc("getClientTableState", {
+    const snapshot = await readRealtimeData(state.sb.rpc("getClientTableState", {
       table_id: table.id,
       table_access_code: tableCode(table),
       ensure_session: true
-    }), null);
+    }));
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     if (snapshot?.session) {
       state.currentSession = snapshot.session;
@@ -891,7 +897,7 @@ const App = (() => {
       if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId || !session) return null;
       await loadClientSnapshot();
     }
-    await refreshClientPosData();
+    void refreshClientPosData();
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     reconcilePendingBillsForTable(state.clientRequests);
     refreshTableLock();
@@ -938,6 +944,18 @@ const App = (() => {
     } catch (error) {
       return fallback;
     }
+  };
+
+  const readRealtimeData = async (query) => {
+    let timeout;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const builder = controller && typeof query?.abortSignal === "function" ? query.abortSignal(controller.signal) : query;
+    try {
+      return await Promise.race([
+        dbQuiet(builder, null),
+        new Promise((resolve) => { timeout = window.setTimeout(() => { controller?.abort(); resolve(null); }, 8000); })
+      ]);
+    } finally { window.clearTimeout(timeout); }
   };
 
   let bootstrapPromise = null;
@@ -1022,17 +1040,18 @@ const App = (() => {
   };
 
   const loadClientSnapshot = async () => {
-    const posRead = refreshClientPosData();
-    if (!state.currentSession) { await posRead; return; }
-    const snapshot = await dbQuiet(
+    void refreshClientPosData();
+    if (!state.currentSession) return false;
+    const sessionId = state.currentSession.id;
+    const tableId = state.currentTable?.id;
+    const snapshot = await readRealtimeData(
       state.sb.rpc("getClientSnapshot", {
         session_id: state.currentSession.id,
         table_id: state.currentTable?.id || null,
         table_access_code: tableCode(state.currentTable)
-      }),
-      null
+      })
     );
-    await posRead;
+    if (state.currentSession?.id !== sessionId || state.currentTable?.id !== tableId) return false;
     if (!snapshot) {
       await Promise.all([loadClientSessionItems(), loadClientRequests()]);
       return true;
@@ -2790,9 +2809,10 @@ const App = (() => {
     p_auth_token: state.authToken || ""
   });
 
-  const loadChatMessages = async (sessionId = state.currentSession?.id, table = state.currentTable) => {
+  const fetchChatMessages = async (sessionId, table) => {
     if (!sessionId) return false;
-    const result = await dbQuiet(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)), null);
+    const result = await readRealtimeData(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)));
+    if (state.page === "client" && (String(state.currentSession?.id || "") !== String(sessionId) || state.currentTable?.id !== table?.id)) return false;
     const messages = Array.isArray(result) ? result : result?.messages;
     if (!Array.isArray(messages)) return false;
     const currentMessages = state.page === "client"
@@ -2839,6 +2859,24 @@ const App = (() => {
       renderAdminChat(sessionId);
     }
     return true;
+  };
+
+  const chatReads = new Map();
+  const loadChatMessages = (sessionId = state.currentSession?.id, table = state.currentTable) => {
+    if (!sessionId) return Promise.resolve(false);
+    const key = `${state.page}:${table?.id || ""}:${sessionId}`;
+    const active = chatReads.get(key);
+    if (active) { active.pending = true; return active.promise; }
+    const read = { pending: false, promise: null };
+    read.promise = fetchChatMessages(sessionId, table).finally(() => {
+      chatReads.delete(key);
+      const stillActive = state.page === "client"
+        ? state.currentSession?.id === sessionId && state.currentTable?.id === table?.id
+        : state.adminChats.has(String(sessionId));
+      if (read.pending && stillActive) window.setTimeout(() => void loadChatMessages(sessionId, table), 0);
+    });
+    chatReads.set(key, read);
+    return read.promise;
   };
 
   const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable, messageId: localMessageId } = {}) => {
@@ -2997,7 +3035,10 @@ const App = (() => {
       .subscribe((status) => {
         chat.connected = status === "SUBSCRIBED";
         renderAdminChat(chat.sessionId);
-        if (chat.connected) broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice }, chat.sessionId);
+        if (chat.connected) {
+          broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice }, chat.sessionId);
+          void loadChatMessages(chat.sessionId, chat.table);
+        }
       });
     window.clearInterval(chat.pollTimer);
     chat.pollTimer = window.setInterval(() => void loadChatMessages(chat.sessionId, chat.table), CHAT_SYNC_INTERVAL_MS);
@@ -3405,37 +3446,59 @@ const App = (() => {
   };
 
   const subscribeClient = () => {
-    if (!state.currentSession) return;
+    if (!state.currentTable || !state.currentSession) {
+      clearInterval(state.clientPollTimer);
+      clearInterval(state.chatPollTimer);
+      window.clearTimeout(state.clientReconnectTimer);
+      const previous = state.clientChannel;
+      state.clientChannel = null;
+      state.clientSubscribedTableId = "";
+      state.clientLiveRefresh = null;
+      if (previous) state.sb.removeChannel(previous);
+      return;
+    }
+    const tableId = state.currentTable.id;
     const sessionId = String(state.currentSession.id);
     if (state.clientChatSoundSessionId !== sessionId) {
       state.clientChatSoundSessionId = sessionId;
       state.clientChatInitialized = false;
       state.clientStaffMessageSoundIds.clear();
     }
+    if (state.clientChannel && state.clientSubscribedTableId === tableId && !state.clientRealtimeNeedsReconnect) return;
     clearInterval(state.clientPollTimer);
-    if (state.clientChannel) state.sb.removeChannel(state.clientChannel);
+    window.clearTimeout(state.clientReconnectTimer);
+    const previous = state.clientChannel;
+    state.clientChannel = null;
+    if (previous) state.sb.removeChannel(previous);
     clearInterval(state.chatPollTimer);
+    let refreshPending = false;
     const refresh = async () => {
-      if (state.clientSyncBusy || !state.currentSession) return;
+      if (state.currentTable?.id !== tableId || !state.currentSession) return;
+      void loadChatMessages();
+      if (state.clientSyncBusy) { refreshPending = true; return; }
       state.clientSyncBusy = true;
       try {
         if (await loadClientSnapshot()) {
           renderAccount();
           renderBillChat();
         }
-        await loadChatMessages();
       } finally {
         state.clientSyncBusy = false;
+        if (refreshPending) { refreshPending = false; window.setTimeout(() => void refresh(), 0); }
       }
     };
-    state.clientChannel = state.sb
-      .channel(`table:${state.currentTable.id}`, { config: { broadcast: { self: false }, private: false } })
+    state.clientLiveRefresh = refresh;
+    state.clientSubscribedTableId = tableId;
+    state.clientRealtimeNeedsReconnect = false;
+    const channel = state.sb
+      .channel(`table:${tableId}`, { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refresh)
       .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages())
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         if (String(payload?.sessionId) === String(state.currentSession?.id) && payload?.role === "staff") setPeerTyping(payload.typing, "staff");
       })
       .on("broadcast", { event: "admin-presence" }, ({ payload }) => {
+        if (payload?.sessionId && String(payload.sessionId) !== String(state.currentSession?.id)) return;
         if (payload?.active) {
           state.adminChatActive = true;
           state.adminChatNotice = payload.notice || "El administrador se unió al chat.";
@@ -3444,7 +3507,8 @@ const App = (() => {
           renderAssistant();
         }
       })
-      .on("broadcast", { event: "chat-closed" }, () => {
+      .on("broadcast", { event: "chat-closed" }, ({ payload } = {}) => {
+        if (payload?.sessionId && String(payload.sessionId) !== String(state.currentSession?.id)) return;
         state.chatMessages = [];
         state.clientChatInitialized = false;
         state.clientStaffMessageSoundIds.clear();
@@ -3452,8 +3516,22 @@ const App = (() => {
         state.adminChatActive = false;
         state.adminChatNotice = "";
         assistantSay("bot", "La conversacion fue finalizada. Puedes iniciar una nueva cuando lo necesites.");
-      })
-      .subscribe();
+      });
+    state.clientChannel = channel;
+    channel.subscribe((status) => {
+      if (state.clientChannel !== channel || state.currentTable?.id !== tableId) return;
+      if (status === "SUBSCRIBED") {
+        state.clientRealtimeNeedsReconnect = false;
+        window.clearTimeout(state.clientReconnectTimer);
+        void refresh();
+      } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+        state.clientRealtimeNeedsReconnect = true;
+        window.clearTimeout(state.clientReconnectTimer);
+        state.clientReconnectTimer = window.setTimeout(() => {
+          if (state.clientChannel === channel && state.currentTable?.id === tableId) subscribeClient();
+        }, 3000);
+      }
+    });
     state.clientPollTimer = setInterval(refresh, SYNC_INTERVAL_MS);
     state.chatPollTimer = setInterval(() => void loadChatMessages(), CHAT_SYNC_INTERVAL_MS);
     void loadChatMessages();
@@ -3491,7 +3569,7 @@ const App = (() => {
     renderBillChat();
     renderAssistant();
     bindClient();
-    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self:false }, private:false } }).on("broadcast", {event:"refresh"}, () => void refreshClientPosData()).on("broadcast", {event:"core-refresh"}, () => void refreshCoreNow()).subscribe();
+    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self:false }, private:false } }).on("broadcast", {event:"refresh"}, () => { void state.clientLiveRefresh?.(); void refreshClientPosData(); }).on("broadcast", {event:"core-refresh"}, () => void refreshCoreNow()).subscribe();
     subscribeClient();
     setLoading(false);
     // La pantalla queda usable tras el bootstrap; la cuenta se hidrata en segundo plano.
@@ -3904,7 +3982,7 @@ const App = (() => {
     (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0) || String(a.id).localeCompare(String(b.id));
 
   const loadAdminData = async () => {
-    const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
+    const snapshot = await readRealtimeData(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }));
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) return false;
@@ -9556,7 +9634,10 @@ const App = (() => {
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
+        if (status === "SUBSCRIBED") {
+          setRealtimeStatus("En vivo", "live");
+          void refreshAdminNow();
+        }
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           setRealtimeStatus("Respaldo cada 5 segundos", "fallback");
         }
@@ -10365,6 +10446,19 @@ const App = (() => {
     void refreshAdminNow();
   };
 
+  const resumeRealtimeReception = () => {
+    if (document.hidden) return;
+    if (state.page === "client" && state.currentTable) {
+      subscribeClient();
+      void state.clientLiveRefresh?.();
+      if (!state.currentSession) void hydrateSelectedTable(state.currentTable.id);
+    }
+    if (state.page === "admin" && state.authToken) {
+      void refreshAdminNow();
+      state.adminChats.forEach((chat) => void loadChatMessages(chat.sessionId, chat.table));
+    }
+  };
+
   const init = async () => {
     document.addEventListener("wheel", (event) => {
       const input = event.target instanceof Element ? event.target.closest('input[type="number"]') : null;
@@ -10387,6 +10481,10 @@ const App = (() => {
       refreshIcons();
       return;
     }
+    window.addEventListener("online", resumeRealtimeReception);
+    window.addEventListener("focus", resumeRealtimeReception);
+    window.addEventListener("pageshow", resumeRealtimeReception);
+    document.addEventListener("visibilitychange", resumeRealtimeReception);
     if (state.page === "client") {
       window.addEventListener("online", () => {
         flushRequestOutbox();

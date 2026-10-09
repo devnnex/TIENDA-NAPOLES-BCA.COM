@@ -82,6 +82,7 @@ function harness(storage = new Map()) {
     state, Date, console, navigator: { onLine: true }, SUPABASE_CONFIG: { url: 'test-project' },
     localStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     dbQuiet: async query => (await query)?.data || null,
+    readRealtimeData: async query => (await query)?.data || null,
     retryQuiet: async factory => (await factory())?.data || null,
     mergeOptimisticSessions: rows => rows, renderAdminLive() {}, renderAdmin() {},
     stopAlarm() {}, toast: message => toasts.push(message),
