@@ -61,6 +61,7 @@ function backend() {
 
 function device(server, page = 'client') {
   let clock = 0, nextId = 0, renders = 0;
+  const sounds = [], queueBox = { hidden: true, innerHTML: '' };
   const timers = new Map(), events = new Map(), storage = new Map();
   const schedule = (callback, delay, interval = false) => {
     const id = ++nextId;
@@ -83,7 +84,9 @@ function device(server, page = 'client') {
     setInterval: (callback, delay) => schedule(callback, delay, true), clearInterval: id => timers.delete(id),
     localStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     db: async query => (await query)?.data || null, retryQuiet: async factory => (await factory())?.data || null,
-    tableCode: () => 'table-code', uid: () => `message-${page}-${++nextId}`, $: () => null,
+    tableCode: () => 'table-code', uid: () => `message-${page}-${++nextId}`,
+    $: selector => selector === '#clientQueueStatus' ? queueBox : null, escapeHTML: String,
+    RECEIPT_SOUND: 'notification.mp3', Audio: class { constructor(src) { this.src = src; } async play() { sounds.push(this.src); } },
     normalizeText: value => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(),
     renderAccount() {}, renderBillChat() {}, renderTablePicker() {}, refreshTableLock() {},
     renderClientQueue() {}, songTurnCount: () => 0, pendingBillIds: () => [], readRequestOutbox: () => [],
@@ -97,6 +100,9 @@ function device(server, page = 'client') {
     + section('ensureOpenSession', 'bootstrapCacheKey')
       .split('  const dbQuiet =')[0]
     + section('loadClientSnapshot', 'pwaAssetUrl')
+    + section('playClientChatReceipt', 'playAdminChatReceipt')
+    + section('isSongRequest', 'hasOpenAdminChatForRequest')
+    + section('renderClientQueue', 'bindAccountFeatures')
     + section('mergeChatMessageList', 'setPeerTyping')
     + section('broadcastChatEvent', 'broadcastTyping')
     + section('subscribeClient', 'initClient')
@@ -107,9 +113,9 @@ function device(server, page = 'client') {
     + section('subscribeAdmin', 'tableFromScannedValue')
     + section('resumeRealtimeReception', 'init')
     + ';globalThis.api = { hydrateSelectedTable, subscribeClient, loadChatMessages, persistChatMessage, '
-    + 'broadcastChatEvent, resumeRealtimeReception, subscribeAdmin, refreshAdminNow, readRealtimeData };', context);
+    + 'broadcastChatEvent, resumeRealtimeReception, subscribeAdmin, refreshAdminNow, readRealtimeData, renderClientQueue };', context);
   return {
-    state, api: context.api, document, renders: () => renders,
+    state, api: context.api, document, sounds, queueBox, renders: () => renders,
     async advance(ms) {
       const end = clock + ms;
       while (true) {
@@ -149,6 +155,11 @@ function device(server, page = 'client') {
   for (const client of [first, second]) {
     assert.ok(client.state.chatMessages.some(row => row.body === 'Respuesta en vivo'), 'Ambos clientes reciben el mensaje sin recargar.');
     assert.ok(client.renders() > 0);
+    await client.advance(0);
+    assert.equal(client.sounds.length, 1, 'La respuesta del administrador reproduce el sonido en cada dispositivo.');
+    await client.api.loadChatMessages();
+    await client.advance(0);
+    assert.equal(client.sounds.length, 1, 'Leer el mismo mensaje otra vez no repite el sonido.');
   }
   await first.api.persistChatMessage('client', 'Mensaje desde la mesa');
   await first.api.broadcastChatEvent('chat-refresh');
@@ -161,6 +172,19 @@ function device(server, page = 'client') {
   await settle();
   assert.equal(admin.state.requests[0].id, 'request-a', 'El admin recibe las solicitudes mediante el aviso remoto.');
   assert.equal(first.state.clientRequests[0].id, 'request-a', 'La recepción de solicitudes no espera a los pagos.');
+
+  assert.doesNotMatch(first.queueBox.innerHTML, /Te estamos atendiendo/);
+  server.requests[0].status = 'acknowledged';
+  server.requests.push({ id: 'chat-request', table_id: 'table-a', session_id: 'session-a', status: 'acknowledged', request_type: 'other', message: 'Hola' });
+  server.emit('table:table-a', 'refresh');
+  await settle();
+  assert.match(first.queueBox.innerHTML, /data-attending-request="request-a"/);
+  assert.match(first.queueBox.innerHTML, /está siendo atendida en este momento/);
+  assert.doesNotMatch(first.queueBox.innerHTML, /data-attending-request="chat-request"/, 'El chat conserva su propio aviso de conexión.');
+  server.requests[0].status = 'resolved';
+  server.emit('table:table-a', 'refresh');
+  await settle();
+  assert.doesNotMatch(first.queueBox.innerHTML, /Te estamos atendiendo/);
 
   first.state.clientChannel.active = false;
   server.messages.push({ id: 'fallback', session_id: 'session-a', sender_type: 'staff', body: 'Recibido sin WebSocket', created_at: '2026-10-08T18:01:00Z' });
@@ -190,6 +214,27 @@ function device(server, page = 'client') {
   await settle();
   assert.ok(first.state.chatMessages.some(row => row.id === 'resume'), 'Volver a la pestaña recupera inmediatamente los mensajes pendientes.');
 
+  const requestsBeforeClose = JSON.stringify(second.state.clientRequests);
+  second.state.assistantMode = 'song';
+  second.state.assistantThreads.song = [{ role: 'bot', text: 'Tu canción está pendiente.' }];
+  server.messages = [];
+  server.emit('table:table-a', 'chat-closed', { sessionId: 'session-a' });
+  assert.match(second.state.assistantThreads.bar[0].text, /La conversación ha finalizado/);
+  assert.equal(second.state.assistantThreads.song[0].text, 'Tu canción está pendiente.');
+  assert.equal(JSON.stringify(second.state.clientRequests), requestsBeforeClose, 'La despedida no modifica otras solicitudes.');
+  await second.advance(1000);
+  const previousSounds = second.sounds.length;
+  server.messages.push({ id: 'after-close', session_id: 'session-a', sender_type: 'staff', body: 'Nueva respuesta', created_at: '2026-10-08T18:04:00Z' });
+  server.emit('table:table-a', 'chat-refresh');
+  await settle();
+  await second.advance(0);
+  assert.equal(second.sounds.length, previousSounds + 1, 'La primera respuesta después de un cierre también suena.');
+  second.state.adminChatActive = true;
+  server.messages = [];
+  await second.api.loadChatMessages();
+  assert.match(second.state.assistantThreads.bar[0].text, /La conversación ha finalizado/, 'El respaldo detecta el cierre aunque no llegue el aviso remoto.');
+  assert.equal(second.state.chatMessages.length, 0);
+
   let finishRead;
   const oldRpc = server.sb.rpc;
   server.sb.rpc = name => name === 'listChatMessages' ? new Promise(resolve => { finishRead = resolve; }) : oldRpc(name);
@@ -200,6 +245,13 @@ function device(server, page = 'client') {
   finishRead({ data: { messages: [{ id: 'old-session', session_id: 'session-a', sender_type: 'staff', body: 'Mensaje viejo' }] } });
   assert.equal(await obsolete, false);
   assert.equal(first.state.chatMessages.length, 0, 'Una respuesta de una sesión anterior no contamina la conversación actual.');
+
+  const closingRead = second.api.loadChatMessages();
+  server.emit('table:table-a', 'chat-closed', { sessionId: 'session-a' });
+  finishRead({ data: { messages: [{ id: 'old-join', session_id: 'session-a', sender_type: 'system', body: 'El administrador se unió al chat.' }] } });
+  assert.equal(await closingRead, false);
+  assert.equal(second.state.adminChatActive, false, 'Una lectura iniciada antes del cierre no reabre el chat.');
+  assert.match(second.state.assistantThreads.bar[0].text, /La conversación ha finalizado/);
 
   const timed = device(backend());
   let signal;

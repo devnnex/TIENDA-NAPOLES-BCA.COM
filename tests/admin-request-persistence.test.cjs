@@ -158,9 +158,19 @@ function harness(storage = new Map()) {
   assert.equal(await h.api.loadAdminData(), false, 'Un snapshot incompleto no sustituye la cola.');
   await h.api.openAdminChat('chat');
   assert.ok(h.ids().includes('chat'), 'Abrir un chat sin Aceptar conserva su solicitud.');
+  const laterChat = request('later-chat', 4, 'other');
+  const pendingSong = { ...request('song', 5, 'other'), message: 'Mesa solicita la canción: prueba' };
+  const pendingBill = request('bill-pending', 6, 'bill');
+  for (const row of [laterChat, pendingSong, pendingBill]) {
+    h.state.requests.push({ ...row });
+    h.backend.rows.push({ ...row });
+  }
   await h.api.finishAdminChat('session-a');
   await tick();
-  assert.deepEqual([...h.ids()], ['first', 'second'], 'Cerrar chat retira solo las solicitudes de chat.');
+  assert.deepEqual([...h.ids()], ['first', 'second', 'later-chat', 'song', 'bill-pending'], 'Cerrar chat conserva todas las demás solicitudes de esa mesa, incluso otro chat.');
+  assert.equal(h.backend.rows.find(row => row.id === 'chat').status, 'resolved');
+  assert.ok(h.backend.rows.filter(row => row.id !== 'chat').every(row => row.status === 'pending'), 'Solo la solicitud usada para abrir el chat se resuelve en el servidor.');
+  assert.deepEqual(JSON.parse(h.storage.get('napoles_pending_admin_requests_v1:test-project:completed')), ['chat'], 'La caché no marca como atendidas las demás solicitudes.');
 
   const accept = harness();
   accept.backend.rows = [first, second].map(row => ({ ...row }));

@@ -900,6 +900,7 @@ const App = (() => {
     void refreshClientPosData();
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     reconcilePendingBillsForTable(state.clientRequests);
+    renderClientQueue();
     refreshTableLock();
     renderAccount();
     renderBillChat();
@@ -924,6 +925,7 @@ const App = (() => {
   const loadClientRequests = async () => {
     if (!state.currentSession) {
       state.clientRequests = [];
+      renderClientQueue();
       return;
     }
     state.clientRequests = await db(
@@ -934,6 +936,7 @@ const App = (() => {
         .order("created_at", { ascending: false }),
       []
     );
+    renderClientQueue();
   };
 
   const dbQuiet = async (builder, fallback = null) => {
@@ -1064,6 +1067,7 @@ const App = (() => {
     state.clientSnapshotSignature = signature;
     state.sessionItems = snapshot.sessionItems || [];
     state.clientRequests = snapshot.requests || [];
+    renderClientQueue();
     refreshTableLock();
     return true;
   };
@@ -2809,15 +2813,36 @@ const App = (() => {
     p_auth_token: state.authToken || ""
   });
 
+  const finishClientChat = () => {
+    state.clientChatRevision = Number(state.clientChatRevision || 0) + 1;
+    state.chatMessages = [];
+    state.clientChatInitialized = true;
+    state.clientStaffMessageSoundIds.clear();
+    state.assistantThreads.bar = [{
+      role: "bot", local: true, created_at: new Date().toISOString(),
+      text: "La conversación ha finalizado. Gracias por comunicarte con nosotros. Puedes iniciar una nueva cuando lo necesites."
+    }];
+    state.assistantMessages = state.assistantThreads[state.assistantMode] || [];
+    state.adminChatActive = false;
+    state.adminChatNotice = "";
+    setPeerTyping(false, "staff");
+    renderAssistant();
+  };
+
   const fetchChatMessages = async (sessionId, table) => {
     if (!sessionId) return false;
+    const revision = Number(state.clientChatRevision || 0);
     const result = await readRealtimeData(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)));
-    if (state.page === "client" && (String(state.currentSession?.id || "") !== String(sessionId) || state.currentTable?.id !== table?.id)) return false;
+    if (state.page === "client" && (String(state.currentSession?.id || "") !== String(sessionId) || state.currentTable?.id !== table?.id || revision !== Number(state.clientChatRevision || 0))) return false;
     const messages = Array.isArray(result) ? result : result?.messages;
     if (!Array.isArray(messages)) return false;
     const currentMessages = state.page === "client"
       ? state.chatMessages
       : state.adminChats.get(String(sessionId))?.messages || [];
+    if (state.page === "client" && !messages.length && state.adminChatActive && currentMessages.some((message) => !message.pending)) {
+      finishClientChat();
+      return true;
+    }
     const sortedMessages = mergeChatMessageList(currentMessages, messages);
     if (state.page === "client") {
       const currentSessionId = String(sessionId);
@@ -3088,14 +3113,16 @@ const App = (() => {
         toast("No se pudo finalizar el chat. Intenta nuevamente.", "error", `chat-close:${targetSessionId}`);
         return;
       }
-      const relatedIds = state.requests
-        .filter((request) => String(request.session_id || "") === targetSessionId && requestKind(request) === "chat")
-        .map((request) => request.id);
-      const requestIds = Array.from(new Set([...chat.requestIds, ...relatedIds]));
+      const knownRequests = new Map([...readPendingAdminRequests(), ...state.requests].map((request) => [request.id, request]));
+      const requestIds = [...chat.requestIds].filter((id) => {
+        const request = knownRequests.get(id);
+        return request && String(request.session_id || "") === targetSessionId && requestKind(request) === "chat";
+      });
       await broadcastChatEvent("chat-closed", {}, targetSessionId);
       state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
-      rememberCompletedAdminRequests([...requestIds, ...readPendingAdminRequests().filter((request) => String(request.session_id || "") === targetSessionId && requestKind(request) === "chat").map((request) => request.id)]);
+      rememberCompletedAdminRequests(requestIds);
       persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
+      renderAdminLive();
       if (chat.channel) state.sb.removeChannel(chat.channel);
       window.clearInterval(chat.pollTimer);
       window.clearTimeout(state.adminChatTypingTimers.get(targetSessionId));
@@ -3509,13 +3536,7 @@ const App = (() => {
       })
       .on("broadcast", { event: "chat-closed" }, ({ payload } = {}) => {
         if (payload?.sessionId && String(payload.sessionId) !== String(state.currentSession?.id)) return;
-        state.chatMessages = [];
-        state.clientChatInitialized = false;
-        state.clientStaffMessageSoundIds.clear();
-        state.assistantThreads.bar = [];
-        state.adminChatActive = false;
-        state.adminChatNotice = "";
-        assistantSay("bot", "La conversacion fue finalizada. Puedes iniciar una nueva cuando lo necesites.");
+        finishClientChat();
       });
     state.clientChannel = channel;
     channel.subscribe((status) => {
@@ -4272,10 +4293,15 @@ const App = (() => {
     const box = $("#clientQueueStatus"); if (!box) return;
     const rows = state.clientQueuePositions || [];
     const groups = new Map(); rows.forEach((row) => groups.set(row.kind, row));
-    box.hidden = !groups.size;
+    const attending = (state.clientRequests || []).filter((request) =>
+      request.status === "acknowledged" && request.table_id === state.currentTable?.id
+      && request.session_id === state.currentSession?.id && requestKind(request) !== "chat");
+    box.hidden = !groups.size && !attending.length;
     box.innerHTML = [...groups].map(([kind,row]) => '<div><strong>' + (kind === "song" ? "Canciones" : "Solicitudes")
       + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position)-1) + ' turno(s) antes del tuyo.')
       + (kind === "song" ? ' · ' + rows.filter((entry) => entry.kind === "song").length + '/5 canciones en este turno.' : '') + '</small></div>').join('');
+    const labels = { waiter: "de mesero", song: "de canción", bill: "de cuenta", other: "de atención" };
+    box.innerHTML += attending.map((request) => `<div data-attending-request="${escapeHTML(request.id)}"><strong>Te estamos atendiendo</strong><small>Tu solicitud ${labels[requestKind(request)] || "de atención"} está siendo atendida en este momento.</small></div>`).join("");
   };
   const bindAccountFeatures = () => {
     $("#abonoForm")?.addEventListener("submit", (event) => { event.preventDefault(); void recordAbono(event.currentTarget); });
