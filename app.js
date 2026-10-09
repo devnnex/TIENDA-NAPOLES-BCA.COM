@@ -3010,8 +3010,7 @@ const App = (() => {
       chat.element?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
       chat.element?.querySelector('input[name="message"]')?.focus();
       await loadChatMessages(sessionId, chat.table);
-      acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
-      return;
+      return true;
     }
     chat = { sessionId, tableId: request.table_id, table, requestIds: new Set(ids), messages: [], channel: null, pollTimer: null, element: null, connected: false, peerTyping: false, closing: false, confirming: false, minimized: false, initialized: false, unreadCount: 0, unreadBoundaryId: "" };
     state.adminChats.set(sessionId, chat);
@@ -3023,7 +3022,7 @@ const App = (() => {
     const joinAlreadyRegistered = chat.messages.some((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
     if (!joinAlreadyRegistered) void persistChatMessage("system", joinNotice, { sessionId: request.session_id, table });
     chat.element?.querySelector('input[name="message"]')?.focus();
-    acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
+    return true;
   };
 
   const finishAdminChat = async (sessionId) => {
@@ -3045,6 +3044,7 @@ const App = (() => {
       const requestIds = Array.from(new Set([...chat.requestIds, ...relatedIds]));
       await broadcastChatEvent("chat-closed", {}, targetSessionId);
       state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
+      persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
       if (chat.channel) state.sb.removeChannel(chat.channel);
       window.clearInterval(chat.pollTimer);
       window.clearTimeout(state.adminChatTypingTimers.get(targetSessionId));
@@ -3492,6 +3492,10 @@ const App = (() => {
 
   const mergeOptimisticRequests = (requests = []) => requests.map((request) => {
     const optimistic = state.optimisticRequestStates.get(request.id);
+    if (optimistic && (request.status === "acknowledged" || request.acknowledged_at)) {
+      state.optimisticRequestStates.delete(request.id);
+      return request;
+    }
     return optimistic ? { ...request, ...optimistic } : request;
   });
 
@@ -3851,12 +3855,51 @@ const App = (() => {
     }, SYNC_INTERVAL_MS);
   };
 
+  const pendingAdminRequestsStorageKey = () => `napoles_pending_admin_requests_v1:${SUPABASE_CONFIG.url}`;
+
+  const readPendingAdminRequests = () => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(pendingAdminRequestsStorageKey()) || "[]");
+      return Array.isArray(stored) ? stored.filter((request) => request?.id && request.status === "pending") : [];
+    } catch (_) { return []; }
+  };
+
+  const persistPendingAdminRequests = (requests) => {
+    try {
+      const unique = [...new Map(requests.map((request) => [request.id, request])).values()];
+      localStorage.setItem(pendingAdminRequestsStorageKey(), JSON.stringify(unique.filter((request) => request.status === "pending")));
+    } catch (_) { /* La cola del servidor y la memoria siguen conservando las solicitudes. */ }
+  };
+
+  const compareRequestArrival = (a, b) =>
+    (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0) || String(a.id).localeCompare(String(b.id));
+
   const loadAdminData = async () => {
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) return false;
-    const requests = mergeOptimisticRequests(snapshot.requests || []);
+    if (!Array.isArray(snapshot.requests) || !Array.isArray(snapshot.sessions)) return false;
+    const knownPending = new Map([...readPendingAdminRequests(), ...state.requests.filter((request) => request.status === "pending")].map((request) => [request.id, request]));
+    const incoming = new Map(snapshot.requests.map((request) => [request.id, request]));
+    // Una omisión del snapshot no confirma que alguien haya aceptado la solicitud.
+    const missingIds = [...knownPending.keys()].filter((id) => !incoming.has(id));
+    for (let offset = 0; offset < missingIds.length; offset += 100) {
+      const confirmed = await dbQuiet(state.sb.from("service_requests").select("*").in("id", missingIds.slice(offset, offset + 100)), null);
+      if (Array.isArray(confirmed)) confirmed.forEach((request) => incoming.set(request.id, request));
+    }
+    incoming.forEach((request, id) => {
+      const previous = knownPending.get(id);
+      const accepted = ["acknowledged", "resolved"].includes(request.status) || Boolean(request.acknowledged_at);
+      knownPending.set(id, {
+        ...previous, ...request,
+        restaurant_tables: request.restaurant_tables || previous?.restaurant_tables,
+        status: previous && !accepted ? "pending" : request.status
+      });
+    });
+    const merged = [...knownPending.values()].sort(compareRequestArrival);
+    persistPendingAdminRequests(merged);
+    const requests = mergeOptimisticRequests(merged);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
     const signature = JSON.stringify([requests,sessions]);
     if (signature === state.adminSnapshotSignature) return false;
@@ -4166,19 +4209,9 @@ const App = (() => {
     });
 
   const groupedActiveRequests = () => {
-    const groups = new Map();
-    [...activeRequests()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id))).forEach((request) => {
-      const kind = requestKind(request);
-      const key = `${request.table_id}:${request.session_id || "no-session"}:${kind}`;
-      if (!groups.has(key)) {
-        groups.set(key, { ...request, kind, request_ids: [], count: 0, latest_message: request.message || "" });
-      }
-      const group = groups.get(key);
-      group.request_ids.push(request.id);
-      group.count += 1;
-      if (kind === "song" && group.count > 1) { group.message += "\n" + (request.message || ""); group.latest_message = group.message; }
-    });
-    return Array.from(groups.values());
+    return [...activeRequests()].sort(compareRequestArrival).map((request) => ({
+      ...request, kind: requestKind(request), request_ids: [request.id], count: 1, latest_message: request.message || ""
+    }));
   };
 
   const renderAlerts = () => {
@@ -4210,13 +4243,7 @@ const App = (() => {
                   <p>${prettyDateTime(request.created_at)}</p>
                 </div>
                 ${request.count > 1 ? `<strong class="alert-count" aria-label="${request.count} llamados">${request.count}</strong>` : ""}
-                ${
-                  request.request_type === "bill"
-                    ? `<button class="primary" data-send-bill="${request.request_ids.join(",")}">${icon("send", 17)} Enviar cuenta</button>`
-                    : request.kind === "chat"
-                      ? `<button class="primary" data-open-chat="${request.request_ids.join(",")}">${icon("messages-square", 17)} Abrir chat</button>`
-                      : `<button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>`
-                }
+                <button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>
               </article>
             `
       )
@@ -6367,7 +6394,7 @@ const App = (() => {
         ${items.length ? `<button class="ghost small" type="button" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>` : `<button class="ghost small danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 15)} Liberar mesa</button>`}
         ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" type="button" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
         ${items.length ? `<button class="ghost small" type="button" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>` : ""}
-        ${billRequest ? `<button class="ghost small" type="button" data-send-bill="${billRequest.id}">${icon("send", 15)} ${billRequest.status === "acknowledged" ? "Reenviar" : "Enviar cuenta"}</button>` : ""}
+        ${billRequest ? `<button class="ghost small" type="button" data-send-bill="${billRequest.id}">${icon("send", 15)} ${billRequest.status === "acknowledged" ? "Reenviar" : "Aceptar"}</button>` : ""}
         ${items.length ? `<button class="primary small invoice-close" type="button" data-charge-session="${session.id}">${icon("badge-dollar-sign", 18)} Cobrar y facturar</button>` : ""}
       </div>`;
     refreshIcons();
@@ -6760,18 +6787,23 @@ const App = (() => {
         persist,
         4
       );
-      ids.forEach((id) => state.optimisticRequestStates.delete(id));
-      if (!saved || !saved.length) {
-        const originalMap = new Map(originals.map((request) => [request.id, request]));
-        state.requests = state.requests.map((request) => originalMap.get(request.id) || request);
-        renderAdminLive();
-        toast(failureMessage, "error", `request-write-failed:${ids.join(":")}`);
-        return;
-      }
-      const savedMap = new Map(saved.map((request) => [request.id, request]));
-      state.requests = state.requests.map((request) => savedMap.has(request.id)
-        ? { ...request, ...savedMap.get(request.id), restaurant_tables: request.restaurant_tables }
-        : request);
+      const savedMap = new Map((Array.isArray(saved) ? saved : []).map((request) => [request.id, request]));
+      const restored = new Map(state.requests.map((request) => [request.id, request]));
+      originals.forEach((request) => {
+        const confirmed = savedMap.get(request.id);
+        if (confirmed?.status === "acknowledged" || confirmed?.acknowledged_at) {
+          // Mantener la aceptación hasta que el snapshot también la confirme.
+          state.optimisticRequestStates.set(request.id, { ...optimistic, ...confirmed });
+          restored.set(request.id, { ...request, ...confirmed, restaurant_tables: request.restaurant_tables });
+        } else {
+          state.optimisticRequestStates.delete(request.id);
+          restored.set(request.id, request);
+        }
+      });
+      state.requests = [...restored.values()].sort(compareRequestArrival);
+      const confirmedIds = new Set(originals.filter((request) => savedMap.get(request.id)?.status === "acknowledged" || savedMap.get(request.id)?.acknowledged_at).map((request) => request.id));
+      persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !confirmedIds.has(request.id)), ...state.requests.filter((request) => request.status === "pending")]);
+      if (confirmedIds.size !== originals.length) toast(failureMessage, "error", `request-write-failed:${ids.join(":")}`);
       renderAdminLive();
     })();
   };
@@ -6779,6 +6811,13 @@ const App = (() => {
   const acceptRequest = async (ids) => {
     stopAlarm();
     const idList = String(ids || "").split(",").filter(Boolean);
+    const request = state.requests.find((entry) => idList.includes(entry.id));
+    if (!request || idList.some((id) => state.optimisticRequestStates.has(id))) return;
+    if (request.request_type === "bill") {
+      await sendBillToClient(ids);
+      return;
+    }
+    if (requestKind(request) === "chat" && !await openAdminChat(ids)) return;
     const sessionIds = [...new Set(state.requests.filter((request) => idList.includes(request.id)).map((request) => request.session_id).filter(Boolean))];
     if (sessionIds.length && state.currentUser?.id) {
       state.sessions = state.sessions.map((session) => {
@@ -6924,9 +6963,10 @@ const App = (() => {
     }
     const originalSessions = state.sessions;
     const originalRequests = state.requests;
+    const belongsToClosingTable = (request) => session.table_id ? request.table_id === session.table_id : request.session_id === id;
     state.optimisticSessionStates.set(id, { mode: "remove", session });
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
-    state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
+    state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
     renderAdminLive();
     const closedAt = new Date().toISOString();
     const closure = { status: "closed", closed_at: closedAt, subtotal: totals.subtotal,
@@ -6948,13 +6988,17 @@ const App = (() => {
     if (!saved) {
       state.optimisticSessionStates.delete(id);
       state.sessions = originalSessions;
-      state.requests = originalRequests;
+      const originalMap = new Map(originalRequests.map((request) => [request.id, request]));
+      state.requests = state.requests.map((request) => belongsToClosingTable(request) && originalMap.has(request.id) ? originalMap.get(request.id) : request);
+      persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
       renderAdmin();
       toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
       return null;
     }
     state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
-    await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq("session_id", id), null);
+    await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq(session.table_id ? "table_id" : "session_id", session.table_id || id), null);
+    state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
+    persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !belongsToClosingTable(request)), ...state.requests]);
     return { session, saved, totals };
   };
 
