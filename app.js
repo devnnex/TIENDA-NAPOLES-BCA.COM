@@ -2693,7 +2693,7 @@ const App = (() => {
     state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 0);
   };
 
-  const signalRequestArrival = async (attempt = 0) => {
+  const signalRequestArrival = async (attempt = 0, requestIds = []) => {
     // El aviso HTTP no depende de que el WebSocket del navegador esté conectado.
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 3000);
@@ -2701,11 +2701,11 @@ const App = (() => {
       const response = await fetch(`${SUPABASE_CONFIG.url}/realtime/v1/api/broadcast`, {
         method: "POST", cache: "no-store", signal: controller.signal,
         headers: { apikey: SUPABASE_CONFIG.anonKey, Authorization: `Bearer ${SUPABASE_CONFIG.anonKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: [{ topic: "admin", event: "refresh", payload: {}, private: false }] })
+        body: JSON.stringify({ messages: [{ topic: "admin", event: "refresh", payload: {}, private: false }, { topic: "admin", event: "request-arrived", payload: { requestIds }, private: false }] })
       });
       if (!response.ok) throw new Error("Aviso pendiente");
     } catch (_) {
-      if (attempt < 3) window.setTimeout(() => void signalRequestArrival(attempt + 1), 1000 * (attempt + 1));
+      if (attempt < 3) window.setTimeout(() => void signalRequestArrival(attempt + 1, requestIds), 1000 * (attempt + 1));
       // La consulta periódica del admin también recupera las solicitudes ya guardadas.
     } finally { window.clearTimeout(timeout); }
   };
@@ -2772,7 +2772,9 @@ const App = (() => {
       });
       writeRequestOutbox(nextOutbox);
       if (succeeded.size) {
-        void signalRequestArrival();
+        const requestIds = (results || []).map((result) => (result?.request || result)?.id).filter(Boolean);
+        void signalRequestArrival(0, requestIds);
+        try { Promise.resolve(state.adminBroadcastChannel?.send?.({ type: "broadcast", event: "request-arrived", payload: { requestIds } })).catch(() => undefined); } catch (_) {}
         try { Promise.resolve(state.adminBroadcastChannel?.send?.({ type: "broadcast", event: "refresh", payload: {} })).catch(() => undefined); } catch (_) {}
       }
       renderBillChat();
@@ -3854,7 +3856,7 @@ const App = (() => {
     stopAlarm();
     state.soundEnabled = false;
     state.soundPrimed = false;
-    localStorage.removeItem("waiter_alarm_enabled");
+    localStorage.setItem("waiter_alarm_enabled", "0");
     updateAlarmButton();
     toast("Alarma desactivada en este equipo.", "ok", "alarm-disabled");
   };
@@ -3891,12 +3893,13 @@ const App = (() => {
 
     try {
       state.soundEnabled = true;
-      state.soundPrimed = true;
       localStorage.setItem("waiter_alarm_enabled", "1");
       updateAlarmButton();
       audio.currentTime = 0;
       audio.loop = false;
       await audio.play();
+      state.soundPrimed = true;
+      updateAlarmButton();
       if (!silent) toast("Alarma activada.", "ok", "alarm-enabled");
 
       window.setTimeout(() => {
@@ -3905,9 +3908,7 @@ const App = (() => {
         if (activeRequests().length) playAlarm(activeRequests());
       }, activeRequests().length ? 450 : 1100);
     } catch (error) {
-      state.soundEnabled = false;
       state.soundPrimed = false;
-      localStorage.removeItem("waiter_alarm_enabled");
       updateAlarmButton();
       if (!silent) toast("El navegador bloqueo el audio. Toca Activar alarma otra vez.", "error", "alarm-permission");
     }
@@ -3915,10 +3916,10 @@ const App = (() => {
 
   const armAlarmOnFirstGesture = () => {
     const prime = async (fromMouseMove = false) => {
-      if (state.soundPrimed || state.soundPriming) return;
+      if (!state.soundEnabled || state.soundPrimed || state.soundPriming) return;
       if (fromMouseMove) {
-        if (state.mousePrimeAttempted) return;
-        state.mousePrimeAttempted = true;
+        if (Date.now() - Number(state.mousePrimeAttempted || 0) < 1500) return;
+        state.mousePrimeAttempted = Date.now();
       }
       state.soundPriming = true;
       try {
@@ -3930,7 +3931,7 @@ const App = (() => {
     // Algunos navegadores aceptan mousemove; click, toque y teclado son el respaldo garantizado.
     document.addEventListener("mousemove", () => prime(true), { passive: true });
     ["pointerdown", "touchstart", "keydown"].forEach((eventName) => {
-      document.addEventListener(eventName, () => prime(false), { once: true, passive: true });
+      document.addEventListener(eventName, () => prime(false), { passive: true });
     });
   };
 
@@ -3958,6 +3959,30 @@ const App = (() => {
         catch (_) { /* La consulta periódica recupera un canal desconectado. */ }
       }
     }
+  };
+
+  const receiveAdminRequests = (rows) => {
+    const incoming = (Array.isArray(rows) ? rows : []).filter((row) => row?.id && row.table_id && row.status);
+    if (!incoming.length) return;
+    const completed = rememberCompletedAdminRequests(incoming.filter((row) => ["acknowledged", "resolved"].includes(row.status) || row.acknowledged_at).map((row) => row.id));
+    const requests = new Map(state.requests.map((row) => [row.id, row]));
+    incoming.forEach((row) => {
+      if (row.status === "pending" && completed.has(row.id)) return;
+      requests.set(row.id, { ...requests.get(row.id), ...row,
+        restaurant_tables: row.restaurant_tables || requests.get(row.id)?.restaurant_tables || state.tables.find((table) => String(table.id) === String(row.table_id)) });
+    });
+    state.requests = mergeOptimisticRequests([...requests.values()].sort(compareRequestArrival));
+    persistPendingAdminRequests(state.requests);
+    state.adminSnapshotSignature = "";
+    renderAdminLive();
+  };
+
+  const refreshAdminRequests = async (requestIds = []) => {
+    const ids = [...new Set(Array.isArray(requestIds) ? requestIds : [])].filter((id) => typeof id === "string").slice(0, 30);
+    if (!state.authToken || !ids.length) return;
+    // El aviso solo lleva IDs: la notificación se confirma leyendo Supabase.
+    const rows = await readRealtimeData(state.sb.from("service_requests").select("*").in("id", ids));
+    receiveAdminRequests(rows);
   };
 
   let adminRefreshPending = false;
@@ -4448,7 +4473,7 @@ const App = (() => {
     const emptyText = normalTables().some((table) => table.is_active !== false)
       ? "No hay mesas que coincidan con este filtro."
       : "Crea las mesas del negocio para comenzar.";
-    box.innerHTML = compactTableTiles(state.dashboardTableGroupFilter, $("#dashboardTableSearch")?.value || "") || emptyState("Sin mesas", emptyText, "layout-grid");
+    box.innerHTML = `<button class="compact-table-tile walk-in-table" id="newWalkInSale" type="button" data-manager-only aria-label="Nueva venta individual"><span class="table-furniture-icon">${icon("plus", 23)}</span><small>Venta individual</small></button>` + (compactTableTiles(state.dashboardTableGroupFilter, $("#dashboardTableSearch")?.value || "") || emptyState("Sin mesas", emptyText, "layout-grid"));
     refreshIcons();
   };
 
@@ -5767,8 +5792,9 @@ const App = (() => {
       state.salesShiftPending = saved?.pending || null;
     } catch (_) { state.salesShift = null; state.salesShiftPending = null; }
     renderSalesShift();
+    state.salesShiftPrompted ||= Boolean(SalesShift.bounds(state.salesShift));
     void syncSalesShift().finally(() => {
-      if (!state.salesShiftPrompted) { state.salesShiftPrompted = true; openSalesShift(); }
+      if (!state.salesShiftPrompted && !SalesShift.bounds(state.salesShift)) { state.salesShiftPrompted = true; openSalesShift(); }
     });
     window.clearInterval(state.salesShiftTimer);
     state.salesShiftTimer = window.setInterval(() => { refreshSalesShiftRange(); void syncSalesShift(); }, 15000);
@@ -6450,6 +6476,28 @@ const App = (() => {
     return new Date(date.getTime() - offset).toISOString().slice(0, 16);
   };
 
+  const incomeEditTotal = (form) => $$('[data-income-line]', form).reduce((total, row) =>
+    total + Number(row.querySelector('[data-line-field="quantity"]')?.value || 0) * currencyInputNumber(row.querySelector('[data-line-field="price"]')), 0);
+
+  const updateIncomeEditPayments = (form, initialize = false) => {
+    const mixed = form.payment_method.value === "mixed";
+    const panel = $("#incomeEditPayments");
+    if (!panel) return;
+    panel.hidden = !mixed;
+    const methods = ["cash", "transfer", "breb"];
+    methods.forEach((method) => { form.elements.namedItem("edit_payment_" + method).disabled = !mixed; });
+    const total = incomeEditTotal(form);
+    if (mixed && initialize && methods.filter((method) => currencyInputNumber(form.elements.namedItem("edit_payment_" + method)) > 0).length < 2) {
+      setCurrencyInputValue(form.elements.namedItem("edit_payment_cash"), Math.round(total / 2));
+      setCurrencyInputValue(form.elements.namedItem("edit_payment_transfer"), total - Math.round(total / 2));
+      setCurrencyInputValue(form.elements.namedItem("edit_payment_breb"), 0);
+    }
+    const paid = methods.reduce((sum, method) => sum + currencyInputNumber(form.elements.namedItem("edit_payment_" + method)), 0);
+    const balance = $("#incomeEditPaymentBalance");
+    balance.textContent = "Total: " + money(total) + " · Distribuido: " + money(paid) + (paid === total ? "" : " · " + (paid < total ? "Faltan" : "Sobran") + " " + money(Math.abs(total - paid)));
+    balance.classList.toggle("is-unbalanced", paid !== total);
+  };
+
   const openIncomeEdit = (saleId) => {
     if (!isBoss()) return;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
@@ -6460,11 +6508,15 @@ const App = (() => {
     form.payer.value = record.payer || "";
     form.waiter.value = record.waiter || state.currentUser?.full_name || "";
     form.date.value = dateTimeLocalValue(record.date);
-    form.payment_method.value = record.isMixed ? "mixed" : (record.payments?.[0]?.method || "cash");
+    form.payment_method.value = record.isMixed || record.payments?.length > 1 ? "mixed" : (record.payments?.[0]?.method || "cash");
+    ["cash", "transfer", "breb"].forEach((method) => {
+      setCurrencyInputValue(form.elements.namedItem(`edit_payment_${method}`), (record.payments || []).filter((payment) => payment.method === method).reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
+    });
     form.reference.value = record.reference || "";
     const lines = $("#incomeEditLines");
     lines.innerHTML = `<div class="income-edit-lines-head"><strong>Productos facturados</strong><small>Edita producto, cantidad o precio, o usa la canasta para retirar un articulo cobrado.</small></div>${(record.items || []).map((item, index) => `<div class="income-edit-line" data-income-line="${index}" data-line-id="${escapeHTML(item.lineId || item.id || "")}" data-menu-item-id="${escapeHTML(item.menuItemId || item.menu_item_id || "")}"><label>Producto<input data-line-field="name" value="${escapeHTML(item.name || "Producto")}" maxlength="100" required></label><label>Cantidad<input data-line-field="quantity" type="number" min="1" step="1" value="${Number(item.quantity || 0)}" required></label><label>Precio<input data-line-field="price" type="text" value="${formattedCurrencyInput(item.unitPrice || item.unit_price || 0)}" inputmode="numeric" data-currency-input required></label><button class="icon-btn danger income-line-delete" type="button" data-remove-income-line aria-label="Eliminar ${escapeHTML(item.name || "producto")}">${icon("trash-2", 17)}</button></div>`).join("")}`;
     bindCurrencyInputs(lines);
+    updateIncomeEditPayments(form);
     $("#incomeEditDialog")?.showModal();
     refreshIcons();
   };
@@ -6563,15 +6615,15 @@ const App = (() => {
     const subtotal = items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0);
     const total = subtotal;
     const selectedPaymentMethod = form.payment_method.value;
-    const existingPaymentTotal = (record.payments || []).reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
-    const correctedPayments = selectedPaymentMethod === "mixed" && record.payments?.length > 1
-      ? record.payments.map((payment, index, payments) => ({
-          method: payment.method,
-          amount: index === payments.length - 1
-            ? total - payments.slice(0, -1).reduce((sum, entry) => sum + Math.round(total * Number(entry.amount || 0) / Math.max(1, existingPaymentTotal)), 0)
-            : Math.round(total * Number(payment.amount || 0) / Math.max(1, existingPaymentTotal))
-        }))
-      : [{ method: selectedPaymentMethod === "mixed" ? "cash" : selectedPaymentMethod, amount: total }];
+    const mixedAmounts = ["cash", "transfer", "breb"].map((method) => ({ method, amount: currencyInputNumber(form.elements.namedItem("edit_payment_" + method)) }));
+    const correctedPayments = selectedPaymentMethod === "mixed"
+      ? mixedAmounts.filter((payment) => payment.amount > 0)
+      : [{ method: selectedPaymentMethod, amount: total }];
+    if (selectedPaymentMethod === "mixed" && (mixedAmounts.some((payment) => !Number.isFinite(payment.amount) || payment.amount < 0)
+      || correctedPayments.length < 2 || correctedPayments.reduce((sum, payment) => sum + payment.amount, 0) !== total)) {
+      toast("Distribuye el total exacto de la venta entre al menos dos medios de pago.", "error", "invalid-income-payments");
+      return;
+    }
     const correctedDate = new Date(form.date.value);
     if (Number.isNaN(correctedDate.getTime())) {
       toast("Selecciona una fecha y hora validas para la venta.", "error", "invalid-income-date");
@@ -7421,41 +7473,9 @@ const App = (() => {
     popup.document.open();
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();
-    const receiptDocument = popup.document;
-    const waitForReceiptLoad = () => {
-      if (receiptDocument.readyState === "complete") return Promise.resolve();
-      return new Promise((resolve) => {
-        const complete = () => {
-          if (receiptDocument.readyState !== "complete") return;
-          popup.removeEventListener("load", complete);
-          receiptDocument.removeEventListener("readystatechange", complete);
-          resolve();
-        };
-        popup.addEventListener("load", complete, { once: true });
-        receiptDocument.addEventListener("readystatechange", complete);
-      });
-    };
-    const printWhenReady = async () => {
-      await waitForReceiptLoad();
-      try {
-        if (receiptDocument.fonts?.ready) await receiptDocument.fonts.ready;
-        const images = Array.from(receiptDocument.images || []);
-        await Promise.all(images.map((image) => {
-          if (image.complete) return image.decode?.().catch(() => undefined);
-          return new Promise((resolve) => {
-            image.addEventListener("load", resolve, { once: true });
-            image.addEventListener("error", resolve, { once: true });
-          });
-        }));
-        await new Promise((resolve) => popup.requestAnimationFrame(() => popup.requestAnimationFrame(resolve)));
-      } finally {
-        if (!popup.closed) {
-          popup.focus();
-          popup.print();
-        }
-      }
-    };
-    void printWhenReady();
+    popup.requestAnimationFrame(() => {
+      if (!popup.closed) { popup.focus(); popup.print(); }
+    });
     return true;
   };
 
@@ -7729,7 +7749,10 @@ const App = (() => {
       restaurant_tables: isWalkIn ? null : { table_name: tableName },
       session_items: items
     };
-    const ledger = invoice.sessionId ? await dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: invoice.sessionId, auth_token: state.authToken }), null) : null;
+    // Muestra el documento enseguida mientras se recuperan abonos no guardados localmente.
+    if (receiptWindow) { receiptWindow.document.open(); receiptWindow.document.write(thermalReceiptHtml(session, invoice)); receiptWindow.document.close(); }
+    const ledger = Array.isArray(storedInvoice?.prepayments) ? { payments: storedInvoice.prepayments }
+      : invoice.sessionId ? await dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: invoice.sessionId, auth_token: state.authToken }), null) : null;
     if (ledger?.payments?.length) { invoice.prepayments = ledger.payments; invoice.remainingPaid = Math.max(0, Number(invoice.totals.total || 0) - ledger.payments.reduce((sum,row) => sum + Number(row.amount || 0),0)); }
     return printThermalReceipt(session, invoice, receiptWindow);
   };
@@ -8017,7 +8040,8 @@ const App = (() => {
     const preview = $("#tableConsumptionPreview");
     const button = $("#viewTableConsumption");
     if (!preview || !button || button.hidden) return;
-    preview.hidden = !visible;
+    visible = true;
+    preview.hidden = false;
     button.innerHTML = visible
       ? `${icon("list-x", 17)} Esconder lista`
       : `${icon("receipt-text", 17)} Ver consumo`;
@@ -8069,14 +8093,12 @@ const App = (() => {
     if (chargeButton) chargeButton.hidden = emptyAccount;
     if (releaseButton) releaseButton.hidden = !emptyAccount;
     actions.classList.toggle("is-single", emptyAccount);
-    preview.hidden = true;
-    if (!session) {
-      preview.innerHTML = "";
-      return;
-    }
-    preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    const quickCheckout = $("#consumptionForm")?.quick_checkout.value === "1";
+    preview.hidden = quickCheckout;
+    $("#consumptionLayout")?.classList.toggle("without-consumption-preview", quickCheckout);
+    preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(session ? sessionTotal(session) : 0)}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div data-consumption-item="${escapeHTML(item.id)}"><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
     if (session) preview.innerHTML += abonoRowsHtml(session) + (sessionPaid(session) ? `<div class="account-abono-summary">Saldo pendiente: ${money(sessionBalance(session))}</div>` : "");
-    setTableConsumptionPreviewVisible(false);
+    if (!quickCheckout) setTableConsumptionPreviewVisible(true);
   };
 
   const addConsumptionBatch = async (form, drafts) => {
@@ -8272,19 +8294,14 @@ const App = (() => {
   };
 
   const confirmConsumptionSelection = async (form) => {
+    if (form.dataset.localSubmitInProgress === "1") return null;
     if (form.session_item_id.value) return addManualConsumption(form);
     const hasPendingEntry = Boolean(form.menu_item_id.value || form.item_name.value.trim() || form.quantity.value || $("#consumptionProductSearch")?.value.trim());
     const pendingEntry = currentConsumptionDraft(form, { quiet: true });
-    if (hasPendingEntry && !pendingEntry) {
-      currentConsumptionDraft(form);
-      return null;
-    }
+    if (hasPendingEntry && !pendingEntry) { currentConsumptionDraft(form); return null; }
     if (pendingEntry) {
-      if (state.consumptionDraftEditIndex >= 0 && state.consumptionDrafts[state.consumptionDraftEditIndex]) {
-        state.consumptionDrafts[state.consumptionDraftEditIndex] = pendingEntry;
-      } else {
-        state.consumptionDrafts.push(pendingEntry);
-      }
+      if (state.consumptionDraftEditIndex >= 0 && state.consumptionDrafts[state.consumptionDraftEditIndex]) state.consumptionDrafts[state.consumptionDraftEditIndex] = pendingEntry;
+      else state.consumptionDrafts.push(pendingEntry);
       state.consumptionDraftEditIndex = -1;
     }
     if (!state.consumptionDrafts.length) {
@@ -8293,29 +8310,45 @@ const App = (() => {
     }
     const drafts = [...state.consumptionDrafts];
     const quickCheckout = form.quick_checkout.value === "1";
-    const submit = $("#consumptionSubmitButton");
-    const queue = $("#consumptionQueueButton");
-    if (submit) submit.disabled = true;
-    if (queue) queue.disabled = true;
-    $("#consumptionDialog")?.close();
-    const result = await addConsumptionBatch(form, drafts);
-    if (submit) submit.disabled = false;
-    if (queue) queue.disabled = false;
-    if (!result) {
-      state.consumptionDrafts = drafts;
-      clearConsumptionEntry(form);
+    const dialog = $("#consumptionDialog");
+    form.dataset.localSubmitInProgress = "1";
+    form.inert = true;
+    let confirmed = false;
+    try {
+      const result = await addConsumptionBatch(form, drafts);
+      if (!result) {
+        state.consumptionDrafts = drafts;
+        clearConsumptionEntry(form);
+        renderConsumptionSelection();
+        return null;
+      }
+      confirmed = true;
+      state.consumptionDrafts = [];
+      state.consumptionDraftEditIndex = -1;
       renderConsumptionSelection();
-      $("#consumptionDialog")?.showModal();
-      return null;
+      const sessionId = result.sessionId;
+      if (!quickCheckout && dialog?.open) {
+        const session = state.sessions.find((entry) => entry.id === sessionId);
+        renderTableConsumptionPreview(session);
+        renderLastConsumptionTime(session);
+        const addedIds = new Set((result.items || []).map((item) => String(item.id)));
+        $$('[data-consumption-item]', $("#tableConsumptionPreview")).forEach((row) => {
+          if (addedIds.has(row.dataset.consumptionItem)) row.classList.add("consumption-just-added");
+        });
+        $("#tableConsumptionPreview .consumption-just-added")?.scrollIntoView({ block: "nearest" });
+        await new Promise((resolve) => window.setTimeout(resolve, 2200));
+      }
+      dialog?.close();
+      clearConsumptionEntry(form);
+      if (quickCheckout) openPaymentDialog(sessionId);
+      return sessionId;
+    } catch (error) {
+      if (!confirmed) { state.consumptionDrafts = drafts; renderConsumptionSelection(); }
+      throw error;
+    } finally {
+      form.inert = false;
+      delete form.dataset.localSubmitInProgress;
     }
-    state.consumptionDrafts = [];
-    state.consumptionDraftEditIndex = -1;
-    renderConsumptionSelection();
-    const sessionId = result.sessionId;
-    $("#consumptionDialog")?.close();
-    clearConsumptionEntry(form);
-    if (quickCheckout) openPaymentDialog(sessionId);
-    return sessionId;
   };
 
   const bindConsumptionConfirmShortcut = () => {
@@ -8393,7 +8426,7 @@ const App = (() => {
 
   const cancelConsumption = () => {
     const form = $("#consumptionForm");
-    if (!form) return;
+    if (!form || form.dataset.localSubmitInProgress === "1") return;
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
     const quickCheckout = form.quick_checkout.value === "1";
     state.consumptionDrafts = [];
@@ -8426,6 +8459,7 @@ const App = (() => {
     renderConsumptionSelection();
     if ($("#tableSessionActions")) $("#tableSessionActions").hidden = true;
     if ($("#tableConsumptionPreview")) $("#tableConsumptionPreview").hidden = true;
+    $("#consumptionLayout")?.classList.add("without-consumption-preview");
     if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = true;
     if ($("#consumptionEyebrow")) $("#consumptionEyebrow").textContent = "Consumo";
     if ($("#consumptionDialogTitle")) $("#consumptionDialogTitle").textContent = "Editar consumo";
@@ -9246,6 +9280,10 @@ const App = (() => {
       markIncomeRangePreset();
       void loadIncomeReport();
     });
+    $("#incomeEditForm")?.addEventListener("change", (event) => {
+      updateIncomeEditPayments(event.currentTarget, event.target.name === "payment_method");
+    });
+    $("#incomeEditForm")?.addEventListener("input", (event) => updateIncomeEditPayments(event.currentTarget));
     $("#incomeEditForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveIncomeEdit(event.currentTarget);
@@ -9797,7 +9835,7 @@ const App = (() => {
           $("#incomeEditDialog")?.close();
           openDeleteIncomeDialog(saleId);
         }
-        else line?.remove();
+        else { line?.remove(); updateIncomeEditPayments($("#incomeEditForm")); }
       }
       if (target.dataset.closeDialog !== undefined) target.closest("dialog")?.close();
       if (target.dataset.copyQr) await copyQr(target.dataset.copyQr);
@@ -9848,11 +9886,12 @@ const App = (() => {
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("broadcast", { event: "request-arrived" }, ({ payload }) => void refreshAdminRequests(payload?.requestIds))
       .on("broadcast", { event: "reports-refresh" }, () => void refreshBackgroundReports({ force:true }))
       .on("broadcast", { event: "inventory-refresh" }, () => void refreshInventoryFromPeer())
       .on("broadcast", { event: "users-refresh" }, () => { if (isBoss()) void loadUsers(); })
       .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
-      .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
+      .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, (event) => { receiveAdminRequests([event.new]); void refreshAdminNow(); })
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow);
     state.subscriptions.push(channel);
@@ -10641,7 +10680,8 @@ const App = (() => {
     await waitForAdminLogin();
     loadInventoryStore();
     void loadUsers().then(renderUsers);
-    state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") === "1";
+    state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") !== "0";
+    if (state.soundEnabled) localStorage.setItem("waiter_alarm_enabled", "1");
     const initialSection = pendingScan ? "service" : (location.hash.replace("#", "") || "dashboard");
     renderAdminShell();
     renderBusinessForm();
