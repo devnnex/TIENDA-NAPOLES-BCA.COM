@@ -55,7 +55,7 @@ const SupabaseDb = (() => {
       if (authToken) headers.set("x-app-token", authToken);
       if (clientTableAccess.table_id) headers.set("x-table-id", clientTableAccess.table_id);
       if (clientTableAccess.code) headers.set("x-table-code", clientTableAccess.code);
-      return fetch(input, { ...options, headers }).then((response) => {
+      return fetch(input, { ...options, headers, cache: "no-store" }).then((response) => {
         try {
           const url = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url);
           const method = String(options.method || input?.method || "GET").toUpperCase();
@@ -319,7 +319,7 @@ const App = (() => {
     incomeRevision: "",
     incomeLoading: false,
     incomeRequestId: 0,
-    incomeRangePreset: "month",
+    incomeRangePreset: "today",
     incomePageLoading: false,
     incomeFetchedAt: 0,
     incomeAppliedRange: null,
@@ -747,6 +747,7 @@ const App = (() => {
     syncAdminSectionAccess();
     if (section === "tips" && !tipsEnabled()) section = canAccessAdminSection("accounts") ? "accounts" : firstAllowedAdminSection();
     if (!canAccessAdminSection(section)) section = firstAllowedAdminSection();
+    const enteringIncome = section === "income" && state.activeAdminSection !== "income";
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -789,6 +790,8 @@ const App = (() => {
           if (!state.movementLoaded && !state.movementLoading) void loadInventoryMovements();
         }
         if (section === "income") {
+          if (enteringIncome) { setIncomeRange("today", false); state.incomeReport = null; }
+          renderSalesShift();
           initializeIncomeFilters();
           if (state.incomeRangePreset !== "custom") {
             const currentRange = incomeRangeDates(state.incomeRangePreset);
@@ -2690,6 +2693,23 @@ const App = (() => {
     state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 0);
   };
 
+  const signalRequestArrival = async (attempt = 0) => {
+    // El aviso HTTP no depende de que el WebSocket del navegador esté conectado.
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 3000);
+    try {
+      const response = await fetch(`${SUPABASE_CONFIG.url}/realtime/v1/api/broadcast`, {
+        method: "POST", cache: "no-store", signal: controller.signal,
+        headers: { apikey: SUPABASE_CONFIG.anonKey, Authorization: `Bearer ${SUPABASE_CONFIG.anonKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: [{ topic: "admin", event: "refresh", payload: {}, private: false }] })
+      });
+      if (!response.ok) throw new Error("Aviso pendiente");
+    } catch (_) {
+      if (attempt < 3) window.setTimeout(() => void signalRequestArrival(attempt + 1), 1000 * (attempt + 1));
+      // La consulta periódica del admin también recupera las solicitudes ya guardadas.
+    } finally { window.clearTimeout(timeout); }
+  };
+
   const flushRequestOutbox = async () => {
     if (state.requestOutboxBusy || !navigator.onLine) return;
     const now = Date.now();
@@ -2707,29 +2727,27 @@ const App = (() => {
     state.requestOutboxBusy = true;
     let results = null;
     try {
-      const batch = await dbQuiet(
+      const batch = await readRealtimeData(
         state.sb.rpc("createServiceRequestsBatch", {
           requests: due.map(({ attempts, next_attempt_at, ...event }) => event)
-        }),
-        null
+        })
       );
       results = batch?.results || null;
 
       // Compatibilidad mientras se publica el backend por lotes.
       if (!results) {
         results = await Promise.all(due.map(async (item) => {
-          let result = await dbQuiet(state.sb.rpc("createServiceRequest", item), null);
+          let result = await readRealtimeData(state.sb.rpc("createServiceRequest", item));
           if (result?.duplicate && result.request?.id !== item.request_id) result = null;
           if (result) return result;
-          const request = await dbQuiet(
+          const request = await readRealtimeData(
             state.sb.from("service_requests").insert({
               id: item.request_id,
               table_id: item.table_id,
               session_id: item.session_id || null,
               request_type: item.request_type,
               message: item.message || ""
-            }).select("*").single(),
-            null
+            }).select("*").single()
           );
           return request ? { request, duplicate: false } : null;
         }));
@@ -2753,7 +2771,10 @@ const App = (() => {
         return [{ ...item, attempts, next_attempt_at: Date.now() + delay }];
       });
       writeRequestOutbox(nextOutbox);
-      if (succeeded.size) state.adminBroadcastChannel?.send?.({ type: "broadcast", event: "refresh", payload: { requestIds: Array.from(succeeded) } });
+      if (succeeded.size) {
+        void signalRequestArrival();
+        try { Promise.resolve(state.adminBroadcastChannel?.send?.({ type: "broadcast", event: "refresh", payload: {} })).catch(() => undefined); } catch (_) {}
+      }
       renderBillChat();
     } finally {
       state.requestOutboxBusy = false;
@@ -3962,7 +3983,7 @@ const App = (() => {
         void refreshCoreNow();
         if (isBoss()) void loadUsers();
       }
-    }, SYNC_INTERVAL_MS);
+    }, Math.min(SYNC_INTERVAL_MS, 1500));
   };
 
   const pendingAdminRequestsStorageKey = () => `napoles_pending_admin_requests_v1:${SUPABASE_CONFIG.url}`;
@@ -4015,7 +4036,7 @@ const App = (() => {
     // Una omisión del snapshot no confirma que alguien haya aceptado la solicitud.
     const missingIds = [...knownPending.keys()].filter((id) => !incoming.has(id) || !livePending.has(id));
     for (let offset = 0; offset < missingIds.length; offset += 100) {
-      const confirmed = await dbQuiet(state.sb.from("service_requests").select("*").in("id", missingIds.slice(offset, offset + 100)), null);
+      const confirmed = await readRealtimeData(state.sb.from("service_requests").select("*").in("id", missingIds.slice(offset, offset + 100)));
       if (Array.isArray(confirmed)) confirmed.forEach((request) => incoming.set(request.id, request));
     }
     // Al recargar, la caché sola no prueba que una solicitud siga pendiente.
@@ -5588,18 +5609,173 @@ const App = (() => {
     return date.toISOString().slice(0, 10);
   };
 
-  const incomeRangeDates = (preset = "today") => {
-    const today = businessDateKey();
-    let from = today;
-    let to = today;
-    if (preset === "yesterday") from = to = shiftBusinessDateKey(today, -1);
-    if (preset === "7days") from = shiftBusinessDateKey(today, -6);
-    if (preset === "15days") from = shiftBusinessDateKey(today, -14);
-    if (preset === "30days") from = shiftBusinessDateKey(today, -29);
-    if (preset === "month") from = `${today.slice(0, 7)}-01`;
-    if (preset === "year") from = `${today.slice(0, 4)}-01-01`;
-    return { dateFrom: from, dateTo: to };
+  const salesShiftStorageKey = () => `napoles_shared_sales_shift_v1:${SUPABASE_CONFIG.url}`;
+  const persistSalesShift = async (shift, pending = null) => {
+    const value = { shift, pending };
+    if (typeof persistDurableJson === "function") {
+      if (!await persistDurableJson(salesShiftStorageKey(), value)) throw new Error("No se pudo guardar el turno en este equipo. Intenta de nuevo.");
+    } else localStorage.setItem(salesShiftStorageKey(), JSON.stringify(value));
+    state.salesShift = shift;
+    state.salesShiftPending = pending;
   };
+  const renderSalesShift = () => {
+    const button = $("#salesShiftBase");
+    if (!button) return;
+    const shift = state.salesShift;
+    if (!shift) {
+      button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno</small><strong>Registrar turno</strong><small>${state.salesShiftError ? escapeHTML(state.salesShiftError) : "Configura el horario y la base compartida"}</small></span>`;
+    } else {
+      button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno · ${escapeHTML(shift.date)}</small><strong>${money(shift.base)}</strong><small>Inicial: ${money(shift.initialBase)} · ${escapeHTML(SalesShift.timeLabel(shift.startMinutes))}–${escapeHTML(SalesShift.timeLabel(shift.endMinutes))}</small><small>${state.salesShiftPending ? "Guardado en este equipo · pendiente de compartir" : `Actualizada: ${escapeHTML(formatIncomeDate(shift.updatedAt))}`}</small></span>${icon("pencil", 15)}`;
+    }
+    refreshIcons();
+  };
+  const refreshSalesShiftRange = () => {
+    renderSalesShift();
+    if (state.incomeRangePreset !== "today") return;
+    const range = SalesShift.today(state.salesShift);
+    const signature = JSON.stringify(range);
+    if (state.salesShiftRangeSignature === signature) return;
+    state.salesShiftRangeSignature = signature;
+    window.clearTimeout(state.salesShiftBoundaryTimer);
+    state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt) - Date.now() + 25)));
+    setIncomeRange("today", false);
+    if (state.activeAdminSection === "income") void loadIncomeReport();
+  };
+  const syncSalesShift = async () => {
+    if (!state.currentUser || !canAccessAdminSection("income") || state.salesShiftSyncBusy) return false;
+    state.salesShiftSyncBusy = true;
+    try {
+      const pending = state.salesShiftPending;
+      const result = await appsScriptRequest(pending ? "save_sales_shift" : "get_sales_shift", pending || {}, 12000);
+      if (!result?.ok) {
+        if (pending && result?.retryable === false && Object.prototype.hasOwnProperty.call(result, "shift")) {
+          await persistSalesShift(result.shift, null);
+          toast(result.error || "El turno cambió en otro equipo. Revisa la base antes de guardar nuevamente.", "error", "sales-shift-conflict");
+          refreshSalesShiftRange();
+        }
+        throw new Error(result?.error || "No se pudo consultar el turno compartido.");
+      }
+      // Un formulario puede guardarse mientras llega esta lectura. No sustituir su operación pendiente.
+      if (state.salesShiftPending && state.salesShiftPending.id !== pending?.id) return false;
+      await persistSalesShift(result.shift || null, null);
+      state.salesShiftError = "";
+      refreshSalesShiftRange();
+      if (pending) toast("Turno y base compartidos con todos los equipos.", "ok", "sales-shift-saved");
+      return true;
+    } catch (error) {
+      state.salesShiftError = /accion no permitida/i.test(normalizeText(error?.message || ""))
+        ? "Falta publicar la actualización de turnos en Apps Script."
+        : "Sin conexión al turno compartido";
+      renderSalesShift();
+      return false;
+    } finally { state.salesShiftSyncBusy = false; }
+  };
+  const updateSalesShiftForm = () => {
+    const form = $("#salesShiftForm");
+    if (!form) return;
+    const action = form.elements.namedItem("action").value;
+    const editing = action !== "new";
+    form.elements.namedItem("date").readOnly = editing;
+    for (const name of ["start_time", "start_period", "end_time", "end_period"]) form.elements.namedItem(name).disabled = editing;
+    $("#salesShiftAmountLabel").textContent = action === "add" ? "Dinero adicional" : editing ? "Saldo base actualizado" : "Saldo base inicial";
+    $("#salesShiftHint").textContent = editing
+      ? "La base se comparte entre todos los equipos y no se suma a los ingresos por ventas."
+      : "Si el cierre es anterior al inicio, termina al día siguiente. Horario de Colombia.";
+    if (editing && state.salesShiftFormSnapshot) {
+      const shift = state.salesShiftFormSnapshot;
+      form.elements.namedItem("date").value = shift.date;
+      for (const [prefix, minutes] of [["start", shift.startMinutes], ["end", shift.endMinutes]]) {
+        const value = SalesShift.timeParts(minutes);
+        form.elements.namedItem(`${prefix}_time`).value = value.text;
+        form.elements.namedItem(`${prefix}_period`).value = value.period;
+      }
+      setCurrencyInputValue(form.elements.namedItem("amount"), action === "add" ? 0 : shift.base);
+    } else {
+      form.elements.namedItem("date").value = SalesShift.dateKey();
+      form.elements.namedItem("start_time").value = "";
+      form.elements.namedItem("end_time").value = "";
+      form.elements.namedItem("start_period").value = "PM";
+      form.elements.namedItem("end_period").value = "AM";
+      setCurrencyInputValue(form.elements.namedItem("amount"), 0);
+    }
+    $("#salesShiftError").textContent = "";
+  };
+  const openSalesShift = () => {
+    if (!canAccessAdminSection("income")) return;
+    const dialog = $("#salesShiftDialog"), form = $("#salesShiftForm");
+    if (!dialog || !form || dialog.open) return;
+    state.salesShiftFormSnapshot = state.salesShift ? { ...state.salesShift } : null;
+    const interval = SalesShift.bounds(state.salesShift);
+    const current = interval && Date.now() < interval.end;
+    const action = form.elements.namedItem("action");
+    action.querySelector('[value="new"]').disabled = Boolean(current);
+    action.querySelector('[value="replace"]').disabled = !state.salesShift;
+    action.querySelector('[value="add"]').disabled = !state.salesShift;
+    action.value = current ? "replace" : "new";
+    updateSalesShiftForm();
+    bindCurrencyInputs(form);
+    dialog.showModal();
+  };
+  const saveSalesShift = async (form) => {
+    const errorBox = $("#salesShiftError"), button = form.querySelector('[type="submit"]');
+    if (button.disabled) return;
+    errorBox.textContent = "";
+    if (state.salesShiftPending) { errorBox.textContent = "Hay un cambio de base pendiente de compartir. Espera a que vuelva la conexión."; return; }
+    const action = form.elements.namedItem("action").value;
+    const amount = currencyInputNumber(form.elements.namedItem("amount"));
+    const previous = state.salesShiftFormSnapshot;
+    const start = SalesShift.parseTime(form.elements.namedItem("start_time").value, form.elements.namedItem("start_period").value);
+    const end = SalesShift.parseTime(form.elements.namedItem("end_time").value, form.elements.namedItem("end_period").value);
+    if (action === "new" && (!start || !end || start.minutes === end.minutes)) {
+      errorBox.textContent = "Escribe dos horas distintas entre 1:00 y 12:59, con AM o PM. Puedes escribir 800 o 8:00.";
+      return;
+    }
+    if (amount > 999999999999 || (action === "add" && amount <= 0)) { errorBox.textContent = "Escribe un valor válido en pesos; la base adicional debe ser mayor que cero."; return; }
+    if (action !== "new" && !previous) return;
+    const now = new Date().toISOString();
+    const operation = { id: uid(), action, amount, expectedId: previous?.id || "", expectedVersion: previous?.version || 0,
+      date: form.elements.namedItem("date").value, startMinutes: start?.minutes, endMinutes: end?.minutes };
+    const next = action === "new"
+      ? { id: operation.id, date: operation.date, startMinutes: start.minutes, endMinutes: end.minutes, initialBase: amount, base: amount, version: 1, createdAt: now, updatedAt: now }
+      : { ...previous, base: action === "add" ? previous.base + amount : amount, version: previous.version + 1, updatedAt: now };
+    if (!SalesShift.bounds(next) || next.base > 999999999999) { errorBox.textContent = "Revisa la fecha, el horario y el saldo base."; return; }
+    button.disabled = true;
+    try {
+      await persistSalesShift(next, operation);
+      $("#salesShiftDialog").close();
+      refreshSalesShiftRange();
+      void syncSalesShift();
+    } catch (error) { errorBox.textContent = error.message; }
+    finally { button.disabled = false; }
+  };
+  const bindSalesShift = () => {
+    $("#salesShiftBase")?.addEventListener("click", () => { void syncSalesShift(); openSalesShift(); });
+    const form = $("#salesShiftForm");
+    form?.addEventListener("submit", (event) => { event.preventDefault(); void saveSalesShift(form); });
+    form?.elements.namedItem("action").addEventListener("change", updateSalesShiftForm);
+    for (const prefix of ["start", "end"]) form?.elements.namedItem(`${prefix}_time`).addEventListener("blur", () => {
+      const input = form.elements.namedItem(`${prefix}_time`);
+      const parsed = SalesShift.parseTime(input.value, form.elements.namedItem(`${prefix}_period`).value);
+      if (parsed) input.value = parsed.text;
+    });
+  };
+  const startSalesShift = () => {
+    if (!canAccessAdminSection("income")) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem(salesShiftStorageKey()) || "null");
+      state.salesShift = saved?.shift || null;
+      state.salesShiftPending = saved?.pending || null;
+    } catch (_) { state.salesShift = null; state.salesShiftPending = null; }
+    renderSalesShift();
+    void syncSalesShift().finally(() => {
+      if (!state.salesShiftPrompted) { state.salesShiftPrompted = true; openSalesShift(); }
+    });
+    window.clearInterval(state.salesShiftTimer);
+    state.salesShiftTimer = window.setInterval(() => { refreshSalesShiftRange(); void syncSalesShift(); }, 15000);
+    for (const event of ["online", "focus"]) window.addEventListener(event, () => { refreshSalesShiftRange(); void syncSalesShift(); });
+  };
+
+  const incomeRangeDates = (preset = "today") => SalesShift.range(preset, state.salesShift);
 
   const markIncomeRangePreset = () => {
     $$('[data-income-range]').forEach((button) => {
@@ -5637,9 +5813,16 @@ const App = (() => {
 
   const incomeFiltersFromForm = () => {
     initializeIncomeFilters();
+    const current = state.incomeRangePreset === "today" ? SalesShift.today(state.salesShift) : null;
+    if (current) {
+      $("#incomeDateFrom").value = current.dateFrom;
+      $("#incomeDateTo").value = current.dateTo;
+      state.incomeAppliedRange = current;
+    }
     return {
       dateFrom: state.incomeAppliedRange?.dateFrom || businessDateKey(),
       dateTo: state.incomeAppliedRange?.dateTo || businessDateKey(),
+      ...(current || {}),
       paymentMethod: $("#incomePaymentMethod")?.value || "all",
       query: $("#incomeSearch")?.value.trim() || "",
       limit: 300
@@ -5720,8 +5903,7 @@ const App = (() => {
         items
       };
     }).filter((record) => {
-      const dateKey = incomeRecordDateKey(record.date);
-      if (dateKey < filters.dateFrom || dateKey > filters.dateTo) return false;
+      if (!SalesShift.matches(record.date, filters)) return false;
       if (filters.paymentMethod === "mixed" && !record.isMixed) return false;
       if (!["all", "mixed"].includes(filters.paymentMethod) && !record.payments.some((payment) => payment.method === filters.paymentMethod)) return false;
       const haystack = normalizeText([record.invoice, record.table, record.payer, record.waiter, record.reference, record.items.map((item) => item.name).join(" ")].join(" "));
@@ -5856,6 +6038,7 @@ const App = (() => {
   };
 
   const renderIncomeReport = (appendFrom = 0) => {
+    renderSalesShift();
     const kpis = $("#incomeKpis");
     const payments = $("#incomePaymentBreakdown");
     const recordsTarget = $("#incomeRecords");
@@ -5885,7 +6068,7 @@ const App = (() => {
     const filters = report.filters || incomeFiltersFromForm();
     if (summaryTarget) {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
-      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}`;
+      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
     }
     const appendOnly = appendFrom > 0 && recordsTarget.querySelectorAll(".income-record").length === appendFrom;
     const visibleRecords = appendOnly ? report.records.slice(appendFrom) : report.records;
@@ -5954,6 +6137,7 @@ const App = (() => {
       if (requestId !== state.incomeRequestId) return false;
       if (result?.stale) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
+      if (filters.startAt && result.intervalApplied !== true) throw new Error("Publica la actualización de turnos en Apps Script para consultar este horario.");
       if (result.stale) throw new Error("El historial cambió mientras se calculaba. Actualiza el informe.");
       if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error("El respaldo remoto no devolvió los datos necesarios para paginar ventas.");
       if (requestId !== state.incomeRequestId) return false;
@@ -6046,6 +6230,7 @@ const App = (() => {
     try {
       const result = await appsScriptRequest("get_income_report", { filters: { ...report.filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar la siguiente página.");
+      if (report.filters?.startAt && result.intervalApplied !== true) throw new Error("El respaldo todavía no admite el horario del turno.");
       if (requestId !== state.incomeRequestId || state.incomeReport !== report) return false;
       if (result.stale) {
         await loadIncomeReport();
@@ -8937,6 +9122,7 @@ const App = (() => {
   };
 
   const bindAdmin = () => {
+    bindSalesShift();
     bindAccountFeatures();
     $("#accountsSearch")?.addEventListener("input", () => renderAccounts());
     $("#openCashDrawer")?.addEventListener("click", () => void openCashDrawer());
@@ -9057,7 +9243,6 @@ const App = (() => {
         return;
       }
       state.incomeAppliedRange = { dateFrom, dateTo };
-      state.incomeRangePreset = "custom";
       markIncomeRangePreset();
       void loadIncomeReport();
     });
@@ -9646,6 +9831,16 @@ const App = (() => {
   };
 
   const subscribeAdmin = () => {
+    if (!state.authToken) return;
+    const previous = state.adminBroadcastChannel;
+    if (previous && !state.adminRealtimeNeedsReconnect) return;
+    window.clearTimeout(state.adminReconnectTimer);
+    state.adminBroadcastChannel = null;
+    if (previous) {
+      state.subscriptions = state.subscriptions.filter((entry) => entry !== previous);
+      void state.sb.removeChannel(previous);
+    }
+    state.adminRealtimeNeedsReconnect = false;
     if (!state.peerSyncListener) {
       state.peerSyncListener = (event) => notifyAdminPeers(event.detail);
       window.addEventListener("napoles-remote-change", state.peerSyncListener);
@@ -9659,18 +9854,26 @@ const App = (() => {
       .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
-      .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
-      .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          setRealtimeStatus("En vivo", "live");
-          void refreshAdminNow();
-        }
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setRealtimeStatus("Respaldo cada 5 segundos", "fallback");
-        }
-      });
+      .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow);
     state.subscriptions.push(channel);
     state.adminBroadcastChannel = channel;
+    channel.subscribe((status) => {
+      if (state.adminBroadcastChannel !== channel) return;
+      if (status === "SUBSCRIBED") {
+        state.adminRealtimeNeedsReconnect = false;
+        window.clearTimeout(state.adminReconnectTimer);
+        setRealtimeStatus("En vivo", "live");
+        void refreshAdminNow();
+      }
+      if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+        state.adminRealtimeNeedsReconnect = true;
+        window.clearTimeout(state.adminReconnectTimer);
+        state.adminReconnectTimer = window.setTimeout(() => {
+          if (state.adminBroadcastChannel === channel && state.authToken) subscribeAdmin();
+        }, 3000);
+        setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
+      }
+    });
   };
 
   const tableFromScannedValue = (value) => {
@@ -10445,8 +10648,10 @@ const App = (() => {
     showAdminSection(initialSection);
     updateAlarmButton();
     bindAdmin();
+    startSalesShift();
     armAlarmOnFirstGesture();
     subscribeAdmin();
+    startAdminPolling();
     startAlarmLoop();
     setLoading(false);
     await loadBootstrap();
@@ -10462,7 +10667,6 @@ const App = (() => {
       if (!isWaiter()) void flushAppsScriptOutbox();
       void refreshBackgroundReports({ force: true });
     });
-    startAdminPolling();
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
       cleanUrl.searchParams.delete("scan");
@@ -10481,6 +10685,8 @@ const App = (() => {
       if (!state.currentSession) void hydrateSelectedTable(state.currentTable.id);
     }
     if (state.page === "admin" && state.authToken) {
+      subscribeAdmin();
+      startAdminPolling();
       void refreshAdminNow();
       state.adminChats.forEach((chat) => void loadChatMessages(chat.sessionId, chat.table));
     }

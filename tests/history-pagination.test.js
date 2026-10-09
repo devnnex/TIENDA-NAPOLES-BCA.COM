@@ -86,6 +86,7 @@ class FixedDate extends Date {
   constructor(...args) { super(...(args.length ? args : ["2026-09-22T02:00:00Z"])); }
 }
 const rangeContext = vm.createContext({ Date: FixedDate, Intl, state: { businessTimeZone: "America/Bogota" } });
+vm.runInContext(fs.readFileSync("sales-shift.js", "utf8"), rangeContext);
 vm.runInContext(`${rangeSource}\nthis.incomeRangeDates = incomeRangeDates;`, rangeContext);
 assert.equal(rangeContext.incomeRangeDates("today").dateFrom, "2026-09-21");
 assert.equal(rangeContext.incomeRangeDates("yesterday").dateFrom, "2026-09-20");
