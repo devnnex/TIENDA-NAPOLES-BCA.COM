@@ -122,11 +122,12 @@ function harness(storage = new Map()) {
   await h.api.loadAdminData();
   assert.deepEqual([...h.ids()], ['first', 'second', 'chat']);
   assert.equal(h.api.groupedActiveRequests().length, 3, 'Dos solicitudes de la misma mesa y tipo conservan tarjetas individuales.');
+  assert.deepEqual([...h.api.groupedActiveRequests()].map(row => row.id), ['chat', 'second', 'first'], 'Las tarjetas del admin muestran primero la solicitud más reciente.');
   h.api.renderAlerts();
   assert.equal((h.alerts.innerHTML.match(/data-accept-request=/g) || []).length, 3);
   h.state.alertFilter = 'waiter';
   h.api.renderAlerts();
-  assert.ok(h.alerts.innerHTML.indexOf('data-alert-card="first"') < h.alerts.innerHTML.indexOf('data-alert-card="second"'), 'El filtro por tipo conserva el orden de llegada.');
+  assert.ok(h.alerts.innerHTML.indexOf('data-alert-card="second"') < h.alerts.innerHTML.indexOf('data-alert-card="first"'), 'El filtro por tipo muestra primero la solicitud más reciente.');
   assert.ok(!h.alerts.innerHTML.includes('data-alert-card="chat"'));
 
   h.backend.snapshot = { requests: [second], sessions: [] };

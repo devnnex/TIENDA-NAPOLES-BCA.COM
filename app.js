@@ -2546,10 +2546,12 @@ const App = (() => {
 
   const assistantSay = (role, text) => {
     const thread = state.assistantThreads[state.assistantMode] || [];
-    thread.push({ role, text, local: true, created_at: new Date().toISOString() });
+    const message = { id: uid(), role, text, local: true, created_at: new Date().toISOString() };
+    thread.push(message);
     state.assistantThreads[state.assistantMode] = thread.slice(-40);
     state.assistantMessages = state.assistantThreads[state.assistantMode];
     renderAssistant();
+    return message;
   };
 
   const renderAssistant = () => {
@@ -2575,15 +2577,18 @@ const App = (() => {
     const activeThread = (state.assistantThreads[state.assistantMode] || [])
       .filter((message) => songMode || !state.adminChatActive || message.role !== "bot");
     const serverMessages = !songMode ? state.chatMessages.map((message) => ({
+      id: message.id,
       role: message.sender_type === "client" ? "user" : message.sender_type === "staff" ? "staff" : "system",
       text: message.body,
-      created_at: message.created_at
+      created_at: activeThread.find((local) => local.id === message.id)?.created_at || message.created_at
     })) : [];
     const hasJoinNotice = serverMessages.some((message) => message.role === "system" && normalizeText(message.text).includes("se unio al chat"));
     const localJoinNotice = !songMode && state.adminChatActive && state.adminChatNotice && !hasJoinNotice
       ? [{ role: "system", text: state.adminChatNotice, local: true, created_at: new Date().toISOString() }]
       : [];
-    const messages = [...serverMessages, ...activeThread, ...localJoinNotice].filter((message, index, values) => !message.local || !values.some((candidate) => !candidate.local && candidate.text === message.text && candidate.role === message.role));
+    const messages = [...serverMessages, ...activeThread, ...localJoinNotice]
+      .filter((message) => !message.local || !message.id || !serverMessages.some((candidate) => candidate.id === message.id))
+      .sort((left, right) => (Date.parse(left.created_at) || 0) - (Date.parse(right.created_at) || 0));
     const visibleMessages = messages.length
       ? messages
       : [{
@@ -2592,10 +2597,14 @@ const App = (() => {
             ? "Escribe el nombre exacto de la canción y, si lo conoces, también el artista. Enviaremos tu solicitud al equipo."
             : "Hola, soy tu agente de bar. Dime qué deseas pedir y enviaré la solicitud al mesero para que confirme contigo los detalles."
         }];
-    chat.innerHTML = visibleMessages
-      .map((message) => `<div class="assistant-message ${message.role}">${message.role === "staff" ? `<small>Administrador</small>` : ""}${escapeHTML(message.text)}</div>`)
-      .join("");
-    chat.scrollTop = chat.scrollHeight;
+    const renderSignature = JSON.stringify([state.assistantMode, visibleMessages.map((message) => [message.id, message.role, message.text])]);
+    if (renderSignature !== state.assistantRenderSignature) {
+      state.assistantRenderSignature = renderSignature;
+      chat.innerHTML = visibleMessages
+        .map((message) => `<div class="assistant-message ${message.role}">${message.role === "staff" ? `<small>Administrador</small>` : ""}${escapeHTML(message.text)}</div>`)
+        .join("");
+      chat.scrollTop = chat.scrollHeight;
+    }
     if (songMode) {
       suggestions.innerHTML = `<span class="assistant-song-hint">${icon("music", 16)} Ejemplo: Nombre de la canción — Artista</span>`;
     } else {
@@ -2832,10 +2841,10 @@ const App = (() => {
     return true;
   };
 
-  const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable } = {}) => {
+  const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable, messageId: localMessageId } = {}) => {
     const clean = String(body || "").trim().replace(/\s+/g, " ").slice(0, 600);
     if (!clean || !sessionId) return null;
-    const messageId = uid();
+    const messageId = localMessageId || uid();
     const payload = {
       ...chatRpcPayload(sessionId, table),
       p_message_id: messageId,
@@ -3117,11 +3126,11 @@ const App = (() => {
     const text = message.trim();
     if (!text) return;
     if (songTurnCount() >= 5) { showSongLimitNotice(); return; }
-    assistantSay("user", text);
+    const localMessage = assistantSay("user", text);
     if (state.currentTable) {
       const session = state.currentSession || await ensureOpenSession(state.currentTable.id);
       if (session) {
-        void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable }).then((saved) => {
+        void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable, messageId: localMessage?.id }).then((saved) => {
           if (saved) broadcastChatEvent("chat-refresh");
         });
         if (!state.adminChatActive) {
@@ -4238,7 +4247,7 @@ const App = (() => {
     });
 
   const groupedActiveRequests = () => {
-    return [...activeRequests()].sort(compareRequestArrival).map((request) => ({
+    return [...activeRequests()].sort((left, right) => compareRequestArrival(right, left)).map((request) => ({
       ...request, kind: requestKind(request), request_ids: [request.id], count: 1, latest_message: request.message || ""
     }));
   };
