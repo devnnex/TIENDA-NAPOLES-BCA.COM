@@ -2090,7 +2090,7 @@ const App = (() => {
     void pollDrawerReceiver();
   };
 
-  const openCashDrawer = async () => {
+  const openCashDrawer = async ({ localOnly = false } = {}) => {
     if (!state.currentUser || !state.authToken || drawerOpenBusy) return false;
     drawerOpenBusy = true;
     try {
@@ -2103,6 +2103,7 @@ const App = (() => {
         drawerReceiverData = local;
         return await sendCashDrawerPulse(local.settings);
       }
+      if (localOnly) return false;
       if (state.posFeatures?.remote_drawer && navigator.onLine) {
         try { return await openRemoteCashDrawer(); }
         catch (error) { if (!local?.printers?.length) { toast(error.message, "error", "remote-drawer-failed"); return false; } }
@@ -4259,7 +4260,7 @@ const App = (() => {
         if (wasVisible) setTableConsumptionPreviewVisible(true);
       }
       toast("Abono guardado: " + money(amount) + ". Saldo: " + money(sessionBalance(session)), "ok", "abono:" + id);
-      if (form.payment_method.value === "cash") void openCashDrawer();
+      if (form.payment_method.value === "cash") void openCashDrawer({ localOnly: true });
     } catch (error) {
       toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
     } finally { delete form.dataset.saving; button.disabled = false; }
@@ -7666,7 +7667,7 @@ const App = (() => {
     $("#paymentDialog")?.close();
     renderInventory();
     renderTips();
-    void openCashDrawer();
+    void openCashDrawer({ localOnly: true });
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
