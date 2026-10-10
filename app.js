@@ -372,9 +372,6 @@ const App = (() => {
     activeAdminSection: "dashboard",
     dashboardTableGroupFilter: "all",
     tableManagerGroupFilter: "all",
-    adminSectionSwitchToken: 0,
-    adminSectionSwitchFrame: 0,
-    adminSectionSwitchTimer: 0,
     tableManagerRenderSignature: "",
     usersRenderSignature: "",
     adminAiRenderSignature: "",
@@ -535,7 +532,9 @@ const App = (() => {
     crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
   const refreshIcons = () => {
-    if (window.lucide) window.lucide.createIcons();
+    if (window.lucide) window.lucide.createIcons({
+      root: { querySelectorAll: (selector) => document.querySelectorAll(`${selector}:not(svg)`) }
+    });
   };
 
   const setLoading = (isLoading) => {
@@ -773,55 +772,53 @@ const App = (() => {
       if (active) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
-    const switchToken = ++state.adminSectionSwitchToken;
-    window.cancelAnimationFrame(state.adminSectionSwitchFrame);
-    window.clearTimeout(state.adminSectionSwitchTimer);
-    state.adminSectionSwitchFrame = window.requestAnimationFrame(() => {
-      if (state.activeAdminSection !== section || switchToken !== state.adminSectionSwitchToken) return;
-      state.adminSectionSwitchTimer = window.setTimeout(() => {
-        if (state.activeAdminSection !== section || switchToken !== state.adminSectionSwitchToken) return;
-        if (section === "dashboard") {
-          renderAlerts();
-          renderTables();
+    if (section === "dashboard") {
+      renderAlerts();
+      renderTables();
+    }
+    if (section === "accounts") renderAccounts();
+    if (section === "tips") renderTips();
+    if (section === "service") {
+      renderServiceTables();
+      renderWaiterTableSelect();
+    }
+    if (section === "menu") {
+      renderMenuManager();
+      renderTableManager();
+      renderTableFormQr();
+    }
+    if (section === "brand") renderBusinessForm();
+    if (section === "inventory") {
+      renderInventory();
+      void syncInventoryWithAppsScript();
+    }
+    if (section === "movements") {
+      renderInventoryMovements();
+      if (!state.movementLoaded && !state.movementLoading) void loadInventoryMovements();
+    }
+    if (section === "income") {
+      if (enteringIncome) {
+        const previousRange = state.incomeReport?.filters;
+        const todayRange = incomeRangeDates("today");
+        setIncomeRange("today", false);
+        if (!previousRange || ["dateFrom", "dateTo", "startAt", "endAt"].some((key) =>
+          String(previousRange[key] || "") !== String(todayRange[key] || ""))) state.incomeReport = null;
+      }
+      renderSalesShift();
+      initializeIncomeFilters();
+      if (state.incomeRangePreset !== "custom") {
+        const currentRange = incomeRangeDates(state.incomeRangePreset);
+        if (currentRange.dateFrom !== state.incomeAppliedRange?.dateFrom || currentRange.dateTo !== state.incomeAppliedRange?.dateTo) {
+          setIncomeRange(state.incomeRangePreset, false);
+          state.incomeReport = null;
         }
-        if (section === "accounts") renderAccounts();
-        if (section === "tips") renderTips();
-        if (section === "service") {
-          renderServiceTables();
-          renderWaiterTableSelect();
-        }
-        if (section === "menu") {
-          renderTableManager();
-          renderTableFormQr();
-        }
-        if (section === "brand") renderBusinessForm();
-        if (section === "inventory") {
-          renderInventory();
-          void syncInventoryWithAppsScript();
-        }
-        if (section === "movements") {
-          renderInventoryMovements();
-          if (!state.movementLoaded && !state.movementLoading) void loadInventoryMovements();
-        }
-        if (section === "income") {
-        state.incomeSaleTypeSnapshot = null;
-          if (enteringIncome) { setIncomeRange("today", false); state.incomeReport = null; }
-          renderSalesShift();
-          initializeIncomeFilters();
-          if (state.incomeRangePreset !== "custom") {
-            const currentRange = incomeRangeDates(state.incomeRangePreset);
-            if (currentRange.dateFrom !== state.incomeAppliedRange?.dateFrom || currentRange.dateTo !== state.incomeAppliedRange?.dateTo) {
-              setIncomeRange(state.incomeRangePreset, false);
-              state.incomeReport = null;
-            }
-          }
-          renderIncomeReport();
-          if (!state.incomeLoading && !state.incomeReport) void loadIncomeReport();
-        }
-        if (section === "users") renderUsers();
-        if (section === "assistant") renderAdminAi();
-      }, 0);
-    });
+      }
+      renderIncomeReport();
+      if (!state.incomeLoading && !state.incomeReport) void loadIncomeReport();
+      else if (enteringIncome && !state.incomeLoading) void loadIncomeReport({ background: true });
+    }
+    if (section === "users") renderUsers();
+    if (section === "assistant") renderAdminAi();
   };
 
   const findTableFromUrl = () => {
@@ -6074,6 +6071,26 @@ const App = (() => {
     }
   };
 
+  const previewIncomeSearch = () => {
+    const filters = incomeFiltersFromForm();
+    const snapshot = state.incomeSaleTypeSnapshot;
+    if (!snapshot || snapshot.key !== incomeSaleTypeFiltersKey({ ...filters, query: "" })
+      || !Array.isArray(snapshot.report.records)
+      || snapshot.report.records.length < Number(snapshot.report.totalRecords || 0)) return false;
+    const query = normalizeText(filters.query || "");
+    const records = snapshot.report.records.filter((record) => !query || normalizeText([
+      record.invoice, record.table, record.payer, record.waiter, record.reference,
+      (record.items || []).map((item) => item.name).join(" ")
+    ].join(" ")).includes(query));
+    const ids = new Set(records.map((record) => String(record.saleId)));
+    state.incomeReport = mergeIncomeReport({ ...snapshot.report, records,
+      totals: incomeTotalsFromRecords(records), totalRecords: records.length,
+      recordRows: (snapshot.report.recordRows || []).filter((row) => ids.has(String(row.saleId))),
+      nextIndex: records.length, truncated: false }, filters);
+    renderIncomeReport();
+    return true;
+  };
+
   const incomePaymentLabel = (method) => ({
     cash: "Efectivo",
     transfer: "Transferencia",
@@ -9627,7 +9644,8 @@ const App = (() => {
       clearTimeout(state.incomeSearchTimer);
       state.incomeRequestId += 1;
       state.incomePageLoading = false;
-      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 350);
+      const previewed = previewIncomeSearch();
+      state.incomeSearchTimer = window.setTimeout(() => void loadIncomeReport({ background: previewed }), previewed ? 150 : 0);
     });
     $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
     $("#incomeSaleType")?.addEventListener("change", applyIncomeSaleTypeFilter);
@@ -11013,6 +11031,7 @@ const App = (() => {
     if (hadCredentialParams) history.replaceState(null, "", `${loginUrl.pathname}${loginUrl.search}${loginUrl.hash}`);
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
+    const bootstrapReady = loadBootstrap();
     loadInventoryStore();
     void loadUsers().then(renderUsers);
     state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") !== "0";
@@ -11029,15 +11048,15 @@ const App = (() => {
     startAdminPolling();
     startAlarmLoop();
     setLoading(false);
-    await loadBootstrap();
-    await ensurePresetCategories();
+    await bootstrapReady;
+    void ensurePresetCategories();
     const currentSection = state.activeAdminSection || location.hash.replace("#", "") || initialSection;
     renderAdminShell();
     renderBusinessForm();
     showAdminSection(currentSection);
     renderTableFormQr();
     initRemoteStorage();
-    window.setTimeout(() => void refreshBackgroundReports({ force: true }), 400);
+    void refreshBackgroundReports({ force: true });
     window.addEventListener("online", () => {
       if (!isWaiter()) void flushAppsScriptOutbox();
       void refreshBackgroundReports({ force: true });
