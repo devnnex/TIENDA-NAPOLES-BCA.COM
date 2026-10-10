@@ -24,7 +24,7 @@ const setup=(method,closed=true,device='bridge')=>{
   closeSession:async(id,checkout)=>{assert.equal(id,account.id);assert.equal(checkout.paid,40);return closed?{session:account,saved:{closed_at:'2026-10-07T19:00:00Z'},totals:{subtotal:100,total:100}}:null;},
   uid:()=> 'invoice-8',sessionReference:()=> 'M8',sessionLabel:()=> 'Mesa 8',paymentMethodLabel:()=>method,
   applyPaidInventoryLocally:()=>{},applyInvoiceToInventory:invoice=>calls.push(invoice),
-  renderInventory:()=>{},renderTips:()=>{},printThermalReceipt:()=>calls.push('print')});
+  renderInventory:()=>calls.push('render-inventory'),renderTips:()=>{},printThermalReceipt:()=>calls.push('print')});
  vm.runInContext(section('sessionPayments','abonoRowsHtml')+section('openLocalCashDrawer','getAppsScriptUrl')
   +section('processPayment','renderConsumptionSelection')+';globalThis.process=processPayment;globalThis.openDrawer=openCashDrawer;',context);
  return {context,calls,form};
@@ -37,6 +37,7 @@ for(const method of ['cash','transfer','breb','mixed'])for(const action of ['sav
   assert.equal(invoice.payments.reduce((sum,row)=>sum+row.amount,0),100);
   assert.equal(invoice.totals.total,100);assert.equal(invoice.changeDue,method==='cash'?40:0);
   assert.equal(app.calls.filter(call=>call==='drawer').length,1);
+  assert.ok(app.calls.indexOf('drawer')<app.calls.indexOf('render-inventory'),'El pulso sale antes de reconstruir la interfaz.');
   assert.equal(app.calls.filter(call=>call==='print').length,action==='print'?1:0);
  });
 }
