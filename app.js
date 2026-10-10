@@ -6138,6 +6138,7 @@ const App = (() => {
   };
 
   const loadIncomeReport = async ({ background = false, manual = false } = {}) => {
+    if (state.pendingIncomeEdits?.size) return false;
     if (!$("#income") || !canAccessAdminSection("income")) return false;
     clearTimeout(state.incomeSearchTimer);
     state.incomeSearchTimer = null;
@@ -6237,6 +6238,7 @@ const App = (() => {
   };
 
   const loadMoreIncomeRecords = async () => {
+    if (state.pendingIncomeEdits?.size) return false;
     const report = state.incomeReport;
     if (!report || state.incomeLoading || state.incomePageLoading) return false;
     const start = Number(report.nextIndex || 0);
@@ -6500,6 +6502,10 @@ const App = (() => {
 
   const openIncomeEdit = (saleId) => {
     if (!isBoss()) return;
+    if (state.pendingIncomeEdits?.has(String(saleId))) {
+      toast("La correccion de esta venta se esta guardando.", "ok", `income-saving:${saleId}`);
+      return;
+    }
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     const form = $("#incomeEditForm");
     if (!record || !form) return;
@@ -6596,6 +6602,25 @@ const App = (() => {
     }
   };
 
+  const replaceEditedIncomeRecord = (previous, next) => {
+    const report = state.incomeReport;
+    if (!report?.records?.some((entry) => String(entry.saleId) === String(previous.saleId))) return;
+    const before = incomeTotalsFromRecords([previous]);
+    const after = incomeTotalsFromRecords([next]);
+    const totals = { ...(report.totals || incomeTotalsFromRecords(report.records)) };
+    Object.keys(after).forEach((key) => {
+      if (key !== "averageTicket") totals[key] = Number(totals[key] || 0) - Number(before[key] || 0) + Number(after[key] || 0);
+    });
+    totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
+    const update = (records) => records.map((entry) => String(entry.saleId) === String(previous.saleId) ? next : entry);
+    state.incomeReport = {
+      ...report,
+      totals,
+      records: update(report.records),
+      ...(report.allLocalRecords ? { allLocalRecords: update(report.allLocalRecords) } : {})
+    };
+  };
+
   const saveIncomeEdit = async (form) => {
     if (!isBoss()) return;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(form.sale_id.value));
@@ -6643,24 +6668,66 @@ const App = (() => {
       totals: { subtotal, discount: 0, tax: 0, serviceFee: 0, total },
       items
     };
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+    if (!(state.pendingIncomeEdits instanceof Set)) state.pendingIncomeEdits = new Set();
+    if (state.pendingIncomeEdits.has(String(record.saleId))) return;
+    state.pendingIncomeEdits.add(String(record.saleId));
+    state.incomeRequestId += 1;
+    state.incomeLoading = false;
+    state.incomePageLoading = false;
+    const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
+    const previousInvoice = localIndex >= 0 ? state.invoiceHistory[localIndex] : null;
+    if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...previousInvoice, ...corrected };
+    else state.invoiceHistory.push(corrected);
+    persistInvoiceHistory();
+    const correctedCost = items.reduce((sum, item) => sum + Number(item.unit_cost || 0) * Number(item.quantity || 0), 0);
+    const correctedRecord = {
+      ...record,
+      table: corrected.table,
+      date: corrected.createdAt,
+      payer: corrected.payerName,
+      waiter: corrected.waiterName,
+      payments: corrected.payments,
+      isMixed: corrected.paymentMethod === "mixed",
+      reference: corrected.reference,
+      subtotal,
+      discount: 0,
+      tax: 0,
+      service: 0,
+      total,
+      cost: correctedCost,
+      profit: total - correctedCost,
+      items: corrected.items.map((item) => ({
+        lineId: item.id,
+        menuItemId: item.menu_item_id,
+        name: item.item_name,
+        quantity: item.quantity,
+        unitPrice: item.unit_price,
+        total: item.quantity * item.unit_price,
+        cost: item.quantity * item.unit_cost,
+        profit: item.quantity * (item.unit_price - item.unit_cost)
+      }))
+    };
+    replaceEditedIncomeRecord(record, correctedRecord);
+    $("#incomeEditDialog")?.close();
+    renderIncomeReport();
+    toast("Venta actualizada. Guardando la correccion...", "ok", `income-saving:${record.saleId}`);
     try {
       const result = await appsScriptRequest("edit_sale", { invoice: corrected }, 40000);
       if (!result?.ok) throw new Error(result?.error || "No se pudo corregir la venta.");
-      const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
-      if (localIndex >= 0) {
-        state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
-        persistInvoiceHistory();
-      }
-      $("#incomeEditDialog")?.close();
-      state.incomeReport = null;
-      await loadIncomeReport();
       toast("Venta corregida. El cambio quedo registrado en auditoria.", "ok", `income-edited:${record.saleId}`);
     } catch (error) {
+      const currentIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
+      if (currentIndex >= 0) {
+        if (previousInvoice) state.invoiceHistory[currentIndex] = previousInvoice;
+        else state.invoiceHistory.splice(currentIndex, 1);
+        persistInvoiceHistory();
+      }
+      replaceEditedIncomeRecord(correctedRecord, record);
+      renderIncomeReport();
       toast(String(error?.message || error), "error", `income-edit-failed:${record.saleId}`);
     } finally {
-      if (submit) submit.disabled = false;
+      state.pendingIncomeEdits.delete(String(record.saleId));
+      if (!state.pendingIncomeEdits.size) void loadIncomeReport({ background: true });
     }
   };
 
@@ -8039,12 +8106,12 @@ const App = (() => {
   const setTableConsumptionPreviewVisible = (visible) => {
     const preview = $("#tableConsumptionPreview");
     const button = $("#viewTableConsumption");
-    if (!preview || !button || button.hidden) return;
-    visible = true;
-    preview.hidden = false;
+    if (!preview || !button) return;
+    visible = !window.matchMedia("(max-width: 640px)").matches || visible;
+    preview.hidden = !visible;
     button.innerHTML = visible
-      ? `${icon("list-x", 17)} Esconder lista`
-      : `${icon("receipt-text", 17)} Ver consumo`;
+      ? `${icon("list-x", 17)} Ocultar desglose`
+      : `${icon("receipt-text", 17)} Ver desglose`;
     button.setAttribute("aria-expanded", String(visible));
     refreshIcons();
   };
@@ -8089,16 +8156,17 @@ const App = (() => {
     const viewButton = $("#viewTableConsumption");
     const chargeButton = $("#chargeTableAccount");
     const releaseButton = $("#releaseEmptyTable");
-    if (viewButton) viewButton.hidden = emptyAccount;
+    if (viewButton) viewButton.hidden = emptyAccount || !session || isLocalWalkInSession(session);
     if (chargeButton) chargeButton.hidden = emptyAccount;
     if (releaseButton) releaseButton.hidden = !emptyAccount;
     actions.classList.toggle("is-single", emptyAccount);
     const quickCheckout = $("#consumptionForm")?.quick_checkout.value === "1";
-    preview.hidden = quickCheckout;
+    const previewWasVisible = $("#consumptionDialog")?.open && !preview.hidden;
+    preview.hidden = quickCheckout || (window.matchMedia("(max-width: 640px)").matches && !previewWasVisible);
     $("#consumptionLayout")?.classList.toggle("without-consumption-preview", quickCheckout);
     preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(session ? sessionTotal(session) : 0)}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div data-consumption-item="${escapeHTML(item.id)}"><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
     if (session) preview.innerHTML += abonoRowsHtml(session) + (sessionPaid(session) ? `<div class="account-abono-summary">Saldo pendiente: ${money(sessionBalance(session))}</div>` : "");
-    if (!quickCheckout) setTableConsumptionPreviewVisible(true);
+    if (!quickCheckout) setTableConsumptionPreviewVisible(Boolean(previewWasVisible));
   };
 
   const addConsumptionBatch = async (form, drafts) => {
@@ -8330,6 +8398,7 @@ const App = (() => {
       if (!quickCheckout && dialog?.open) {
         const session = state.sessions.find((entry) => entry.id === sessionId);
         renderTableConsumptionPreview(session);
+        setTableConsumptionPreviewVisible(true);
         renderLastConsumptionTime(session);
         const addedIds = new Set((result.items || []).map((item) => String(item.id)));
         $$('[data-consumption-item]', $("#tableConsumptionPreview")).forEach((row) => {
@@ -9538,8 +9607,13 @@ const App = (() => {
       else showWaiterTableOptions();
     });
     document.addEventListener("pointerdown", (event) => {
+      if (event.button === 0 && event.target.closest('#consumptionDialog [data-cancel-consumption]')) {
+        event.preventDefault();
+        cancelConsumption();
+        return;
+      }
       if (!event.target.closest("#waiterTableCombobox")) closeWaiterTableOptions();
-      if (!event.target.closest("#consumptionProductCombobox")) closeConsumptionProductOptions();
+      if (!event.target.closest("#consumptionProductCombobox, #viewTableConsumption")) closeConsumptionProductOptions();
     });
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
