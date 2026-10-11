@@ -799,10 +799,11 @@ const App = (() => {
     if (section === "income") {
       if (enteringIncome) {
         const previousRange = state.incomeReport?.filters;
-        const todayRange = incomeRangeDates("today");
-        setIncomeRange("today", false);
+        const preset = state.incomeRangePreset === "shift" && (state.salesShiftHistory || []).some((shift) => shift.id === state.selectedSalesShiftId) ? "shift" : "today";
+        const activeRange = incomeRangeDates(preset);
+        setIncomeRange(preset, false);
         if (!previousRange || ["dateFrom", "dateTo", "startAt", "endAt"].some((key) =>
-          String(previousRange[key] || "") !== String(todayRange[key] || ""))) state.incomeReport = null;
+          String(previousRange[key] || "") !== String(activeRange[key] || ""))) state.incomeReport = null;
       }
       renderSalesShift();
       initializeIncomeFilters();
@@ -813,9 +814,9 @@ const App = (() => {
           state.incomeReport = null;
         }
       }
-      renderIncomeReport();
+      if (state.incomeRangePreset !== "shift" || state.incomeRenderedReport !== state.incomeReport) renderIncomeReport();
       if (!state.incomeLoading && !state.incomeReport) void loadIncomeReport();
-      else if (enteringIncome && !state.incomeLoading) void loadIncomeReport({ background: true });
+      else if (enteringIncome && !state.incomeLoading && state.incomeRangePreset !== "shift") void loadIncomeReport({ background: true });
     }
     if (section === "users") renderUsers();
     if (section === "assistant") renderAdminAi();
@@ -5805,23 +5806,33 @@ const App = (() => {
     const button = $("#salesShiftBase");
     if (!button) return;
     const shift = state.salesShift;
+    let summary;
     if (!shift) {
-      button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno</small><strong>Registrar turno</strong><small>${state.salesShiftError ? escapeHTML(state.salesShiftError) : "Configura el horario y la base compartida"}</small></span>`;
+      summary = `${icon("wallet", 18)}<span><small>Base del turno</small><strong>Registrar turno</strong><small>${state.salesShiftError ? escapeHTML(state.salesShiftError) : "Configura el horario y la base compartida"}</small></span>`;
     } else {
-      button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno · ${escapeHTML(SalesShift.dateLabel(shift.date))}</small><strong>${money(shift.base)}</strong><small>Inicial: ${money(shift.initialBase)} · ${escapeHTML(SalesShift.timeLabel(shift.startMinutes))}–${escapeHTML(SalesShift.timeLabel(shift.endMinutes))}</small><small>${state.salesShiftPending ? "Guardado en este equipo · pendiente de compartir" : `Actualizada: ${escapeHTML(formatIncomeDate(shift.updatedAt))}`}</small></span>${icon("pencil", 15)}`;
+      summary = `${icon("wallet", 18)}<span><small>Base del turno · ${escapeHTML(SalesShift.dateLabel(shift.date))}</small><strong>${money(shift.base)}</strong><small>Inicial: ${money(shift.initialBase)} · ${escapeHTML(SalesShift.timeLabel(shift.startMinutes))}–${escapeHTML(SalesShift.timeLabel(shift.endMinutes))}</small><small>${state.salesShiftPending ? "Guardado en este equipo · pendiente de compartir" : `Actualizada: ${escapeHTML(formatIncomeDate(shift.updatedAt))}`}</small></span>${icon("pencil", 15)}`;
+    }
+    if (state.salesShiftRenderedSummary !== summary) {
+      button.innerHTML = summary;
+      state.salesShiftRenderedSummary = summary;
+      refreshIcons();
     }
     const history = $("#salesShiftHistory"), edit = $("#editSalesShiftHistory");
     if (history) {
       const shifts = [...(state.salesShiftHistory || [])].sort((a, b) => b.date.localeCompare(a.date));
-      history.innerHTML = '<option value="">Elegir un día</option>' + shifts.map((item) => {
+      const options = '<option value="">Elegir un día</option>' + shifts.map((item) => {
         const end = SalesShift.bounds(item)?.end;
         const endDate = end ? SalesShift.dateKey(new Date(end - 1)) : item.date;
         return `<option value="${escapeHTML(item.id)}">${escapeHTML(SalesShift.dateLabel(item.date, true))} · ${escapeHTML(SalesShift.timeLabel(item.startMinutes))} a ${escapeHTML(SalesShift.timeLabel(item.endMinutes))}${endDate !== item.date ? ` (${escapeHTML(SalesShift.dateLabel(endDate, true))})` : ""}</option>`;
       }).join("");
-      history.value = state.incomeRangePreset === "shift" ? state.selectedSalesShiftId || "" : "";
+      if (state.salesShiftRenderedOptions !== options) {
+        history.innerHTML = options;
+        state.salesShiftRenderedOptions = options;
+      }
+      const selected = state.incomeRangePreset === "shift" ? state.selectedSalesShiftId || "" : "";
+      if (history.value !== selected) history.value = selected;
       if (edit) edit.disabled = !history.value || Boolean(state.salesShiftPending);
     }
-    refreshIcons();
   };
   const refreshSalesShiftRange = () => {
     renderSalesShift();
@@ -5829,9 +5840,6 @@ const App = (() => {
     const range = incomeRangeDates(state.incomeRangePreset);
     const signature = JSON.stringify(range);
     if (state.salesShiftRangeSignature === signature) return;
-    state.salesShiftRangeSignature = signature;
-    window.clearTimeout(state.salesShiftBoundaryTimer);
-    if (state.incomeRangePreset === "today") state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt) - Date.now() + 25)));
     setIncomeRange(state.incomeRangePreset, false);
     if (state.activeAdminSection === "income") void loadIncomeReport();
   };
@@ -5851,7 +5859,10 @@ const App = (() => {
       }
       // Un formulario puede guardarse mientras llega esta lectura. No sustituir su operación pendiente.
       if (state.salesShiftPending && state.salesShiftPending.id !== pending?.id) return false;
-      await persistSalesShift(result.shift || null, null, result.shifts || []);
+      const nextShift = result.shift || null, nextHistory = result.shifts || [];
+      if (pending || JSON.stringify({ shift: nextShift, shifts: nextHistory }) !== JSON.stringify({ shift: state.salesShift, shifts: state.salesShiftHistory || [] })) {
+        await persistSalesShift(nextShift, null, nextHistory);
+      }
       state.salesShiftError = "";
       refreshSalesShiftRange();
       if (pending) toast("Turno y base compartidos con todos los equipos.", "ok", "sales-shift-saved");
@@ -6023,6 +6034,11 @@ const App = (() => {
     from.value = range.dateFrom;
     to.value = range.dateTo;
     state.incomeAppliedRange = range;
+    if (preset === "today" || preset === "shift") {
+      state.salesShiftRangeSignature = JSON.stringify(range);
+      window.clearTimeout(state.salesShiftBoundaryTimer);
+      if (preset === "today") state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt) - Date.now() + 25)));
+    }
     markIncomeRangePreset();
     renderSalesShift();
     if (refresh) void loadIncomeReport();
@@ -6409,8 +6425,15 @@ const App = (() => {
     }
     const limitedText = hasMore ? ` · mostrando ${report.records.length} ventas` : "";
     setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+    state.incomeRenderedReport = report;
     refreshIcons();
   };
+
+  const incomeReportVisibleSignature = (report) => JSON.stringify({
+    filters: report?.filters, totals: report?.totals, records: report?.records,
+    recordRows: report?.recordRows, totalRecords: report?.totalRecords,
+    nextIndex: report?.nextIndex, pendingCount: report?.pendingCount, localOnly: report?.localOnly
+  });
 
   const loadIncomeReport = async ({ background = false, manual = false } = {}) => {
     if (state.pendingIncomeEdits?.size) return false;
@@ -6451,10 +6474,14 @@ const App = (() => {
       } else {
         state.incomeSaleTypeSnapshot = null;
       }
-      state.incomeReport = mergeIncomeReport(result, filters);
+      const nextReport = mergeIncomeReport(result, filters);
+      const unchangedShift = background && state.incomeRangePreset === "shift" && previousReport
+        && incomeReportVisibleSignature(previousReport) === incomeReportVisibleSignature(nextReport);
+      state.incomeReport = nextReport;
       state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
-      if (state.activeAdminSection === "income") renderIncomeReport();
+      if (unchangedShift) state.incomeRenderedReport = nextReport;
+      else if (state.activeAdminSection === "income") renderIncomeReport();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;

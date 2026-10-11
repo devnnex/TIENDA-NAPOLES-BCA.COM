@@ -57,6 +57,47 @@ test('Turno configurado local o remoto evita el modal al refrescar; sin turno ab
   }
 });
 
+test('Un turno seleccionado no vuelve a consultar ventas hasta que cambia su horario', () => {
+  const state = { incomeRangePreset: 'today', selectedSalesShiftId: 'shift-1', activeAdminSection: 'income' };
+  const fields = { '#incomeDateFrom': { value: '' }, '#incomeDateTo': { value: '' } };
+  let loads = 0, endAt = '2026-10-11T07:00:00.000Z';
+  const range = () => ({ dateFrom: '2026-10-10', dateTo: '2026-10-11', startAt: '2026-10-10T16:00:00.000Z', endAt, shiftId: 'shift-1' });
+  const context = vm.createContext({ state, incomeRangeDates: range, renderSalesShift() {}, markIncomeRangePreset() {},
+    loadIncomeReport: () => { loads++; }, $: selector => fields[selector],
+    window: { clearTimeout() {}, setTimeout() { return 1; } }, Date });
+  vm.runInContext(section('refreshSalesShiftRange', 'syncSalesShift') + section('setIncomeRange', 'incomeFiltersFromForm')
+    + ';globalThis.select = setIncomeRange; globalThis.refresh = refreshSalesShiftRange;', context);
+  context.select('shift');
+  context.refresh();
+  context.refresh();
+  assert.equal(loads, 1, 'La selección hace una sola consulta inicial.');
+  endAt = '2026-10-11T08:00:00.000Z';
+  context.refresh();
+  context.refresh();
+  assert.equal(loads, 2, 'Un cambio real de horario hace una sola consulta adicional.');
+});
+
+test('Sin cambios remotos, la sincronización conserva el selector y el cuadro del turno', () => {
+  const shift = { id: 'shift-1', date: '2026-10-10', startMinutes: 660, endMinutes: 120,
+    base: 250000, initialBase: 250000, updatedAt: '2026-10-11T05:42:00Z' };
+  const state = { salesShift: shift, salesShiftHistory: [shift], incomeRangePreset: 'shift', selectedSalesShiftId: shift.id };
+  let summaryWrites = 0, optionWrites = 0, iconRefreshes = 0;
+  const button = { set innerHTML(value) { summaryWrites++; } };
+  const history = { value: '', set innerHTML(value) { optionWrites++; } };
+  const edit = { disabled: true };
+  const context = vm.createContext({ state, SalesShift, icon: () => '<svg></svg>', money: value => String(value),
+    escapeHTML: value => String(value), formatIncomeDate: value => String(value), refreshIcons: () => iconRefreshes++,
+    $: selector => ({ '#salesShiftBase': button, '#salesShiftHistory': history, '#editSalesShiftHistory': edit })[selector] });
+  vm.runInContext(section('renderSalesShift', 'refreshSalesShiftRange') + ';globalThis.render = renderSalesShift;', context);
+  context.render();
+  context.render();
+  assert.equal(summaryWrites, 1);
+  assert.equal(optionWrites, 1);
+  assert.equal(iconRefreshes, 1);
+  assert.equal(history.value, shift.id);
+  assert.equal(edit.disabled, false);
+});
+
 test('Aviso de solicitud lee la fila confirmada y la muestra aunque el snapshot siga ocupado', async () => {
   const state = { authToken: 'staff', adminSyncBusy: true, tables: [{ id: 'table-1' }], requests: [] };
   let renders = 0, saved = [];
