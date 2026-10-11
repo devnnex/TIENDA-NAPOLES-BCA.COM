@@ -45,6 +45,12 @@ const SalesShift = (() => {
       ? Math.max(midnight(date), interval.end) : midnight(date);
     return { dateFrom: date, dateTo: date, startAt: new Date(start).toISOString(), endAt: new Date(midnight(date) + dayMs).toISOString() };
   };
+  const shiftRange = (shift) => {
+    const interval = bounds(shift);
+    if (!interval) return null;
+    return { dateFrom: shift.date, dateTo: dateKey(new Date(interval.end - 1)),
+      startAt: new Date(interval.start).toISOString(), endAt: new Date(interval.end).toISOString(), shiftId: shift.id };
+  };
   const range = (preset, shift, now = new Date()) => {
     if (preset === "today") return today(shift, now);
     const date = dateKey(now);
@@ -65,6 +71,6 @@ const SalesShift = (() => {
     const key = dateKey(new Date(timestamp));
     return key >= filters.dateFrom && key <= filters.dateTo;
   };
-  return { zone, dateKey, parseTime, timeParts, timeLabel, bounds, today, range, matches };
+  return { zone, dateKey, parseTime, timeParts, timeLabel, bounds, today, shiftRange, range, matches };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = SalesShift;

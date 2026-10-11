@@ -5792,13 +5792,14 @@ const App = (() => {
   };
 
   const salesShiftStorageKey = () => `napoles_shared_sales_shift_v1:${SUPABASE_CONFIG.url}`;
-  const persistSalesShift = async (shift, pending = null) => {
-    const value = { shift, pending };
+  const persistSalesShift = async (shift, pending = null, shifts = state.salesShiftHistory || []) => {
+    const value = { shift, pending, shifts };
     if (typeof persistDurableJson === "function") {
       if (!await persistDurableJson(salesShiftStorageKey(), value)) throw new Error("No se pudo guardar el turno en este equipo. Intenta de nuevo.");
     } else localStorage.setItem(salesShiftStorageKey(), JSON.stringify(value));
     state.salesShift = shift;
     state.salesShiftPending = pending;
+    state.salesShiftHistory = shifts;
   };
   const renderSalesShift = () => {
     const button = $("#salesShiftBase");
@@ -5809,18 +5810,29 @@ const App = (() => {
     } else {
       button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno · ${escapeHTML(shift.date)}</small><strong>${money(shift.base)}</strong><small>Inicial: ${money(shift.initialBase)} · ${escapeHTML(SalesShift.timeLabel(shift.startMinutes))}–${escapeHTML(SalesShift.timeLabel(shift.endMinutes))}</small><small>${state.salesShiftPending ? "Guardado en este equipo · pendiente de compartir" : `Actualizada: ${escapeHTML(formatIncomeDate(shift.updatedAt))}`}</small></span>${icon("pencil", 15)}`;
     }
+    const history = $("#salesShiftHistory"), edit = $("#editSalesShiftHistory");
+    if (history) {
+      const shifts = [...(state.salesShiftHistory || [])].sort((a, b) => b.date.localeCompare(a.date));
+      history.innerHTML = '<option value="">Elegir un día</option>' + shifts.map((item) => {
+        const end = SalesShift.bounds(item)?.end;
+        const endDate = end ? SalesShift.dateKey(new Date(end - 1)) : item.date;
+        return `<option value="${escapeHTML(item.id)}">${escapeHTML(item.date)} · ${escapeHTML(SalesShift.timeLabel(item.startMinutes))} a ${escapeHTML(SalesShift.timeLabel(item.endMinutes))}${endDate !== item.date ? ` (${escapeHTML(endDate)})` : ""}</option>`;
+      }).join("");
+      history.value = state.incomeRangePreset === "shift" ? state.selectedSalesShiftId || "" : "";
+      if (edit) edit.disabled = !history.value || Boolean(state.salesShiftPending);
+    }
     refreshIcons();
   };
   const refreshSalesShiftRange = () => {
     renderSalesShift();
-    if (state.incomeRangePreset !== "today") return;
-    const range = SalesShift.today(state.salesShift);
+    if (!["today", "shift"].includes(state.incomeRangePreset)) return;
+    const range = incomeRangeDates(state.incomeRangePreset);
     const signature = JSON.stringify(range);
     if (state.salesShiftRangeSignature === signature) return;
     state.salesShiftRangeSignature = signature;
     window.clearTimeout(state.salesShiftBoundaryTimer);
-    state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt) - Date.now() + 25)));
-    setIncomeRange("today", false);
+    if (state.incomeRangePreset === "today") state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt) - Date.now() + 25)));
+    setIncomeRange(state.incomeRangePreset, false);
     if (state.activeAdminSection === "income") void loadIncomeReport();
   };
   const syncSalesShift = async () => {
@@ -5831,7 +5843,7 @@ const App = (() => {
       const result = await appsScriptRequest(pending ? "save_sales_shift" : "get_sales_shift", pending || {}, 12000);
       if (!result?.ok) {
         if (pending && result?.retryable === false && Object.prototype.hasOwnProperty.call(result, "shift")) {
-          await persistSalesShift(result.shift, null);
+          await persistSalesShift(result.shift, null, result.shifts || []);
           toast(result.error || "El turno cambió en otro equipo. Revisa la base antes de guardar nuevamente.", "error", "sales-shift-conflict");
           refreshSalesShiftRange();
         }
@@ -5839,7 +5851,7 @@ const App = (() => {
       }
       // Un formulario puede guardarse mientras llega esta lectura. No sustituir su operación pendiente.
       if (state.salesShiftPending && state.salesShiftPending.id !== pending?.id) return false;
-      await persistSalesShift(result.shift || null, null);
+      await persistSalesShift(result.shift || null, null, result.shifts || []);
       state.salesShiftError = "";
       refreshSalesShiftRange();
       if (pending) toast("Turno y base compartidos con todos los equipos.", "ok", "sales-shift-saved");
@@ -5856,12 +5868,15 @@ const App = (() => {
     const form = $("#salesShiftForm");
     if (!form) return;
     const action = form.elements.namedItem("action").value;
-    const editing = action !== "new";
-    form.elements.namedItem("date").readOnly = editing;
-    for (const name of ["start_time", "start_period", "end_time", "end_period"]) form.elements.namedItem(name).disabled = editing;
+    const editing = action !== "new", editingSchedule = action === "edit";
+    form.elements.namedItem("date").readOnly = editing && !editingSchedule;
+    for (const name of ["start_time", "start_period", "end_time", "end_period"]) form.elements.namedItem(name).disabled = editing && !editingSchedule;
+    form.elements.namedItem("amount").disabled = editingSchedule;
+    form.elements.namedItem("amount").parentElement.hidden = editingSchedule;
     $("#salesShiftAmountLabel").textContent = action === "add" ? "Dinero adicional" : editing ? "Saldo base actualizado" : "Saldo base inicial";
-    $("#salesShiftHint").textContent = editing
-      ? "La base se comparte entre todos los equipos y no se suma a los ingresos por ventas."
+    $("#salesShiftHint").textContent = editingSchedule
+      ? "Corrige el día y las horas de este turno. El saldo base se conserva. El cierre anterior al inicio corresponde al día siguiente."
+      : editing ? "La base se comparte entre todos los equipos y no se suma a los ingresos por ventas."
       : "Si el cierre es anterior al inicio, termina al día siguiente. Horario de Colombia.";
     if (editing && state.salesShiftFormSnapshot) {
       const shift = state.salesShiftFormSnapshot;
@@ -5882,18 +5897,21 @@ const App = (() => {
     }
     $("#salesShiftError").textContent = "";
   };
-  const openSalesShift = () => {
+  const openSalesShift = (shiftId = "") => {
     if (!canAccessAdminSection("income")) return;
     const dialog = $("#salesShiftDialog"), form = $("#salesShiftForm");
     if (!dialog || !form || dialog.open) return;
-    state.salesShiftFormSnapshot = state.salesShift ? { ...state.salesShift } : null;
+    const chosen = shiftId ? (state.salesShiftHistory || []).find((item) => item.id === shiftId) : state.salesShift;
+    state.salesShiftFormSnapshot = chosen ? { ...chosen } : null;
     const interval = SalesShift.bounds(state.salesShift);
     const current = interval && Date.now() < interval.end;
     const action = form.elements.namedItem("action");
-    action.querySelector('[value="new"]').disabled = Boolean(current);
-    action.querySelector('[value="replace"]').disabled = !state.salesShift;
-    action.querySelector('[value="add"]').disabled = !state.salesShift;
-    action.value = current ? "replace" : "new";
+    const historical = Boolean(shiftId && shiftId !== state.salesShift?.id);
+    action.querySelector('[value="new"]').disabled = Boolean(current || shiftId);
+    action.querySelector('[value="replace"]').disabled = !state.salesShift || historical;
+    action.querySelector('[value="add"]').disabled = !state.salesShift || historical;
+    action.querySelector('[value="edit"]').disabled = !state.salesShiftFormSnapshot;
+    action.value = shiftId ? "edit" : current ? "replace" : "new";
     updateSalesShiftForm();
     bindCurrencyInputs(form);
     dialog.showModal();
@@ -5908,7 +5926,7 @@ const App = (() => {
     const previous = state.salesShiftFormSnapshot;
     const start = SalesShift.parseTime(form.elements.namedItem("start_time").value, form.elements.namedItem("start_period").value);
     const end = SalesShift.parseTime(form.elements.namedItem("end_time").value, form.elements.namedItem("end_period").value);
-    if (action === "new" && (!start || !end || start.minutes === end.minutes)) {
+    if (["new", "edit"].includes(action) && (!start || !end || start.minutes === end.minutes)) {
       errorBox.textContent = "Escribe dos horas distintas entre 1:00 y 12:59, con AM o PM. Puedes escribir 800 o 8:00.";
       return;
     }
@@ -5919,11 +5937,16 @@ const App = (() => {
       date: form.elements.namedItem("date").value, startMinutes: start?.minutes, endMinutes: end?.minutes };
     const next = action === "new"
       ? { id: operation.id, date: operation.date, startMinutes: start.minutes, endMinutes: end.minutes, initialBase: amount, base: amount, version: 1, createdAt: now, updatedAt: now }
-      : { ...previous, base: action === "add" ? previous.base + amount : amount, version: previous.version + 1, updatedAt: now };
+      : action === "edit"
+        ? { ...previous, date: operation.date, startMinutes: start.minutes, endMinutes: end.minutes, version: previous.version + 1, updatedAt: now }
+        : { ...previous, base: action === "add" ? previous.base + amount : amount, version: previous.version + 1, updatedAt: now };
     if (!SalesShift.bounds(next) || next.base > 999999999999) { errorBox.textContent = "Revisa la fecha, el horario y el saldo base."; return; }
     button.disabled = true;
     try {
-      await persistSalesShift(next, operation);
+      const shifts = [...(state.salesShiftHistory || [])];
+      const index = shifts.findIndex((item) => item.id === next.id);
+      if (index < 0) shifts.push(next); else shifts[index] = next;
+      await persistSalesShift(action === "edit" && previous.id !== state.salesShift?.id ? state.salesShift : next, operation, shifts);
       $("#salesShiftDialog").close();
       refreshSalesShiftRange();
       void syncSalesShift();
@@ -5932,6 +5955,13 @@ const App = (() => {
   };
   const bindSalesShift = () => {
     $("#salesShiftBase")?.addEventListener("click", () => { void syncSalesShift(); openSalesShift(); });
+    $("#salesShiftHistory")?.addEventListener("change", (event) => {
+      const id = event.currentTarget.value;
+      if (!id) { setIncomeRange("today"); return; }
+      state.selectedSalesShiftId = id;
+      setIncomeRange("shift");
+    });
+    $("#editSalesShiftHistory")?.addEventListener("click", () => openSalesShift(state.selectedSalesShiftId));
     const form = $("#salesShiftForm");
     form?.addEventListener("submit", (event) => { event.preventDefault(); void saveSalesShift(form); });
     form?.elements.namedItem("action").addEventListener("change", updateSalesShiftForm);
@@ -5947,7 +5977,8 @@ const App = (() => {
       const saved = JSON.parse(localStorage.getItem(salesShiftStorageKey()) || "null");
       state.salesShift = saved?.shift || null;
       state.salesShiftPending = saved?.pending || null;
-    } catch (_) { state.salesShift = null; state.salesShiftPending = null; }
+      state.salesShiftHistory = saved?.shifts || (saved?.shift ? [saved.shift] : []);
+    } catch (_) { state.salesShift = null; state.salesShiftPending = null; state.salesShiftHistory = []; }
     renderSalesShift();
     state.salesShiftPrompted ||= Boolean(SalesShift.bounds(state.salesShift));
     void syncSalesShift().finally(() => {
@@ -5958,7 +5989,9 @@ const App = (() => {
     for (const event of ["online", "focus"]) window.addEventListener(event, () => { refreshSalesShiftRange(); void syncSalesShift(); });
   };
 
-  const incomeRangeDates = (preset = "today") => SalesShift.range(preset, state.salesShift);
+  const incomeRangeDates = (preset = "today") => preset === "shift"
+    ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", state.salesShift)
+    : SalesShift.range(preset, state.salesShift);
 
   const markIncomeRangePreset = () => {
     $$('[data-income-range]').forEach((button) => {
@@ -5991,12 +6024,13 @@ const App = (() => {
     to.value = range.dateTo;
     state.incomeAppliedRange = range;
     markIncomeRangePreset();
+    renderSalesShift();
     if (refresh) void loadIncomeReport();
   };
 
   const incomeFiltersFromForm = () => {
     initializeIncomeFilters();
-    const current = state.incomeRangePreset === "today" ? SalesShift.today(state.salesShift) : null;
+    const current = ["today", "shift"].includes(state.incomeRangePreset) ? incomeRangeDates(state.incomeRangePreset) : null;
     if (current) {
       $("#incomeDateFrom").value = current.dateFrom;
       $("#incomeDateTo").value = current.dateTo;

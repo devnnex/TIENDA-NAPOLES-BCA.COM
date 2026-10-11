@@ -5253,6 +5253,12 @@ body[data-page="admin"] { overflow-x: hidden; }
 
 /* Turno de ventas y base compartida. */
 .sales-shift-base { display: flex; align-items: center; gap: .8rem; margin: 0 0 1rem; padding: .85rem 1rem; max-width: 100%; text-align: left; color: #6d28d9; background: #f5f0ff; border: 1px solid #ddd0f8; border-radius: 16px; cursor: pointer; }
+.sales-shift-panel { width: fit-content; max-width: 100%; margin: 0 0 1rem; padding: .8rem; background: #f5f0ff; border: 1px solid #ddd0f8; border-radius: 16px; }
+.sales-shift-panel .sales-shift-base { margin: 0; padding: 0; border: 0; border-radius: 0; }
+.sales-shift-history { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; margin-top: .8rem; padding-top: .8rem; border-top: 1px solid #ddd0f8; color: #6d28d9; font-size: .8rem; font-weight: 700; }
+.sales-shift-history select { max-width: min(100%, 390px); min-height: 40px; padding: .4rem .6rem; border: 1px solid #cbb9ef; border-radius: 9px; background: #fff; color: #442178; font: inherit; }
+.sales-shift-history button { min-height: 40px; padding: .4rem .7rem; border: 1px solid #cbb9ef; border-radius: 9px; background: #fff; color: #6d28d9; font: inherit; cursor: pointer; }
+.sales-shift-history button:disabled { opacity: .55; cursor: default; }
 .sales-shift-base > span { display: grid; gap: .18rem; }
 .sales-shift-base strong { font-size: 1.45rem; letter-spacing: -.025em; }
 .sales-shift-base small { font-size: .74rem; color: #6d4d91; line-height: 1.4; }
@@ -5265,6 +5271,7 @@ body[data-page="admin"] { overflow-x: hidden; }
 .sales-shift-card .eyebrow { color: #7c3aed; }
 .sales-shift-row, .sales-shift-hours { display: grid; grid-template-columns: 1fr 1fr; gap: .85rem; }
 .sales-shift-card label { display: grid; gap: .4rem; min-width: 0; font-size: .82rem; font-weight: 700; }
+.sales-shift-card label[hidden] { display: none; }
 .sales-shift-card input, .sales-shift-card select { width: 100%; min-width: 0; height: 46px; border: 1px solid #ddd6e8; border-radius: 12px; background: #fff; color: #241b35; font-size: 16px; }
 .sales-shift-card select option { background: #fff; color: #241b35; }
 .sales-shift-card input.sales-shift-amount { height: 56px; font-size: 1.5rem; font-weight: 800; color: #6d28d9; background: #faf7ff; border-color: #ddd0f8; }
@@ -5278,6 +5285,8 @@ body[data-page="admin"] { overflow-x: hidden; }
 .sales-shift-action[type="button"]:hover { background: #ede4fa; }
 .sales-shift-action:disabled { opacity: .6; cursor: wait; }
 @media (max-width: 560px) {
+  .sales-shift-panel { width: 100%; box-sizing: border-box; }
+  .sales-shift-history select { width: 100%; }
   .sales-shift-modal { width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); border-radius: 18px; }
   .sales-shift-card { min-height: 0; padding: 1.1rem; gap: .9rem; }
   .sales-shift-card h2 { font-size: 1.3rem; }
