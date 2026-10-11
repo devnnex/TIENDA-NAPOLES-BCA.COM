@@ -9,6 +9,12 @@ for (const [input, period, minutes, text] of [['800','AM',480,'8:00'],['8:00','P
 }
 for (const value of ['', '0','000','1300','8:60','1260','24:00','-100','1.30','8:0']) assert.equal(shift.parseTime(value,'AM'), null, value);
 const overnight = { id:'shift-a', date:'2026-10-08', startMinutes:900, endMinutes:60 };
+assert.equal(shift.needsNewShift(null,at('2026-10-09T08:00:00')),true);
+assert.equal(shift.needsNewShift(overnight,at('2026-10-09T00:59:59')),false);
+assert.equal(shift.needsNewShift(overnight,at('2026-10-09T01:00:00')),true);
+assert.equal(shift.needsNewShift({...overnight,endMinutes:1320},at('2026-10-08T23:00:00')),false);
+assert.equal(shift.needsNewShift({...overnight,endMinutes:1320},at('2026-10-09T00:00:00')),true);
+assert.equal(shift.needsNewShift({...overnight,date:'2026-10-09'},at('2026-10-09T08:00:00')),false);
 assert.equal(shift.today(overnight,at('2026-10-09T00:30:00')).dateFrom,'2026-10-08');
 assert.equal(shift.today(overnight,at('2026-10-09T00:59:59')).dateFrom,'2026-10-08');
 const after = shift.today(overnight,at('2026-10-09T01:00:00'));

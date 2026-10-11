@@ -43,6 +43,10 @@ const SalesShift = (() => {
     const end = midnight(shift.date) + endMinutes * 60000 + (endMinutes < startMinutes ? dayMs : 0);
     return Number.isFinite(start) && dateKey(new Date(midnight(shift.date))) === shift.date ? { start, end } : null;
   };
+  const needsNewShift = (shift, now = new Date()) => {
+    const interval = bounds(shift);
+    return !interval || (dateKey(now) > shift.date && Number(now) >= interval.end);
+  };
   const today = (shift, now = new Date()) => {
     const date = dateKey(now), interval = bounds(shift), timestamp = Number(now);
     if (interval && timestamp >= midnight(shift.date) && timestamp < interval.end) {
@@ -80,6 +84,6 @@ const SalesShift = (() => {
     const key = dateKey(new Date(timestamp));
     return key >= filters.dateFrom && key <= filters.dateTo;
   };
-  return { zone, dateKey, dateLabel, parseTime, timeParts, timeLabel, bounds, today, shiftRange, range, matches };
+  return { zone, dateKey, dateLabel, parseTime, timeParts, timeLabel, bounds, needsNewShift, today, shiftRange, range, matches };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = SalesShift;

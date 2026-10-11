@@ -16,7 +16,7 @@
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
     <script>
-      window.__APP_ASSET_VERSION__ = "20261011-sales-shift-history-v3";
+      window.__APP_ASSET_VERSION__ = "20261011-sales-shift-registration-v4";
       document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
     </script>
     <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -435,7 +435,10 @@
         </div>
 
         <div class="sales-shift-panel">
-          <button class="sales-shift-base" id="salesShiftBase" type="button" aria-label="Ver o editar el turno y saldo base"></button>
+          <div class="sales-shift-current">
+            <button class="sales-shift-base" id="salesShiftBase" type="button" aria-label="Ver o editar el turno y saldo base"></button>
+            <button class="sales-shift-register" id="registerSalesShift" type="button" hidden>Registrar nuevo turno</button>
+          </div>
           <div class="sales-shift-history">
             <label for="salesShiftHistory">Historial de turnos</label>
             <select id="salesShiftHistory" aria-label="Elegir un turno del historial"><option value="">Elegir un día</option></select>
@@ -924,7 +927,7 @@
     <script defer src="https://unpkg.com/lucide@latest"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script defer src="sales-shift.js?v=20261011-sales-shift-history-v2"></script>
+    <script defer src="sales-shift.js?v=20261011-sales-shift-registration-v4"></script>
     <script>document.write(`<script defer src="app.js?v=${window.__APP_ASSET_VERSION__}"><\/script>`);</script>
   </body>
 </html>

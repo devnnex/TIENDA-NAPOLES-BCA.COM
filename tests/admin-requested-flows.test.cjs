@@ -37,12 +37,15 @@ test('La alarma conserva la preferencia si el navegador bloquea audio y reintent
   assert.match(source, /state\.soundEnabled = localStorage\.getItem\("waiter_alarm_enabled"\) !== "0"/);
 });
 
-test('Turno configurado local o remoto evita el modal al refrescar; sin turno abre una vez', async () => {
-  const shift = { date: '2026-10-09', startMinutes: 900, endMinutes: 60, base: 100000 };
-  for (const [cached, remote, expected] of [[shift, shift, 0], [shift, null, 0], [null, shift, 0], [null, null, 1]]) {
+test('Al iniciar sesión solicita el nuevo turno tras el cierre y lo recuerda solo en esa sesión', async () => {
+  const expired = { date: '2026-10-09', startMinutes: 900, endMinutes: 60, base: 100000 };
+  const active = { ...expired, date: '2026-10-10', endMinutes: 660 };
+  const now = new Date('2026-10-10T13:00:00-05:00');
+  const FixedDate = class extends Date { constructor(...args) { super(...(args.length ? args : [now])); } };
+  for (const [cached, remote, expected] of [[expired, expired, 1], [expired, active, 0], [null, active, 0], [null, null, 1]]) {
     const state = {};
     let prompts = 0;
-    const context = vm.createContext({ state, SalesShift, canAccessAdminSection: () => true,
+    const context = vm.createContext({ state, SalesShift, Date: FixedDate, canAccessAdminSection: () => true,
       salesShiftStorageKey: () => 'shift', localStorage: { getItem: () => JSON.stringify({ shift: cached }) },
       readLocalJson: () => ({ shift: cached }), renderSalesShift() {},
       syncSalesShift: async () => { state.salesShift = remote; }, openSalesShift: () => prompts++,
@@ -85,9 +88,12 @@ test('Sin cambios remotos, la sincronización conserva el selector y el cuadro d
   const button = { set innerHTML(value) { summaryWrites++; } };
   const history = { value: '', set innerHTML(value) { optionWrites++; } };
   const edit = { disabled: true };
-  const context = vm.createContext({ state, SalesShift, icon: () => '<svg></svg>', money: value => String(value),
+  const register = { hidden: true };
+  const now = new Date('2026-10-11T08:00:00-05:00');
+  const FixedDate = class extends Date { constructor(...args) { super(...(args.length ? args : [now])); } };
+  const context = vm.createContext({ state, SalesShift, Date: FixedDate, icon: () => '<svg></svg>', money: value => String(value),
     escapeHTML: value => String(value), formatIncomeDate: value => String(value), refreshIcons: () => iconRefreshes++,
-    $: selector => ({ '#salesShiftBase': button, '#salesShiftHistory': history, '#editSalesShiftHistory': edit })[selector] });
+    $: selector => ({ '#salesShiftBase': button, '#registerSalesShift': register, '#salesShiftHistory': history, '#editSalesShiftHistory': edit })[selector] });
   vm.runInContext(section('renderSalesShift', 'refreshSalesShiftRange') + ';globalThis.render = renderSalesShift;', context);
   context.render();
   context.render();
@@ -96,6 +102,10 @@ test('Sin cambios remotos, la sincronización conserva el selector y el cuadro d
   assert.equal(iconRefreshes, 1);
   assert.equal(history.value, shift.id);
   assert.equal(edit.disabled, false);
+  assert.equal(register.hidden, false, 'El botón sigue disponible si se cerró el modal sin registrar.');
+  state.salesShift = { ...shift, date: '2026-10-11' };
+  context.render();
+  assert.equal(register.hidden, true, 'Al registrar el turno nuevo, el botón desaparece.');
 });
 
 test('Aviso de solicitud lee la fila confirmada y la muestra aunque el snapshot siga ocupado', async () => {

@@ -5806,6 +5806,8 @@ const App = (() => {
     const button = $("#salesShiftBase");
     if (!button) return;
     const shift = state.salesShift;
+    const register = $("#registerSalesShift");
+    if (register) register.hidden = !SalesShift.needsNewShift(shift, new Date());
     let summary;
     if (!shift) {
       summary = `${icon("wallet", 18)}<span><small>Base del turno</small><strong>Registrar turno</strong><small>${state.salesShiftError ? escapeHTML(state.salesShiftError) : "Configura el horario y la base compartida"}</small></span>`;
@@ -5966,6 +5968,10 @@ const App = (() => {
   };
   const bindSalesShift = () => {
     $("#salesShiftBase")?.addEventListener("click", () => { void syncSalesShift(); openSalesShift(); });
+    $("#registerSalesShift")?.addEventListener("click", async () => {
+      await syncSalesShift();
+      if (SalesShift.needsNewShift(state.salesShift, new Date())) openSalesShift();
+    });
     $("#salesShiftHistory")?.addEventListener("change", (event) => {
       const id = event.currentTarget.value;
       if (!id) { setIncomeRange("today"); return; }
@@ -5991,9 +5997,8 @@ const App = (() => {
       state.salesShiftHistory = saved?.shifts || (saved?.shift ? [saved.shift] : []);
     } catch (_) { state.salesShift = null; state.salesShiftPending = null; state.salesShiftHistory = []; }
     renderSalesShift();
-    state.salesShiftPrompted ||= Boolean(SalesShift.bounds(state.salesShift));
     void syncSalesShift().finally(() => {
-      if (!state.salesShiftPrompted && !SalesShift.bounds(state.salesShift)) { state.salesShiftPrompted = true; openSalesShift(); }
+      if (!state.salesShiftPrompted && SalesShift.needsNewShift(state.salesShift, new Date())) { state.salesShiftPrompted = true; openSalesShift(); }
     });
     window.clearInterval(state.salesShiftTimer);
     state.salesShiftTimer = window.setInterval(() => { refreshSalesShiftRange(); void syncSalesShift(); }, 15000);
