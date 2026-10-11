@@ -9,6 +9,15 @@ const SalesShift = (() => {
     return `${parts.year}-${parts.month}-${parts.day}`;
   };
   const midnight = (date) => Date.parse(`${date}T00:00:00-05:00`);
+  const dateLabel = (date, short = false) => {
+    const formatter = new Intl.DateTimeFormat("es-CO", {
+      timeZone: zone, day: "numeric", month: short ? "short" : "long", year: "numeric"
+    });
+    const value = new Date(midnight(date) + 12 * 60 * 60000);
+    if (!short) return formatter.format(value);
+    const parts = Object.fromEntries(formatter.formatToParts(value).map(({ type, value }) => [type, value]));
+    return `${parts.day} ${parts.month.replace(/\.$/, "")} ${parts.year}`;
+  };
   const addDays = (date, days) => dateKey(new Date(midnight(date) + days * dayMs));
   const parseTime = (text, period) => {
     const value = String(text || "").trim();
@@ -71,6 +80,6 @@ const SalesShift = (() => {
     const key = dateKey(new Date(timestamp));
     return key >= filters.dateFrom && key <= filters.dateTo;
   };
-  return { zone, dateKey, parseTime, timeParts, timeLabel, bounds, today, shiftRange, range, matches };
+  return { zone, dateKey, dateLabel, parseTime, timeParts, timeLabel, bounds, today, shiftRange, range, matches };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = SalesShift;

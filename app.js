@@ -5808,7 +5808,7 @@ const App = (() => {
     if (!shift) {
       button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno</small><strong>Registrar turno</strong><small>${state.salesShiftError ? escapeHTML(state.salesShiftError) : "Configura el horario y la base compartida"}</small></span>`;
     } else {
-      button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno · ${escapeHTML(shift.date)}</small><strong>${money(shift.base)}</strong><small>Inicial: ${money(shift.initialBase)} · ${escapeHTML(SalesShift.timeLabel(shift.startMinutes))}–${escapeHTML(SalesShift.timeLabel(shift.endMinutes))}</small><small>${state.salesShiftPending ? "Guardado en este equipo · pendiente de compartir" : `Actualizada: ${escapeHTML(formatIncomeDate(shift.updatedAt))}`}</small></span>${icon("pencil", 15)}`;
+      button.innerHTML = `${icon("wallet", 18)}<span><small>Base del turno · ${escapeHTML(SalesShift.dateLabel(shift.date))}</small><strong>${money(shift.base)}</strong><small>Inicial: ${money(shift.initialBase)} · ${escapeHTML(SalesShift.timeLabel(shift.startMinutes))}–${escapeHTML(SalesShift.timeLabel(shift.endMinutes))}</small><small>${state.salesShiftPending ? "Guardado en este equipo · pendiente de compartir" : `Actualizada: ${escapeHTML(formatIncomeDate(shift.updatedAt))}`}</small></span>${icon("pencil", 15)}`;
     }
     const history = $("#salesShiftHistory"), edit = $("#editSalesShiftHistory");
     if (history) {
@@ -5816,7 +5816,7 @@ const App = (() => {
       history.innerHTML = '<option value="">Elegir un día</option>' + shifts.map((item) => {
         const end = SalesShift.bounds(item)?.end;
         const endDate = end ? SalesShift.dateKey(new Date(end - 1)) : item.date;
-        return `<option value="${escapeHTML(item.id)}">${escapeHTML(item.date)} · ${escapeHTML(SalesShift.timeLabel(item.startMinutes))} a ${escapeHTML(SalesShift.timeLabel(item.endMinutes))}${endDate !== item.date ? ` (${escapeHTML(endDate)})` : ""}</option>`;
+        return `<option value="${escapeHTML(item.id)}">${escapeHTML(SalesShift.dateLabel(item.date, true))} · ${escapeHTML(SalesShift.timeLabel(item.startMinutes))} a ${escapeHTML(SalesShift.timeLabel(item.endMinutes))}${endDate !== item.date ? ` (${escapeHTML(SalesShift.dateLabel(endDate, true))})` : ""}</option>`;
       }).join("");
       history.value = state.incomeRangePreset === "shift" ? state.selectedSalesShiftId || "" : "";
       if (edit) edit.disabled = !history.value || Boolean(state.salesShiftPending);
