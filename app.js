@@ -2484,6 +2484,8 @@ const App = (() => {
     inventoryPeerRefreshPending = true;
     if (inventoryPeerRefreshPromise) return inventoryPeerRefreshPromise;
     inventoryPeerRefreshPromise = (async () => {
+      const movementRefresh = state.activeAdminSection === "movements"
+        ? loadInventoryMovements({ background: true, force: true }) : Promise.resolve(false);
       do {
         inventoryPeerRefreshPending = false;
         if (inventorySyncPromise) await inventorySyncPromise;
@@ -2491,7 +2493,7 @@ const App = (() => {
         inventoryPeerRefreshPending = false;
         await syncInventoryWithAppsScript({ reconcileDeletions: true });
       } while (inventoryPeerRefreshPending);
-      if (state.activeAdminSection === "movements") await loadInventoryMovements();
+      await movementRefresh;
       return true;
     })().finally(() => {
       inventoryPeerRefreshPromise = null;
@@ -3992,16 +3994,46 @@ const App = (() => {
     }, 12000);
   };
 
-  const notifyAdminPeers = (detail = {}) => {
-    if (!state.authToken || !state.currentUser) return;
-    const channel = state.adminBroadcastChannel;
-    if (!channel?.send) return;
-    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.inventory,"inventory-refresh"],[detail.users,"users-refresh"]]) {
-      if (enabled) {
-        try { Promise.resolve(channel.send({type:"broadcast",event,payload:{}})).catch(() => undefined); }
-        catch (_) { /* La consulta periódica recupera un canal desconectado. */ }
+  const pendingPeerRefreshes = new Set();
+  let peerRefreshSending = false;
+  let peerRefreshRetryTimer = null;
+  const flushPeerRefreshes = async () => {
+    if (peerRefreshSending || !navigator.onLine || !state.authToken || !state.currentUser || !pendingPeerRefreshes.size) return;
+    peerRefreshSending = true;
+    const events = [...pendingPeerRefreshes];
+    events.forEach((event) => pendingPeerRefreshes.delete(event));
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 2500);
+    let delivered = false;
+    try {
+      // La entrega HTTP confirma que Realtime recibió el aviso, incluso si el
+      // socket de este equipo se está reconectando. Solo transmite invalidaciones.
+      const response = await fetch(`${SUPABASE_CONFIG.url}/realtime/v1/api/broadcast`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_CONFIG.anonKey, Authorization: `Bearer ${SUPABASE_CONFIG.anonKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: events.map((event) => ({ topic: "admin", event, payload: {}, private: false })) }),
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error("Aviso pendiente de entrega");
+      delivered = true;
+    } catch (_) {
+      events.forEach((event) => pendingPeerRefreshes.add(event));
+    } finally {
+      window.clearTimeout(timer);
+      peerRefreshSending = false;
+      if (pendingPeerRefreshes.size && navigator.onLine) {
+        window.clearTimeout(peerRefreshRetryTimer);
+        peerRefreshRetryTimer = window.setTimeout(() => void flushPeerRefreshes(), delivered ? 0 : 1000);
       }
     }
+  };
+
+  const notifyAdminPeers = (detail = {}) => {
+    if (!state.authToken || !state.currentUser) return;
+    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.inventory,"inventory-refresh"],[detail.users,"users-refresh"]]) {
+      if (enabled) pendingPeerRefreshes.add(event);
+    }
+    void flushPeerRefreshes();
   };
 
   const receiveAdminRequests = (rows) => {
@@ -4339,6 +4371,7 @@ const App = (() => {
       session.session_payments = [...sessionPayments(session).filter((row) => row.id !== id), data.payment];
       if (typeof persistOfflineAdminSnapshot === "function") persistOfflineAdminSnapshot();
       if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
+      if (form.payment_method.value === "cash" && !data.duplicate) void openCashDrawer({ localOnly: true });
       delete form.dataset.paymentId; $("#abonoDialog")?.close();
       state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
       if (!data.payment._offline_pending) notifyAdminPeers({ operational:true });
@@ -4349,7 +4382,6 @@ const App = (() => {
         if (wasVisible) setTableConsumptionPreviewVisible(true);
       }
       toast("Abono guardado: " + money(amount) + ". Saldo: " + money(sessionBalance(session)), "ok", "abono:" + id);
-      if (form.payment_method.value === "cash") void openCashDrawer({ localOnly: true });
     } catch (error) {
       toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
     } finally { delete form.dataset.saving; button.disabled = false; }
@@ -5499,8 +5531,10 @@ const App = (() => {
     refreshIcons();
   };
 
+  let movementRefreshPending = false;
   const loadInventoryMovements = async ({ more = false, background = false, force = false } = {}) => {
-    if (!isAppsScriptConfigured() || !state.currentUser || (state.movementLoading && !force)) return false;
+    if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    if (state.movementLoading) { if (force) movementRefreshPending = true; return false; }
     if (more && !state.movementHasMore) return false;
     const requestId = ++state.movementRequestId;
     state.movementLoading = true;
@@ -5567,7 +5601,10 @@ const App = (() => {
       if (requestId === state.movementRequestId) {
         state.movementLoading = false;
         if (state.activeAdminSection === "movements") renderInventoryMovements(appendFrom);
-        if (refreshAfterStale) window.setTimeout(() => void loadInventoryMovements({ background }), 0);
+        if (refreshAfterStale || movementRefreshPending) {
+          movementRefreshPending = false;
+          window.setTimeout(() => void loadInventoryMovements({ background: true, force: true }), 0);
+        }
       }
     }
   };
@@ -6440,7 +6477,8 @@ const App = (() => {
     nextIndex: report?.nextIndex, pendingCount: report?.pendingCount, localOnly: report?.localOnly
   });
 
-  const loadIncomeReport = async ({ background = false, manual = false } = {}) => {
+  const loadIncomeReport = async ({ background = false, manual = false, force = false } = {}) => {
+    if (force && state.incomeLoading) { state.incomeForceReloadRequested = true; return false; }
     if (state.pendingIncomeEdits?.size) return false;
     if (!$("#income") || !canAccessAdminSection("income")) return false;
     clearTimeout(state.incomeSearchTimer);
@@ -6506,7 +6544,13 @@ const App = (() => {
       if (manual) toast(String(error?.message || error), "error", "manual-income-refresh-failed");
       return false;
     } finally {
-      if (requestId === state.incomeRequestId) state.incomeLoading = false;
+      if (requestId === state.incomeRequestId) {
+        state.incomeLoading = false;
+        if (state.incomeForceReloadRequested) {
+          state.incomeForceReloadRequested = false;
+          window.setTimeout(() => void loadIncomeReport({ background: Boolean(state.incomeReport), force: true }), 0);
+        }
+      }
     }
   };
 
@@ -6517,7 +6561,30 @@ const App = (() => {
     const canCheckPurchases = canCheckInventory && Boolean($("#purchaseHistoryDialog")?.open);
     if ((!canCheckIncome && !canCheckMovements && !canCheckInventory) || !state.currentUser || !isAppsScriptConfigured() || !navigator.onLine) return false;
     const now = Date.now();
-    if (state.backgroundReportSyncBusy || (!force && now - state.backgroundReportCheckedAt < SYNC_INTERVAL_MS)) return false;
+    if (force) {
+      if (state.confirmedReportSyncBusy) { state.backgroundReportForcePending = true; return false; }
+      state.confirmedReportSyncBusy = true;
+      try {
+        const refreshes = [];
+        if (canCheckIncome && !readAppsScriptOutbox().some((job) => job.action === "clear_income")) {
+          refreshes.push(loadIncomeReport({ background: Boolean(state.incomeReport), force: true }));
+        }
+        if (canCheckMovements || (canCheckInventory && $("#purchaseHistoryDialog")?.open)) {
+          refreshes.push(loadInventoryMovements({ background: true, force: true }));
+        }
+        return (await Promise.all(refreshes)).some(Boolean);
+      } catch (_) { return false; }
+      finally {
+        state.confirmedReportSyncBusy = false;
+        if (state.backgroundReportForcePending) {
+          state.backgroundReportForcePending = false;
+          window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+        }
+      }
+    }
+    if (state.confirmedReportSyncBusy) return false;
+    if (state.backgroundReportSyncBusy) return false;
+    if (!force && now - state.backgroundReportCheckedAt < 1500) return false;
     state.backgroundReportSyncBusy = true;
     state.backgroundReportCheckedAt = now;
     try {
@@ -8217,7 +8284,7 @@ const App = (() => {
       state.paymentProcessing = false;
       return;
     }
-    void openCashDrawer({ localOnly: true });
+    if (payment.payments.some((row) => row.method === "cash" && Number(row.amount) > 0)) void openCashDrawer({ localOnly: true });
     const createdAt = closed.saved.closed_at || new Date().toISOString();
     const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" ? Number(state.tipSettings.percentage) : 0;
     const tipAmount = tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0;
@@ -11139,6 +11206,7 @@ const App = (() => {
 
   const resumeRealtimeReception = () => {
     if (document.hidden) return;
+    void flushPeerRefreshes();
     if (state.page === "client" && state.currentTable) {
       subscribeClient();
       void state.clientLiveRefresh?.();

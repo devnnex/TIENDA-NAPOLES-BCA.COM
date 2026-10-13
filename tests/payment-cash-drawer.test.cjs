@@ -30,14 +30,15 @@ const setup=(method,closed=true,device='bridge')=>{
  return {context,calls,form};
 };
 for(const method of ['cash','transfer','breb','mixed'])for(const action of ['save','print']){
- test('BCA '+method+'/'+action+': cobra saldo, conserva abono y abre caja una vez',async()=>{
+ test('BCA '+method+'/'+action+': cobra saldo, conserva abono y abre solo con efectivo',async()=>{
   const app=setup(method);await app.context.process(app.form,{value:action});
   const invoice=app.calls.find(call=>typeof call==='object');
   assert.equal(invoice.remainingPaid,60);assert.equal(invoice.prepayments.length,1);
   assert.equal(invoice.payments.reduce((sum,row)=>sum+row.amount,0),100);
   assert.equal(invoice.totals.total,100);assert.equal(invoice.changeDue,method==='cash'?40:0);
-  assert.equal(app.calls.filter(call=>call==='drawer').length,1);
-  assert.ok(app.calls.indexOf('drawer')<app.calls.indexOf('render-inventory'),'El pulso sale antes de reconstruir la interfaz.');
+  const expectedPulses=['cash','mixed'].includes(method)?1:0;
+  assert.equal(app.calls.filter(call=>call==='drawer').length,expectedPulses);
+  if(expectedPulses)assert.ok(app.calls.indexOf('drawer')<app.calls.indexOf('render-inventory'),'El pulso sale antes de reconstruir la interfaz.');
   assert.equal(app.calls.filter(call=>call==='print').length,action==='print'?1:0);
  });
 }
@@ -52,7 +53,7 @@ for(const device of ['mobile','desktop','controller'])for(const method of ['cash
   const app=setup(method,true,device);await app.context.process(app.form,{value:action});
   await new Promise(resolve=>setImmediate(resolve));
   assert.ok(app.calls.some(call=>typeof call==='object'),'El pago se registra.');
-  assert.equal(app.calls.filter(call=>call==='drawer').length,device==='controller'?1:0);
+  assert.equal(app.calls.filter(call=>call==='drawer').length,device==='controller'&&['cash','mixed'].includes(method)?1:0);
   assert.equal(app.calls.includes('request_pos_drawer'),false,'El cobro no solicita abrir una caja remota.');
   assert.equal(app.calls.filter(call=>call==='print').length,action==='print'?1:0);
  });
@@ -62,4 +63,9 @@ test('La apertura manual explícita conserva su comportamiento',async()=>{
  const app=setup('cash',true,'mobile');
  assert.equal(await app.context.openDrawer(),true);
  assert.equal(app.calls.filter(call=>call==='request_pos_drawer').length,1);
+});
+
+test('BCA un pago mixto sin efectivo no abre la caja',async()=>{
+ const app=setup('mixed');app.context.paymentFromForm=()=>({method:'mixed',payments:[{method:'transfer',amount:30},{method:'breb',amount:30}]});
+ await app.context.process(app.form,{value:'save'});assert.equal(app.calls.includes('drawer'),false);
 });
