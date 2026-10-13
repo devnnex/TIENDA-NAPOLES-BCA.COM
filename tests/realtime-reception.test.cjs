@@ -103,6 +103,7 @@ function device(server, page = 'client') {
     + section('ensureOpenSession', 'bootstrapCacheKey')
       .split('  const dbQuiet =')[0]
     + section('loadClientSnapshot', 'pwaAssetUrl')
+    + section('getReceiptAudio', 'playReceiptSound')
     + section('playClientChatReceipt', 'playAdminChatReceipt')
     + section('isSongRequest', 'hasOpenAdminChatForRequest')
     + section('renderClientQueue', 'bindAccountFeatures')

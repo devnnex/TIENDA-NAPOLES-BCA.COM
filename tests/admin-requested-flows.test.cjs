@@ -20,8 +20,8 @@ test('La alarma conserva la preferencia si el navegador bloquea audio y reintent
   const audio = { play: async () => { plays++; if (blocked) throw Error('NotAllowedError'); }, pause() {} };
   const context = vm.createContext({ state, localStorage: { setItem: (key, value) => values.set(key, value) },
     document: { addEventListener: (name, fn) => { listeners[name] = fn; } },
-    getAlarmAudio: () => audio, updateAlarmButton() {}, toast() {}, activeRequests: () => [],
-    window: { setTimeout() {} } });
+    getAlarmAudio: () => audio, updateAlarmButton() {}, toast() {}, activeRequests: () => [], primeAlertVoice() {}, primeReceiptAudio() {},
+    window: { setTimeout() {}, clearTimeout() {} } });
   vm.runInContext(section('unlockAlarm', 'startAlarmLoop') + ';globalThis.arm = armAlarmOnFirstGesture;', context);
   context.arm();
   await listeners.mousemove();

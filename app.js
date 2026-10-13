@@ -1619,38 +1619,72 @@ const App = (() => {
     };
   };
 
+  const getReceiptAudio = () => {
+    if (!state.receiptAudio) state.receiptAudio = new Audio(RECEIPT_SOUND);
+    state.receiptAudio.volume = 1;
+    return state.receiptAudio;
+  };
+
+  const rememberPendingReceiptSound = (id, receipt) => {
+    state.pendingReceiptSounds ||= new Map();
+    state.pendingReceiptSounds.set(`${receipt ? "bill" : "message"}:${id}`, { id, receipt });
+  };
+
   const playReceiptSound = async (requestId) => {
     if (!requestId || localStorage.getItem(`receipt_sound_${requestId}`) === "1") return;
-    const audio = new Audio(RECEIPT_SOUND);
-    audio.volume = 1;
+    const audio = getReceiptAudio();
     try {
       await audio.play();
       localStorage.setItem(`receipt_sound_${requestId}`, "1");
+      state.pendingReceiptSounds?.delete(`bill:${requestId}`);
     } catch (error) {
-      // Browsers can block audio until the client interacts with the page.
+      state.receiptSoundPrimed = false;
+      rememberPendingReceiptSound(requestId, true);
     }
   };
 
   const playClientChatReceipt = async (messageId) => {
     if (!messageId) return;
-    const audio = new Audio(RECEIPT_SOUND);
-    audio.volume = 1;
+    const audio = getReceiptAudio();
     try {
       await audio.play();
+      state.pendingReceiptSounds?.delete(`message:${messageId}`);
     } catch (error) {
-      // Browsers can block audio until the client interacts with the page.
+      state.receiptSoundPrimed = false;
+      rememberPendingReceiptSound(messageId, false);
     }
   };
 
   const playAdminChatReceipt = async () => {
     if (!state.soundEnabled) return;
-    const audio = new Audio(RECEIPT_SOUND);
-    audio.volume = 1;
+    const audio = getReceiptAudio();
     try {
       await audio.play();
     } catch (error) {
       // El navegador puede bloquear el sonido hasta que se active la alarma.
+      state.receiptSoundPrimed = false;
     }
+  };
+
+  const primeReceiptAudio = () => {
+    if (state.receiptSoundPrimed || state.receiptSoundPriming) return;
+    state.receiptSoundPriming = true;
+    const audio = getReceiptAudio();
+    audio.volume = 0;
+    audio.play().then(async () => {
+      audio.pause(); audio.currentTime = 0; audio.volume = 1;
+      state.receiptSoundPrimed = true;
+      for (const pending of [...(state.pendingReceiptSounds?.values() || [])]) {
+        if (pending.receipt) await playReceiptSound(pending.id);
+        else await playClientChatReceipt(pending.id);
+      }
+    }).catch(() => { audio.volume = 1; }).finally(() => { state.receiptSoundPriming = false; });
+  };
+
+  const armClientSoundsOnFirstGesture = () => {
+    ["pointerdown", "pointerup", "touchstart", "touchend", "click", "keydown"].forEach(eventName => {
+      document.addEventListener(eventName, primeReceiptAudio, { passive: true, capture: true });
+    });
   };
 
   const latestClientBill = () =>
@@ -3940,22 +3974,23 @@ const App = (() => {
   const playAlarmToneOnce = () => new Promise((resolve) => {
     const audio = getAlarmAudio();
     if (!audio) {
-      resolve();
+      resolve(true);
       return;
     }
     window.clearTimeout(state.alarmStopTimer);
+    window.clearTimeout(state.alarmUnlockTimer);
     audio.pause();
     audio.loop = false;
     audio.currentTime = 0;
     let settled = false;
-    const finish = () => {
+    const finish = (played = true) => {
       if (settled) return;
       settled = true;
       audio.removeEventListener("ended", finish);
       audio.pause();
       audio.currentTime = 0;
       state.alarmToneFinish = null;
-      resolve();
+      resolve(played);
     };
     state.alarmToneFinish = finish;
     audio.addEventListener("ended", finish, { once: true });
@@ -3963,32 +3998,34 @@ const App = (() => {
     audio.play().catch(() => {
       state.soundPrimed = false;
       updateAlarmButton();
-      finish();
+      finish(false);
     });
   });
 
   const drainAlertAnnouncements = async () => {
-    if (state.alertAnnouncementBusy || !state.soundEnabled) return;
+    if (state.alertAnnouncementBusy || !state.soundEnabled || !state.soundPrimed) return;
     state.alertAnnouncementBusy = true;
     try {
-      while (state.alertAnnouncementQueue.length && state.soundEnabled) {
+      while (state.alertAnnouncementQueue.length && state.soundEnabled && state.soundPrimed) {
         const activeIds = new Set(activeRequests().map((request) => request.id));
         const batch = state.alertAnnouncementQueue.splice(0).filter((request) => activeIds.has(request.id));
         if (!batch.length) continue;
-        await playAlarmToneOnce();
+        if (!await playAlarmToneOnce()) {
+          state.alertAnnouncementQueue.unshift(...batch);
+          break;
+        }
         const voiceBatch = batch.filter((request) => !hasOpenAdminChatForRequest(request));
         if (state.soundEnabled && voiceBatch.length) await speakAlertRequests(voiceBatch);
       }
     } finally {
       state.alertAnnouncementBusy = false;
-      if (state.alertAnnouncementQueue.length && state.soundEnabled) void drainAlertAnnouncements();
+      if (state.alertAnnouncementQueue.length && state.soundEnabled && state.soundPrimed) void drainAlertAnnouncements();
     }
   };
 
   const playAlarm = (requests = activeRequests()) => {
     if (!state.soundEnabled) return;
     const unseen = requests.filter((request) => !state.announcedRequestIds.has(request.id));
-    if (!unseen.length) return;
     unseen.forEach((request) => state.announcedRequestIds.add(request.id));
     state.alertAnnouncementQueue.push(...unseen);
     void drainAlertAnnouncements();
@@ -3996,6 +4033,7 @@ const App = (() => {
 
   const stopAlarm = () => {
     window.clearTimeout(state.alarmStopTimer);
+    window.clearTimeout(state.alarmUnlockTimer);
     state.alertAnnouncementQueue = [];
     state.alarmToneFinish?.();
     state.speechFinish?.();
@@ -4039,6 +4077,19 @@ const App = (() => {
     return new Promise((resolve) => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true }));
   };
 
+  const primeAlertVoice = () => {
+    if (state.speechPrimed || !window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== "function") return;
+    try {
+      window.speechSynthesis.resume();
+      const utterance = new window.SpeechSynthesisUtterance(".");
+      utterance.lang = "es-CO"; utterance.volume = 0;
+      utterance.onerror = () => { state.speechPrimed = false; };
+      state.speechPrimed = true;
+      // Se invoca dentro del gesto, antes de esperar la promesa del audio.
+      window.speechSynthesis.speak(utterance);
+    } catch (_) { state.speechPrimed = false; }
+  };
+
   const unlockAlarm = async ({ silent = false } = {}) => {
     const audio = getAlarmAudio();
     if (!audio) {
@@ -4047,6 +4098,8 @@ const App = (() => {
     }
 
     try {
+      primeAlertVoice();
+      primeReceiptAudio();
       state.soundEnabled = true;
       localStorage.setItem("waiter_alarm_enabled", "1");
       updateAlarmButton();
@@ -4057,7 +4110,8 @@ const App = (() => {
       updateAlarmButton();
       if (!silent) toast("Alarma activada.", "ok", "alarm-enabled");
 
-      window.setTimeout(() => {
+      window.clearTimeout(state.alarmUnlockTimer);
+      state.alarmUnlockTimer = window.setTimeout(() => {
         audio.pause();
         audio.currentTime = 0;
         if (activeRequests().length) playAlarm(activeRequests());
@@ -4071,6 +4125,7 @@ const App = (() => {
 
   const armAlarmOnFirstGesture = () => {
     const prime = async (fromMouseMove = false) => {
+      if (!fromMouseMove && state.soundEnabled) { primeAlertVoice(); primeReceiptAudio(); }
       if (!state.soundEnabled || state.soundPrimed || state.soundPriming) return;
       if (fromMouseMove) {
         if (Date.now() - Number(state.mousePrimeAttempted || 0) < 1500) return;
@@ -4083,10 +4138,13 @@ const App = (() => {
         state.soundPriming = false;
       }
     };
-    // Algunos navegadores aceptan mousemove; click, toque y teclado son el respaldo garantizado.
+    // Al terminar el toque o deslizamiento el navegador puede autorizar audio y voz.
     document.addEventListener("mousemove", () => prime(true), { passive: true });
-    ["pointerdown", "touchstart", "keydown"].forEach((eventName) => {
-      document.addEventListener(eventName, () => prime(false), { passive: true });
+    ["pointerdown", "pointerup", "touchstart", "touchend", "click", "keydown"].forEach((eventName) => {
+      document.addEventListener(eventName, (event) => {
+        if (event?.target?.closest?.("#enableSound")) return;
+        return prime(false);
+      }, { passive: true, capture: true });
     });
   };
 
@@ -10757,7 +10815,7 @@ const App = (() => {
         return;
       }
       if (target.id === "enableSound") {
-        if (state.soundEnabled) {
+        if (state.soundEnabled && state.soundPrimed) {
           if (await confirmDisableAlarm()) disableAlarm();
         } else {
           await unlockAlarm();
@@ -11920,6 +11978,7 @@ const App = (() => {
     window.addEventListener("pageshow", resumeRealtimeReception);
     document.addEventListener("visibilitychange", resumeRealtimeReception);
     if (state.page === "client") {
+      armClientSoundsOnFirstGesture();
       window.addEventListener("online", () => {
         flushRequestOutbox();
         flushBillResolutionOutbox();
