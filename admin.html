@@ -16,7 +16,7 @@
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
     <script>
-      window.__APP_ASSET_VERSION__ = "20261013-fast-reports-v2";
+      window.__APP_ASSET_VERSION__ = "20261013-brand-qr-v3";
       document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
     </script>
     <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -157,6 +157,7 @@
             <span><i data-lucide="image-up"></i> Portada</span>
             <small data-upload-status="cover_url">Seleccionar imagen</small>
           </label>
+          <div class="brand-save-actions"><button class="primary form-submit" id="saveBusinessBrand" type="submit"><i data-lucide="save"></i> Guardar marca</button></div>
           <div class="table-zone-setting-card wide">
             <div class="table-zone-setting-head">
               <span class="table-zone-setting-icon"><i data-lucide="map-pinned"></i></span>
@@ -171,9 +172,9 @@
               </div>
             </div>
             <div class="outdoor-table-selector" id="outdoorTableSelector" aria-label="Seleccionar mesas de afuera"></div>
-            <small class="table-zone-setting-status" id="tableZoneSettingStatus">Las mesas no marcadas se consideran mesas de adentro.</small>
+            <div class="table-zone-setting-footer"><small class="table-zone-setting-status" id="tableZoneSettingStatus">Las mesas no marcadas se consideran mesas de adentro.</small><button class="primary" id="saveOutdoorTableZones" type="submit"><i data-lucide="save"></i> Guardar mesas de afuera</button></div>
           </div>
-          <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar marca</button>
+
           <div class="tip-setting-card wide">
             <div class="tip-setting-copy"><span class="tip-setting-icon"><i data-lucide="receipt-text"></i></span><div><strong>Ver cuenta para clientes</strong><small>Activa esta opción para que el cliente consulte su consumo. Apágala si llevas las cuentas en tarjetas físicas.</small></div></div>
             <label class="modern-switch"><input name="client_bill_enabled" type="checkbox" role="switch" checked aria-label="Mostrar Ver cuenta a los clientes"><span aria-hidden="true"></span></label>
