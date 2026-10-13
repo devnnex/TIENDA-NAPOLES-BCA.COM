@@ -25,6 +25,13 @@ ya contiene esa lista; no es una consulta adicional de facturas cobradas.
 Acepta respuestas anteriores del respaldo sin metadatos de paginación. Los
 borrados y las ventas eliminadas conservan su conciliación y restauración de stock.
 
+Las solicitudes de mesas libres preparan una sesión vacía al pulsar la acción;
+esto evita el conflicto SQL de la ruta anterior sin ocupar la mesa ni agregar
+consumo. Cada mesa usa su propio ID y QR, incluidas las que se creen después.
+La prueba con 30 mesas y una creada después no establece un límite de mesas.
+Las lecturas nuevas de cuentas aceptan cambios confirmados del otro equipo;
+las lecturas anteriores conservan la protección de operaciones pendientes.
+
 Las solicitudes tienen un lector independiente de cuentas y reportes cada
 segundo y reciben avisos de inmediato. El canal público de avisos y el de
 cambios de datos se recuperan por separado. En el cliente un envío lento no
@@ -32,7 +39,9 @@ detiene el siguiente. Solo se muestran avisos confirmados por el backend;
 el chat y el límite de cinco canciones conservan su comportamiento.
 
 El selector de consumo conserva el producto al actualizarse la lista y las
-vueltas se muestran en letra y número más grandes. La caja automática conserva
+vueltas y el dinero recibido se muestran en letra y número más grandes.
+El selector de Movimientos abre hacia abajo y el diseño móvil evita el scroll
+horizontal. La caja automática conserva
 su comportamiento: solo efectivo y solo en el PC conectado físicamente.
 
 ## Marca y consultas del QR
