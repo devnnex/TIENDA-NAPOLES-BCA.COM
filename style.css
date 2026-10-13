@@ -5444,9 +5444,6 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
   main, section, form, fieldset, dialog, .panel, .modal-card { min-width: 0; max-width: 100%; }
   img, canvas, video { max-width: 100%; }
   input, select, textarea { min-width: 0; max-width: 100%; }
-  .admin-sidebar { position: relative; top: auto; inset: auto; flex-direction: column; align-items: stretch; overflow: visible; max-width: 100%; }
-  .admin-sidebar nav { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); min-width: 0; gap: .3rem; }
-  .admin-sidebar nav a { min-width: 0; min-height: 44px; gap: .3rem; padding: .5rem; font-size: .74rem; white-space: normal; overflow-wrap: anywhere; }
   .category-tabs, .assistant-suggestions { flex-wrap: wrap; overflow-x: clip; }
   .category-tabs .chip, .assistant-suggestions .chip { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
   .toast-host { flex-direction: column; overflow-x: clip; }
