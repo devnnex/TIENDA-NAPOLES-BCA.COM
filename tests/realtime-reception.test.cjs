@@ -93,7 +93,7 @@ function device(server, page = 'client') {
     renderAssistant: () => { renders++; }, renderAdminChat: () => { renders++; }, renderAdminLive: () => { renders++; },
     playClientChatReceipt() {}, playAdminChatReceipt() {}, assistantSay() {}, setPeerTyping() {},
     mergeOptimisticRequests: rows => rows, mergeOptimisticSessions: rows => rows,
-    refreshBackgroundReports() {}, notifyAdminPeers() {}, flushPeerRefreshes() {}, refreshInventoryFromPeer() {}, isBoss: () => false,
+    refreshBackgroundReports() {}, notifyAdminPeers() {}, flushPeerRefreshes() {}, startConfirmedReportSync() {}, syncConfirmedReports() {}, refreshInventoryFromPeer() {}, isBoss: () => false,
     setRealtimeStatus() {}, refreshCoreNow() {}, loadUsers() {}
   });
   vm.runInContext(section('dbQuiet', 'bootstrapCacheKey')
