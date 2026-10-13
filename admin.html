@@ -16,7 +16,7 @@
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
     <script>
-      window.__APP_ASSET_VERSION__ = "20261013-brand-qr-v3";
+      window.__APP_ASSET_VERSION__ = "20261013-movements-requests-v1";
       document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
     </script>
     <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -359,7 +359,7 @@
         <div class="section-head inventory-heading">
           <div>
             <span class="eyebrow">Auditoria exacta</span>
-            <h2>Movimientos de inventario</h2>
+            <h2 class="movement-view-tabs" role="tablist" aria-label="Ver movimientos"><button type="button" role="tab" data-movement-view="inventory" aria-selected="true" aria-controls="inventoryMovementList">Movimientos de inventario</button><button type="button" role="tab" data-movement-view="sales" aria-selected="false" aria-controls="inventoryMovementList">Movimientos de ventas</button></h2>
             <p>Entradas, salidas, productos nuevos y devoluciones con fecha, hora y responsable.</p>
           </div>
           <div class="inventory-heading-actions">
@@ -386,7 +386,6 @@
             </label>
           </div>
           <p class="purchase-filter-feedback" id="movementTotalsFeedback" aria-live="polite"></p>
-          <button class="ghost" id="completeMovementHistory" type="button"><i data-lucide="list-checks"></i> Consultar todo el historial</button>
           <div class="movement-list" id="inventoryMovementList"></div>
           <button class="ghost history-more-button" id="moreInventoryMovements" type="button" hidden>Ver más movimientos</button>
         </div>
