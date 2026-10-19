@@ -491,8 +491,39 @@ const App = (() => {
     return committed;
   };
 
+  // Solo regula lecturas periódicas; nunca almacena respuestas ni encola escrituras.
+  const createReadBudget = (clock = () => Date.now()) => {
+    const entries = new Map();
+    let owner;
+    const entry = (key, scope) => {
+      if (owner !== scope) { entries.clear(); owner = scope; }
+      if (!entries.has(key)) {
+        if (entries.size >= 128) entries.delete(entries.keys().next().value);
+        entries.set(key, { at: -Infinity, failures: 0, retryAt: 0 });
+      }
+      return entries.get(key);
+    };
+    return {
+      due(key, interval, scope = "") {
+        const item = entry(key, scope), now = clock();
+        if (now < item.at) { item.at = -Infinity; item.retryAt = 0; }
+        if (now < item.retryAt || now - item.at < interval) return false;
+        item.at = now;
+        return true;
+      },
+      touch(key, scope = "") { entry(key, scope).at = clock(); },
+      settled(key, success, scope = "") {
+        if (owner !== scope || !entries.has(key)) return;
+        const item = entries.get(key);
+        if (success) { item.failures = 0; item.retryAt = 0; }
+        else { item.failures += 1; item.retryAt = clock() + Math.min(30000, 1000 * 2 ** Math.min(item.failures, 5)); }
+      }
+    };
+  };
+
   const state = {
     sb: null,
+    readBudget: createReadBudget(),
     page: "",
     business: null,
     tables: [],
@@ -1497,6 +1528,8 @@ const App = (() => {
       el.textContent = state.business?.subtitle || "Servicio a la mesa rapido y claro";
     });
     $$(".js-brand-logo").forEach((el) => {
+      if (el.dataset.brandMarkup === logo) return;
+      el.dataset.brandMarkup = logo;
       el.innerHTML = logo;
     });
     const cover = $(".client-hero");
@@ -3351,13 +3384,21 @@ const App = (() => {
   };
 
   const chatReads = new Map();
-  const loadChatMessages = (sessionId = state.currentSession?.id, table = state.currentTable) => {
+  const loadChatMessages = (sessionId = state.currentSession?.id, table = state.currentTable, { periodic = false } = {}) => {
     if (!sessionId) return Promise.resolve(false);
     const key = `${state.page}:${table?.id || ""}:${sessionId}`;
+    const scope = state.authToken || table?.qr_code || "";
+    const connected = state.page === "client" ? state.clientRealtimeConnected : state.adminChats.get(String(sessionId))?.connected;
+    const interval = connected && document.hidden ? 5000 : CHAT_SYNC_INTERVAL_MS;
+    if (periodic && state.readBudget?.due("chat:"+key,interval,scope) === false) return Promise.resolve(false);
     const active = chatReads.get(key);
-    if (active) { active.pending = true; return active.promise; }
+    if (active) { if (!periodic) active.pending = true; return active.promise; }
+    state.readBudget?.touch("chat:"+key,scope);
     const read = { pending: false, promise: null };
-    read.promise = fetchChatMessages(sessionId, table).finally(() => {
+    read.promise = fetchChatMessages(sessionId, table).then(result => {
+      state.readBudget?.settled("chat:"+key,result === true,scope);
+      return result;
+    }).finally(() => {
       chatReads.delete(key);
       const stillActive = state.page === "client"
         ? state.currentSession?.id === sessionId && state.currentTable?.id === table?.id
@@ -3530,7 +3571,7 @@ const App = (() => {
         }
       });
     window.clearInterval(chat.pollTimer);
-    chat.pollTimer = window.setInterval(() => void loadChatMessages(chat.sessionId, chat.table), CHAT_SYNC_INTERVAL_MS);
+    chat.pollTimer = window.setInterval(() => void loadChatMessages(chat.sessionId, chat.table,{periodic:true}), CHAT_SYNC_INTERVAL_MS);
   };
 
   const openAdminChat = async (requestIds) => {
@@ -3941,6 +3982,7 @@ const App = (() => {
       window.clearTimeout(state.clientReconnectTimer);
       const previous = state.clientChannel;
       state.clientChannel = null;
+      state.clientRealtimeConnected = false;
       state.clientSubscribedTableId = "";
       state.clientLiveRefresh = null;
       if (previous) state.sb.removeChannel(previous);
@@ -3968,14 +4010,19 @@ const App = (() => {
     window.clearTimeout(state.clientReconnectTimer);
     const previous = state.clientChannel;
     state.clientChannel = null;
+      state.clientRealtimeConnected = false;
     if (previous) state.sb.removeChannel(previous);
     clearInterval(state.chatPollTimer);
     let refreshPending = false;
-    const refresh = async () => {
+    const refresh = async ({ periodic = false } = {}) => {
       if (state.currentTable?.id !== tableId || !state.currentSession) return;
-      void loadChatMessages();
-      if (state.clientSyncBusy) { refreshPending = true; return; }
+      void loadChatMessages(undefined,undefined,{periodic});
+      const scope = state.authToken || state.currentTable?.qr_code || "";
+      const interval = state.clientRealtimeConnected && document.hidden ? 5000 : SYNC_INTERVAL_MS;
+      if (periodic && state.readBudget?.due("client-snapshot:"+tableId,interval,scope) === false) return;
+      if (state.clientSyncBusy) { if (!periodic) refreshPending = true; return; }
       state.clientSyncBusy = true;
+      state.readBudget?.touch("client-snapshot:"+tableId,scope);
       try {
         await hydrateSelectedTable(tableId, { background: true });
       } finally {
@@ -3984,6 +4031,7 @@ const App = (() => {
       }
     };
     state.clientLiveRefresh = refresh;
+    if (state.clientSubscribedTableId !== tableId) state.clientReconnectAttempts = 0;
     state.clientSubscribedTableId = tableId;
     state.clientRealtimeNeedsReconnect = false;
     const channel = state.sb
@@ -4010,8 +4058,10 @@ const App = (() => {
     state.clientChannel = channel;
     channel.subscribe((status) => {
       if (state.clientChannel !== channel || state.currentTable?.id !== tableId) return;
+      state.clientRealtimeConnected = status === "SUBSCRIBED";
       if (status === "SUBSCRIBED") {
         state.clientRealtimeNeedsReconnect = false;
+        state.clientReconnectAttempts = 0;
         window.clearTimeout(state.clientReconnectTimer);
         void refresh();
       } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
@@ -4019,11 +4069,11 @@ const App = (() => {
         window.clearTimeout(state.clientReconnectTimer);
         state.clientReconnectTimer = window.setTimeout(() => {
           if (state.clientChannel === channel && state.currentTable?.id === tableId) subscribeClient();
-        }, 3000);
+        }, Math.min(30000,3000*2**Math.min((state.clientReconnectAttempts=(state.clientReconnectAttempts || 0)+1)-1,4)));
       }
     });
-    state.clientPollTimer = setInterval(refresh, SYNC_INTERVAL_MS);
-    state.chatPollTimer = setInterval(() => void loadChatMessages(), CHAT_SYNC_INTERVAL_MS);
+    state.clientPollTimer = setInterval(() => void refresh({periodic:true}), SYNC_INTERVAL_MS);
+    state.chatPollTimer = setInterval(() => void loadChatMessages(undefined,undefined,{periodic:true}), CHAT_SYNC_INTERVAL_MS);
     void loadChatMessages();
   };
 
@@ -4516,8 +4566,8 @@ const App = (() => {
   };
 
   let adminRefreshPending = false;
-  const refreshAdminNow = async () => {
-    if (state.adminSyncBusy) { adminRefreshPending = true; return false; }
+  const refreshAdminNow = async ({ periodic = false } = {}) => {
+    if (state.adminSyncBusy) { if (!periodic) adminRefreshPending = true; return false; }
     state.adminSyncBusy = true;
     try {
       const changed = await loadAdminData();
@@ -4536,9 +4586,16 @@ const App = (() => {
     state.adminRequestPollTimer = setInterval(() => void pollAdminRequests(), 1000);
     clearInterval(state.adminPollTimer);
     state.adminPollTimer = setInterval(() => {
-      void refreshAdminNow();
-      if (Date.now()-Number(state.coreRefreshedAt || 0) >= 5000) {
-        void refreshCoreNow();
+      const healthy = state.adminDataConnected === true && state.adminBroadcastConnected === true;
+      const scope = state.authToken || "";
+      const snapshotInterval = healthy ? (document.hidden ? 15000 : 5000) : SYNC_INTERVAL_MS;
+      if (navigator.onLine && state.readBudget?.due("admin-snapshot",snapshotInterval,scope) !== false) {
+        void refreshAdminNow({periodic:true});
+      }
+      const coreInterval = healthy ? (document.hidden ? 60000 : 15000) : 5000;
+      if (navigator.onLine && Date.now()-Number(state.coreRefreshedAt || 0) >= coreInterval
+          && state.readBudget?.due("core",coreInterval,scope) !== false) {
+        void refreshCoreNow({periodic:true});
         if (isBoss()) void loadUsers();
       }
     }, Math.min(SYNC_INTERVAL_MS, 1500));
@@ -4584,7 +4641,10 @@ const App = (() => {
 
   const loadAdminData = async () => {
     const readStartedAt = Date.now();
+    const readScope = state.authToken || "";
+    state.readBudget?.touch("admin-snapshot",readScope);
     const snapshot = await readRealtimeData(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }));
+    state.readBudget?.settled("admin-snapshot",Boolean(snapshot && Array.isArray(snapshot.requests) && Array.isArray(snapshot.sessions)),readScope);
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) return false;
@@ -4666,10 +4726,12 @@ const App = (() => {
 
   let coreRefreshPromise = null;
   let coreRefreshPending = false;
-  const refreshCoreNow = () => {
-    if (coreRefreshPromise) { coreRefreshPending = true; return coreRefreshPromise; }
+  const refreshCoreNow = ({ periodic = false } = {}) => {
+    if (coreRefreshPromise) { if (!periodic) coreRefreshPending = true; return coreRefreshPromise; }
     state.coreSyncBusy = true;
     coreRefreshPromise = (async () => {
+      const readScope = state.authToken || "";
+      state.readBudget?.touch("core",readScope);
       const queue = typeof getOfflineSyncStatus === 'function' ? await getOfflineSyncStatus() : {blockingRecords:[]};
       if (typeof setScopedCoreRead === 'function') await setScopedCoreRead(Array.isArray(queue.blockingRecords));
       const params = new URLSearchParams(location.search);
@@ -4678,6 +4740,7 @@ const App = (() => {
         table_access_code:state.currentTable ? tableCode(state.currentTable) : params.get('mesa') || params.get('table') || params.get('t') || params.get('qr') || ''
       }),null);
       const businessLoaded = Boolean(data?.business);
+      state.readBudget?.settled("core",Boolean(data?.business && Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items)),readScope);
       const coreLoaded = Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items);
       state.syncFresh ||= {};
       if (businessLoaded && coreLoaded) {
@@ -5278,9 +5341,11 @@ const App = (() => {
       const status = $("#clientBillSettingStatus");
       if (status) status.textContent = form.client_bill_enabled.disabled ? "Pendiente de actualizar Supabase." : clientBillEnabled() ? "Los clientes pueden consultar su cuenta." : "Oculto para los clientes. Puedes llevar las cuentas en tarjetas físicas.";
     }
-    form.business_name.value = state.business?.business_name || "";
-    form.subtitle.value = state.business?.subtitle || "";
-    form.accent_color.value = state.business?.accent_color || "#f05a28";
+    if (!state.businessFormDirty) {
+      form.business_name.value = state.business?.business_name || "";
+      form.subtitle.value = state.business?.subtitle || "";
+      form.accent_color.value = state.business?.accent_color || "#f05a28";
+    }
     form.currency.value = DEFAULT_CURRENCY;
     renderOutdoorTableConfigurator();
     form.tips_enabled.checked = tipsEnabled();
@@ -5643,9 +5708,11 @@ const App = (() => {
   };
   let confirmedReportReading = false;
   let confirmedReportReadPending = false;
-  const syncConfirmedReports = async () => {
+  const syncConfirmedReports = async ({ periodic = false } = {}) => {
     if (!navigator.onLine || !state.authToken || !state.currentUser || !["income","inventory","movements"].some(section => canAccessAdminSection(section))) return false;
-    if (confirmedReportReading) { confirmedReportReadPending = true; return false; }
+    if (confirmedReportReading) { if (!periodic) confirmedReportReadPending = true; return false; }
+    const readScope = state.authToken;
+    state.readBudget?.touch("reports",readScope);
     confirmedReportReading = true;
     const userId = state.currentUser.id;
     try {
@@ -5658,7 +5725,11 @@ const App = (() => {
       let changed = false;
       while (true) {
         const { data, error } = await state.sb.rpc("get_report_changes", { auth_token: state.authToken, p_after: mirror.cursor });
-        if (error || !data?.ok || !Array.isArray(data.changes) || state.currentUser?.id !== userId) return false;
+        if (error || !data?.ok || !Array.isArray(data.changes) || state.currentUser?.id !== userId) {
+          state.readBudget?.settled("reports",false,readScope);
+          return false;
+        }
+        state.readBudget?.settled("reports",true,readScope);
         if (data.changes.some(change => !Number.isSafeInteger(Number(change.sequence)) || Number(change.sequence) <= Number(mirror.cursor))) return false;
         if (!data.changes.length) break;
         const nextMirror = JSON.parse(JSON.stringify(mirror));
@@ -5761,8 +5832,12 @@ const App = (() => {
       totalRecords: Math.max(Number(totals.sales || 0), records.size) };
   };
   const startConfirmedReportSync = () => {
-    window.clearInterval(state.confirmedReportTimer);
-    const tick = () => { void queueReadyCheckoutReports(); void flushConfirmedReportChanges(); void syncConfirmedReports(); };
+    if (state.confirmedReportTimer) return;
+    const tick = () => {
+      void queueReadyCheckoutReports(); void flushConfirmedReportChanges();
+      const interval = state.adminBroadcastConnected ? (document.hidden ? 15000 : 5000) : SYNC_INTERVAL_MS;
+      if (state.readBudget?.due("reports",interval,state.authToken) !== false) void syncConfirmedReports({periodic:true});
+    };
     tick();
     state.confirmedReportTimer = window.setInterval(tick, SYNC_INTERVAL_MS);
   };
@@ -8435,6 +8510,7 @@ const App = (() => {
   };
 
   const saveBusiness = async (form) => {
+    const formRevision = Number(state.businessFormRevision || 0);
     if (state.brandAssetUploads?.size) { toast("Espera a que termine de subir la imagen antes de guardar.", "error", "brand-upload-pending"); return false; }
     if (!updateTipSettingsFromForm(form, { renderForm: false })) return;
     const payload = {
@@ -8462,6 +8538,7 @@ const App = (() => {
       );
       if (saved) {
         state.business = saved;
+        if (Number(state.businessFormRevision || 0) === formRevision) state.businessFormDirty = false;
         clearSavedBrandAssetDrafts(saved);
         renderBrand();
         renderBusinessForm();
@@ -10803,6 +10880,12 @@ const App = (() => {
   };
 
   const bindAdmin = () => {
+    $("#businessForm")?.addEventListener("input",event=>{
+      if (["business_name","subtitle","accent_color"].includes(event.target.name)) {
+        state.businessFormDirty = true;
+        state.businessFormRevision = Number(state.businessFormRevision || 0) + 1;
+      }
+    });
     bindSalesShift();
     bindAccountFeatures();
     $("#accountsSearch")?.addEventListener("input", () => renderAccounts());
@@ -11555,6 +11638,7 @@ const App = (() => {
     if (previous && !state.adminRealtimeNeedsReconnect) return;
     window.clearTimeout(state.adminReconnectTimer);
     state.adminBroadcastChannel = null;
+    state.adminBroadcastConnected = false;
     if (previous) {
       state.subscriptions = state.subscriptions.filter((entry) => entry !== previous);
       void state.sb.removeChannel(previous);
@@ -11577,8 +11661,10 @@ const App = (() => {
     state.adminBroadcastChannel = channel;
     channel.subscribe((status) => {
       if (state.adminBroadcastChannel !== channel) return;
+      state.adminBroadcastConnected = status === "SUBSCRIBED";
       if (status === "SUBSCRIBED") {
         state.adminRealtimeNeedsReconnect = false;
+        state.adminReconnectAttempts = 0;
         window.clearTimeout(state.adminReconnectTimer);
         setRealtimeStatus("En vivo", "live");
         void pollAdminRequests();
@@ -11589,7 +11675,7 @@ const App = (() => {
         window.clearTimeout(state.adminReconnectTimer);
         state.adminReconnectTimer = window.setTimeout(() => {
           if (state.adminBroadcastChannel === channel && state.authToken) subscribeAdmin();
-        }, 3000);
+        }, Math.min(30000,3000*2**Math.min((state.adminReconnectAttempts=(state.adminReconnectAttempts || 0)+1)-1,4)));
         setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
       }
     });
@@ -11600,6 +11686,7 @@ const App = (() => {
     const previous = state.adminDataChannel;
     if (previous && !state.adminDataNeedsReconnect) return;
     state.adminDataChannel = null;
+    state.adminDataConnected = false;
     window.clearTimeout(state.adminDataReconnectTimer);
     if (previous) {
       state.subscriptions = state.subscriptions.filter(entry => entry !== previous);
@@ -11614,11 +11701,12 @@ const App = (() => {
     state.subscriptions.push(channel);
     channel.subscribe(status => {
       if (state.adminDataChannel !== channel) return;
-      if (status === "SUBSCRIBED") { state.adminDataNeedsReconnect = false; return; }
+      state.adminDataConnected = status === "SUBSCRIBED";
+      if (status === "SUBSCRIBED") { state.adminDataNeedsReconnect = false; state.adminDataReconnectAttempts = 0; return; }
       if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
         state.adminDataNeedsReconnect = true;
         window.clearTimeout(state.adminDataReconnectTimer);
-        state.adminDataReconnectTimer = window.setTimeout(subscribeAdminData, 5000);
+        state.adminDataReconnectTimer = window.setTimeout(subscribeAdminData, Math.min(30000,5000*2**Math.min((state.adminDataReconnectAttempts=(state.adminDataReconnectAttempts || 0)+1)-1,3)));
       }
     });
   };
