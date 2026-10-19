@@ -1,5 +1,5 @@
 const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
-const APP_ASSET_CACHE = "tienda-napoles-assets-20261019-carta-compras-v1";
+const APP_ASSET_CACHE = "tienda-napoles-assets-20261019-marca-cartas-v2";
 const DYNAMIC_PWA_ASSETS = new Set([
   "pwa-manifest.webmanifest",
   "pwa-icon-192.png",
