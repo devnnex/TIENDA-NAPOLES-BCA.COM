@@ -56,6 +56,7 @@ const movementContext = vm.createContext({
     };
   },
   readAppsScriptOutbox: () => movementJobs,
+  mergeConfirmedMovements: rows => rows,
   $: () => null,
   persistInventoryMovements: () => undefined,
   renderInventoryMovements: () => undefined,
@@ -63,7 +64,7 @@ const movementContext = vm.createContext({
   window: { setTimeout: () => 1 },
   Date
 });
-vm.runInContext(`${section("  const loadInventoryMovements =", "  const resetInventoryForm =")}
+vm.runInContext(`let movementRefreshPending = false; ${section("  const loadInventoryMovements =", "  const resetInventoryForm =")}
 ;globalThis.loadInventoryMovements = loadInventoryMovements;`, movementContext);
 
 const salesState = {
@@ -116,7 +117,8 @@ vm.runInContext(`${section("  const loadIncomeReport =", "  const refreshBackgro
   assert.ok(movementState.inventoryMovements.some((item) => item.movementId === "m2"));
   movementState.movementLoading = true;
   await movementContext.loadInventoryMovements({ force: true });
-  assert.equal(movementReads, 3, "El clic fuerza otra lectura aunque había una en curso.");
+  assert.equal(movementReads, 2, "Una lectura en curso conserva el refresco pendiente sin solapar solicitudes.");
+  assert.equal(vm.runInContext('movementRefreshPending', movementContext), true);
 
   assert.equal(await saleContext.loadIncomeReport({ background: true, manual: true }), true);
   assert.equal(saleReads, 1);

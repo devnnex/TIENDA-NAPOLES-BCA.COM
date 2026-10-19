@@ -301,6 +301,196 @@ const App = (() => {
     nueve: 9,
     diez: 10
   };
+  // Atomic local persistence is shared by checkout only; BCA's network sync is unchanged.
+  const LOCAL_DATA_DB = "tienda-napoles-bca-checkout-v1";
+  const LOCAL_DATA_DB_VERSION = 1;
+  const LOCAL_DATA_STORE = "records";
+  const DURABLE_LOCAL_KEYS = [INVENTORY_STORAGE_KEY, INVOICE_STORAGE_KEY,
+    INVENTORY_MOVEMENTS_STORAGE_KEY, APPS_SCRIPT_OUTBOX_KEY, WALK_IN_DRAFTS_STORAGE_KEY,
+    "napoles_checkout_intents_v1"];
+  let localDataDbPromise = null;
+  let durableWriteChain = Promise.resolve();
+  let durableRevisionOffset = 0;
+  let checkoutBatch = null;
+  const durableMemoryRevision = new Map();
+  const durableMemory = new Map();
+  const durableIndexedStatus = new Map();
+
+  const localRevisionKey = (key) => `${key}__durable_revision`;
+
+  const openLocalDataDb = () => {
+    if (!window.indexedDB) return Promise.resolve(null);
+    if (localDataDbPromise) return localDataDbPromise;
+    localDataDbPromise = new Promise((resolve) => {
+      const request = indexedDB.open(LOCAL_DATA_DB, LOCAL_DATA_DB_VERSION);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(LOCAL_DATA_STORE)) {
+          request.result.createObjectStore(LOCAL_DATA_STORE, { keyPath: "key" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+      request.onblocked = () => resolve(null);
+    });
+    return localDataDbPromise;
+  };
+
+  const localDataRecord = async (key) => {
+    const database = await openLocalDataDb();
+    if (!database) return null;
+    return new Promise((resolve) => {
+      const transaction = database.transaction(LOCAL_DATA_STORE, "readonly");
+      const request = transaction.objectStore(LOCAL_DATA_STORE).get(key);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => resolve(null);
+      transaction.onabort = () => resolve(null);
+    });
+  };
+
+  const putLocalDataRecord = async (record) => {
+    const database = await openLocalDataDb();
+    if (!database) return false;
+    return new Promise((resolve) => {
+      try {
+        const transaction = database.transaction(LOCAL_DATA_STORE, "readwrite");
+        transaction.objectStore(LOCAL_DATA_STORE).put(record);
+        transaction.oncomplete = () => resolve(true);
+        transaction.onerror = () => resolve(false);
+        transaction.onabort = () => resolve(false);
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  };
+
+  const nextDurableRevision = () => (Date.now() * 1000) + (++durableRevisionOffset % 1000);
+
+  const persistDurableJson = (key, value) => {
+    if (checkoutBatch) {
+      const snapshot = JSON.parse(JSON.stringify(value));
+      checkoutBatch.set(key, snapshot);
+      return Promise.resolve(true);
+    }
+    const revision = nextDurableRevision();
+    const serialized = JSON.stringify(value);
+    const snapshot = JSON.parse(serialized);
+    durableMemory.set(key, snapshot);
+    durableMemoryRevision.set(key, revision);
+    let localSaved = false;
+    try {
+      // localStorage queda como proyeccion sincrona para compatibilidad; IndexedDB
+      // es la copia durable que permite recuperar colas y datos criticos.
+      localStorage.setItem(key, serialized);
+      localStorage.setItem(localRevisionKey(key), String(revision));
+      localSaved = true;
+    } catch (_) { /* IndexedDB sigue siendo la persistencia principal. */ }
+    durableWriteChain = durableWriteChain
+      .catch(() => undefined)
+      .then(async () => {
+        const indexedSaved = await putLocalDataRecord({ key, value: snapshot, revision, updatedAt: new Date().toISOString() });
+        const saved = indexedSaved || localSaved;
+        durableIndexedStatus.set(key, indexedSaved);
+        return saved;
+      });
+    return durableWriteChain;
+  };
+
+  const hydrateDurableKey = async (key) => {
+    const record = await localDataRecord(key);
+    let localValue = null;
+    let localRevision = 0;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw !== null) localValue = JSON.parse(raw);
+      localRevision = Number(localStorage.getItem(localRevisionKey(key)) || 0);
+    } catch (_) {
+      localValue = null;
+      localRevision = 0;
+    }
+    if (localValue !== null && (!record || localRevision >= Number(record.revision || 0))) {
+      if (!record || localRevision > Number(record.revision || 0)) {
+        await persistDurableJson(key, localValue);
+        return localValue;
+      }
+      durableMemory.set(key, localValue);
+      durableMemoryRevision.set(key, localRevision);
+      durableIndexedStatus.set(key, true);
+      return localValue;
+    }
+    if (record) {
+      try {
+        localStorage.setItem(key, JSON.stringify(record.value));
+        localStorage.setItem(localRevisionKey(key), String(record.revision || 0));
+      } catch (_) { /* El estado se conserva en IndexedDB. */ }
+      durableMemory.set(key, record.value);
+      durableMemoryRevision.set(key, Number(record.revision || 0));
+      durableIndexedStatus.set(key, true);
+      return record.value;
+    }
+    return null;
+  };
+
+  const hydrateDurableLocalState = async () => {
+    await Promise.all(DURABLE_LOCAL_KEYS.map(hydrateDurableKey));
+    await durableWriteChain.catch(() => undefined);
+  };
+
+  const flushDurableWrites = async (requiredKeys = []) => {
+    await durableWriteChain.catch(() => undefined);
+    return requiredKeys.every((key) => durableIndexedStatus.get(key) === true);
+  };
+
+  // One IndexedDB transaction commits invoice, stock, movements, outbox and
+  // recovery intent. A crash cannot expose half of a financial projection.
+  const persistCheckoutAtomically = async (project) => {
+    if (checkoutBatch) throw new Error("Ya hay un cobro en procesamiento.");
+    const values = new Map();
+    checkoutBatch = values;
+    try { project(); } finally { checkoutBatch = null; }
+    let committed = false;
+    const commit = async () => {
+      const database = await openLocalDataDb();
+      if (!database) return false;
+      const revision = nextDurableRevision();
+      const updatedAt = new Date().toISOString();
+      const saved = await new Promise((resolve) => {
+        let tx;
+        try {
+          tx = database.transaction(LOCAL_DATA_STORE, "readwrite");
+          const store = tx.objectStore(LOCAL_DATA_STORE);
+          for (const [key, value] of values) {
+            if (key !== APPS_SCRIPT_OUTBOX_KEY) { store.put({ key, value, revision, updatedAt }); continue; }
+            const current = store.get(key);
+            current.onsuccess = () => {
+              readRemovedOutboxJobs(store, value.map(job => job.id), removed => {
+                const merged = mergeOutboxJobs(current.result?.value || [], value, removed);
+                values.set(key, merged);
+                store.put({ key, value: merged, revision, updatedAt });
+              });
+            };
+          }
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = tx.onabort = () => resolve(false);
+        } catch (_) { if (tx) tx.abort(); resolve(false); }
+      });
+      if (!saved) return false;
+      for (const [key, value] of values) {
+        durableMemory.set(key, value);
+        durableMemoryRevision.set(key, revision);
+        durableIndexedStatus.set(key, true);
+        try {
+          localStorage.setItem(key, JSON.stringify(value));
+          localStorage.setItem(localRevisionKey(key), String(revision));
+        } catch (_) { /* The committed IndexedDB record is authoritative. */ }
+      }
+      committed = true;
+      return true;
+    };
+    durableWriteChain = durableWriteChain.catch(() => undefined).then(commit);
+    await durableWriteChain;
+    return committed;
+  };
+
   const state = {
     sb: null,
     page: "",
@@ -765,6 +955,7 @@ const App = (() => {
   };
 
   const isBoss = (user = state.currentUser) => user?.role === "boss";
+  const isManager = (user = state.currentUser) => ["boss", "admin"].includes(user?.role);
   const isWaiter = (user = state.currentUser) => user?.role === "waiter";
   const roleLabel = (role) => ({ boss: "Jefe", admin: "Administrador", waiter: "Mesero" }[role] || "Usuario");
   const normalizedUserPermissions = (user = state.currentUser) => {
@@ -1487,6 +1678,24 @@ const App = (() => {
     });
   };
 
+  // BCA still waits for its backend; cap each attempt and reconcile stable-ID inserts.
+  const retryPosMutation = async (factory) => {
+    const query = factory();
+    if (query.abortSignal) query.abortSignal(AbortSignal.timeout(5000));
+    const result = await dbQuiet(query, null);
+    if (result) return result;
+    const payloads = Array.isArray(query.body) ? query.body : [query.body];
+    if (query.method !== "POST" || !payloads.length || payloads.some(row => !row?.id)) return null;
+    const entity = query.url?.pathname.split("/").pop();
+    if (!["table_sessions", "session_items"].includes(entity)) return null;
+    const read = state.sb.from(entity).select("*").in("id", payloads.map(row => row.id));
+    if (read.abortSignal) read.abortSignal(AbortSignal.timeout(5000));
+    const rows = await dbQuiet(read, null);
+    if (!Array.isArray(rows) || rows.length !== payloads.length || !payloads.every(payload => rows.some(row =>
+      row.id === payload.id && Object.keys(payload).every(key => payload[key] == null ? row[key] == null : String(row[key]) === String(payload[key]))))) return null;
+    return Array.isArray(query.body) ? rows : rows[0];
+  };
+
   const retryQuiet = async (factory, attempts = 4) => {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const result = await dbQuiet(factory(), null);
@@ -1856,12 +2065,14 @@ const App = (() => {
     }[char]));
 
   const readLocalJson = (key, fallback) => {
+    if (checkoutBatch?.has(key)) return checkoutBatch.get(key);
     try {
-      const value = JSON.parse(localStorage.getItem(key) || "null");
-      return value ?? fallback;
-    } catch (error) {
-      return fallback;
-    }
+      const revision = Number(localStorage.getItem(localRevisionKey(key)) || 0);
+      if (durableMemory.has(key) && Number(durableMemoryRevision.get(key) || 0) > revision) return durableMemory.get(key);
+      const raw = localStorage.getItem(key);
+      if (raw !== null) return JSON.parse(raw) ?? fallback;
+    } catch (_) { /* Fall back to the durable record hydrated at startup. */ }
+    return durableMemory.has(key) ? durableMemory.get(key) : fallback;
   };
 
   function applyBusinessTipSettings() {
@@ -1930,21 +2141,9 @@ const App = (() => {
     }
   };
 
-  const persistInventoryStore = () => {
-    try {
-      localStorage.setItem(INVENTORY_STORAGE_KEY, JSON.stringify(state.inventoryMeta));
-    } catch (error) {
-      toast("No se pudo guardar el inventario en este dispositivo.", "error", "inventory-storage-failed");
-    }
-  };
+  const persistInventoryStore = () => persistDurableJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
 
-  const persistInvoiceHistory = () => {
-    try {
-      localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(state.invoiceHistory.slice(-1000)));
-    } catch (error) {
-      toast("La venta se cerro, pero no se pudo guardar el historial local.", "error", "invoice-storage-failed");
-    }
-  };
+  const persistInvoiceHistory = () => persistDurableJson(INVOICE_STORAGE_KEY, state.invoiceHistory);
 
   const persistTipSettings = () => {
     try {
@@ -1954,19 +2153,12 @@ const App = (() => {
     }
   };
 
-  const persistInventoryMovements = () => {
-    try {
-      const recent = [...state.inventoryMovements]
-        .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || "")))
-        ;
-      localStorage.setItem(INVENTORY_MOVEMENTS_STORAGE_KEY, JSON.stringify(recent));
-    } catch (error) { /* Historial remoto y memoria siguen disponibles. */ }
-  };
+  const persistInventoryMovements = () => persistDurableJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements);
 
-  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost, sessionId = "" }) => {
+  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost, sessionId = "", deferPersist = false, knownMovementIds = null }) => {
     const numericDelta = Number(delta || 0);
     const isNewProduct = String(type || "").toUpperCase() === "NUEVO_PRODUCTO";
-    if (!item || !Number.isFinite(numericDelta) || (!numericDelta && !isNewProduct) || state.inventoryMovements.some((movement) => movement.movementId === eventId)) return null;
+    if (!item || !Number.isFinite(numericDelta) || (!numericDelta && !isNewProduct) || (knownMovementIds ? knownMovementIds.has(eventId) : state.inventoryMovements.some((movement) => movement.movementId === eventId))) return null;
     const movement = {
       movementId: eventId,
       sessionId,
@@ -1983,8 +2175,9 @@ const App = (() => {
       user: user || state.currentUser?.full_name || state.currentUser?.username || "Sistema"
     };
     state.inventoryMovements.push(movement);
-    persistInventoryMovements();
-    if (state.activeAdminSection === "movements") renderInventoryMovements();
+    knownMovementIds?.add(eventId);
+    if (!deferPersist) persistInventoryMovements();
+    if (!deferPersist && state.activeAdminSection === "movements") renderInventoryMovements();
     return movement;
   };
 
@@ -2036,6 +2229,7 @@ const App = (() => {
     cash: "Efectivo",
     transfer: "Transferencia",
     breb: "Bre-B",
+    card: "Tarjeta",
     mixed: "Pago mixto"
   }[method] || "Pago");
 
@@ -2262,9 +2456,74 @@ const App = (() => {
     return Array.isArray(stored) ? stored : [];
   };
 
-  const writeAppsScriptOutbox = (jobs) => {
-    try { localStorage.setItem(APPS_SCRIPT_OUTBOX_KEY, JSON.stringify(jobs.slice(-2000))); } catch (error) { /* Cache operativa. */ }
+  const mergeOutboxJobs = (stored, incoming, removed = {}) => {
+    const jobs = new Map((Array.isArray(stored) ? stored : []).filter(job => !removed[job.id]).map(job => [job.id, job]));
+    for (const job of incoming) {
+      if (removed[job.id]) continue;
+      const previous = jobs.get(job.id);
+      if (!previous || String(job.updatedAt || job.createdAt || "") >= String(previous.updatedAt || previous.createdAt || "")) jobs.set(job.id, job);
+    }
+    return [...jobs.values()];
   };
+
+  const readRemovedOutboxJobs = (store, ids, done) => {
+    const unique = [...new Set(ids)], removed = {};
+    let remaining = unique.length;
+    if (!remaining) { done(removed); return; }
+    unique.forEach(id => {
+      const request = store.get(`${APPS_SCRIPT_OUTBOX_KEY}__removed:${id}`);
+      request.onsuccess = () => {
+        if (request.result?.value) removed[id] = true;
+        if (--remaining === 0) done(removed);
+      };
+    });
+  };
+
+  // Read/merge/write occurs in a single IDB transaction across all tabs.
+  // Removal markers prevent stale tabs from resurrecting acknowledged jobs.
+  const persistAppsScriptOutbox = (incoming, removedIds = []) => {
+    if (checkoutBatch) return persistDurableJson(APPS_SCRIPT_OUTBOX_KEY, incoming);
+    const snapshot = JSON.parse(JSON.stringify(incoming));
+    const save = async () => {
+      const database = await openLocalDataDb();
+      if (!database) { durableIndexedStatus.set(APPS_SCRIPT_OUTBOX_KEY, false); return false; }
+      let revision = nextDurableRevision();
+      let jobs;
+      const saved = await new Promise(resolve => {
+        try {
+          const tx = database.transaction(LOCAL_DATA_STORE, "readwrite"), store = tx.objectStore(LOCAL_DATA_STORE);
+          const current = store.get(APPS_SCRIPT_OUTBOX_KEY);
+          current.onsuccess = () => {
+            revision = Math.max(revision, Number(current.result?.revision || 0) + 1);
+            readRemovedOutboxJobs(store, [...snapshot.map(job => job.id), ...removedIds], removed => {
+              removedIds.forEach(id => {
+                removed[id] = true;
+                store.put({ key: `${APPS_SCRIPT_OUTBOX_KEY}__removed:${id}`, value: true, revision });
+              });
+              jobs = mergeOutboxJobs(current.result?.value || readLocalJson(APPS_SCRIPT_OUTBOX_KEY, []), snapshot, removed);
+              store.put({ key: APPS_SCRIPT_OUTBOX_KEY, value: jobs, revision });
+            });
+          };
+          tx.oncomplete = () => resolve(true);
+          tx.onabort = tx.onerror = () => resolve(false);
+        } catch (_) { resolve(false); }
+      });
+      durableIndexedStatus.set(APPS_SCRIPT_OUTBOX_KEY, saved);
+      if (saved) {
+        durableMemory.set(APPS_SCRIPT_OUTBOX_KEY, jobs);
+        durableMemoryRevision.set(APPS_SCRIPT_OUTBOX_KEY, revision);
+        try {
+          localStorage.setItem(APPS_SCRIPT_OUTBOX_KEY, JSON.stringify(jobs));
+          localStorage.setItem(localRevisionKey(APPS_SCRIPT_OUTBOX_KEY), String(revision));
+        } catch (_) { /* IDB is committed and remains authoritative. */ }
+      }
+      return saved;
+    };
+    durableWriteChain = durableWriteChain.catch(() => undefined).then(save);
+    return durableWriteChain;
+  };
+
+  const writeAppsScriptOutbox = (jobs, removedIds = []) => persistAppsScriptOutbox(jobs, removedIds);
 
   const initRemoteStorage = () => {
     if (!isAppsScriptConfigured()) {
@@ -2414,9 +2673,11 @@ const App = (() => {
     if (state.appsScriptOutboxBusy || !isAppsScriptConfigured() || !navigator.onLine) return false;
     state.appsScriptOutboxBusy = true;
     try {
+      await flushDurableWrites();
       let jobs = readAppsScriptOutbox();
       while (jobs.length) {
-        const job = jobs[0];
+        const job = jobs.find(entry => !["failed", "conflict"].includes(entry.status));
+        if (!job) { setInventorySyncStatus("Hay operaciones de respaldo que requieren revisión", "error", "triangle-alert"); return false; }
         setInventorySyncStatus(`Sincronizando ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}`, "pending", "refresh-cw");
         const result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.id);
         const queuedAfterRequest = readAppsScriptOutbox();
@@ -2442,8 +2703,12 @@ const App = (() => {
             && /accion no permitida:\s*adjust_inventory/i.test(normalizeText(result?.error || ""));
           if (result?.retryable === false || legacyInventoryService) {
             if (result.item) applyFreshRemoteInventory();
-            jobs = pendingAfterCurrent;
-            writeAppsScriptOutbox(jobs);
+            job.status = result?.conflict ? "conflict" : "failed";
+            job.lastError = result?.error || "Operacion rechazada";
+            job.updatedAt = new Date().toISOString();
+            jobs = [...pendingAfterCurrent, job];
+            await writeAppsScriptOutbox(jobs);
+            jobs = readAppsScriptOutbox();
             toast(
               legacyInventoryService
                 ? "El servicio remoto no acepta movimientos individuales; el inventario se conciliara al cerrar la mesa."
@@ -2463,14 +2728,15 @@ const App = (() => {
           job.lastAttemptAt = new Date().toISOString();
           jobs = queuedAfterRequest;
           jobs[currentIndex] = job;
-          writeAppsScriptOutbox(jobs);
+          await writeAppsScriptOutbox(jobs);
           setInventorySyncStatus(`${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}; reintento automatico`, "error", "cloud-off");
           scheduleAppsScriptRetry();
           return false;
         }
         applyFreshRemoteInventory();
         jobs = pendingAfterCurrent;
-        writeAppsScriptOutbox(jobs);
+        await writeAppsScriptOutbox(jobs, [job.id]);
+        jobs = readAppsScriptOutbox();
       }
       setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
       return true;
@@ -5682,26 +5948,100 @@ const App = (() => {
     doc.save(filename);
     return doc;
   };
+  const buildPurchasesReportPdf = (rows, filters) => {
+    const PDF = window.jspdf?.jsPDF;
+    if (!PDF) throw new Error("El generador PDF no está disponible. Recarga la aplicación.");
+    const doc = new PDF({orientation:"landscape",unit:"mm",format:"a4"});
+    const width=297, margin=15, tableWidth=267, bottom=191;
+    const clean=value=>String(value ?? "").replace(/[\u00a0\u202f]/g," ");
+    let y=0;
+    const heading=()=>{
+      doc.setFillColor(22,43,57);doc.rect(0,0,width,31,"F");
+      doc.setTextColor(255,255,255);doc.setFont("helvetica","bold");doc.setFontSize(17);
+      doc.text("Compras de inventario",margin,12);
+      doc.setFont("helvetica","normal");doc.setFontSize(10);
+      doc.text(doc.splitTextToSize(clean(state.business?.business_name || "Tienda Nápoles"),tableWidth).slice(0,1),margin,20);
+      doc.text(`${filters.from || "Todo el historial"} a ${filters.to || "hoy"}`,margin,27);
+      doc.setTextColor(35,48,58);y=40;
+    };
+    const newPage=()=>{doc.addPage();heading();};
+    const paragraph=(text,bold=false)=>{
+      doc.setFont("helvetica",bold?"bold":"normal");doc.setFontSize(bold?12:9);
+      const lines=doc.splitTextToSize(clean(text),tableWidth);
+      for(const line of lines){if(y+6>bottom)newPage();doc.text(line,margin,y);y+=5;}
+      y+=3;
+    };
+    const table=(title,columns,data)=>{
+      if(y+25>bottom)newPage();paragraph(title,true);
+      const head=()=>{
+        doc.setFillColor(232,239,243);doc.rect(margin,y-4,tableWidth,10,"F");
+        doc.setFont("helvetica","bold");doc.setFontSize(9);
+        let x=margin;
+        columns.forEach(c=>{doc.text(clean(c.label),c.right?x+c.width-2:x+2,y+2,{align:c.right?"right":"left"});x+=c.width;});
+        y+=11;
+      };
+      head();
+      data.forEach((row,index)=>{
+        doc.setFont("helvetica","normal");doc.setFontSize(9);
+        const cells=columns.map((c,i)=>doc.splitTextToSize(clean(row[i]),c.width-5));
+        const lineCount=Math.max(1,...cells.map(c=>c.length));
+        // Una referencia o un nombre largo puede continuar en la página siguiente.
+        let offset=0;
+        while(offset<lineCount){
+          if(y+10>bottom){newPage();head();}
+          const count=Math.min(lineCount-offset,Math.max(1,Math.floor((bottom-y-5)/4.5)));
+          const height=count*4.5+5;
+          if(index%2===0){doc.setFillColor(247,249,250);doc.rect(margin,y-3,tableWidth,height,"F");}
+          doc.setFont("helvetica","normal");doc.setFontSize(9);doc.setTextColor(35,48,58);
+          let x=margin;
+          cells.forEach((lines,i)=>{const c=columns[i],part=lines.slice(offset,offset+count);if(part.length)doc.text(part,c.right?x+c.width-2:x+2,y+1,{align:c.right?"right":"left"});x+=c.width;});
+          y+=height;offset+=count;
+          if(offset<lineCount){newPage();head();}
+        }
+      });y+=7;
+    };
+    heading();
+    const total=rows.reduce((sum,row)=>sum+Number(row.delta||0)*purchaseUnitCost(row),0);
+    const units=rows.reduce((sum,row)=>sum+Number(row.delta||0),0);
+    paragraph(`Total invertido: ${money(total)}   |   Unidades compradas: ${reportNumber(units)}   |   Registros: ${rows.length}`,true);
+    paragraph(`Producto: ${filters.product}. Búsqueda: ${filters.query || "ninguna"}.`);
+    paragraph(`Alcance: ${rows.length} compras filtradas de los registros cargados en pantalla.${filters.hasMore?" Hay historial anterior sin cargar; este documento contiene la selección visible.":""}${filters.offline?" Sin conexión: copia disponible en este equipo.":""} Las devoluciones no se cuentan como compras. Se usa el costo guardado; si faltaba, el costo actual, igual que en Compras.`);
+    const grouped=new Map();
+    rows.forEach(row=>{const key=String(row.productId||row.product),old=grouped.get(key)||{name:row.product,units:0,total:0};old.units+=Number(row.delta||0);old.total+=Number(row.delta||0)*purchaseUnitCost(row);grouped.set(key,old);});
+    table("Resumen por producto",[{label:"Producto",width:169},{label:"Unidades",width:40,right:true},{label:"Inversión",width:58,right:true}],
+      [...grouped.values()].map(row=>[row.name,reportNumber(row.units),money(row.total)]));
+    table("Detalle de compras",[{label:"Fecha / responsable",width:58},{label:"Producto / referencia",width:91},{label:"Unidades",width:24,right:true},{label:"Costo / unidad",width:42,right:true},{label:"Total",width:52,right:true}],
+      rows.map(row=>[`${prettyDateTime(row.date)}\n${row.user||"Sistema"}`,`${row.product}\n${row.reference||""}`,reportNumber(row.delta),money(purchaseUnitCost(row)),money(Number(row.delta||0)*purchaseUnitCost(row))]));
+    const pages=doc.getNumberOfPages();
+    for(let page=1;page<=pages;page++){
+      doc.setPage(page);doc.setDrawColor(215,224,230);doc.line(margin,198,width-margin,198);
+      doc.setFont("helvetica","normal");doc.setFontSize(8);doc.setTextColor(90,105,115);
+      doc.text(clean(`Generado ${prettyDateTime(new Date())} · COP`),margin,204);
+      doc.text(`Página ${page} de ${pages}`,width-margin,204,{align:"right"});
+    }
+    return doc.save(`compras-${filters.from||"historial"}-${filters.to||purchaseDateKey(new Date())}.pdf`,{returnPromise:true});
+  };
   const exportPurchasesPdf = async () => {
-    const button = $("#exportPurchasesPdf");
-    if (button) button.disabled = true;
+    const button=$("#exportPurchasesPdf");
+    if(button?.disabled)return;
+    if(button)button.disabled=true;
+    const feedback=$("#purchaseFilterFeedback");
     try {
       if(state.purchaseDateFrom && state.purchaseDateTo && state.purchaseDateFrom>state.purchaseDateTo)throw new Error("La fecha inicial debe ser anterior a la final.");
-      if(navigator.onLine)await ensureCompleteMovementHistory();
-      const rows=purchaseMovements();
+      // Misma selección que renderPurchaseHistory. La descarga no exige una
+      // consulta de Movimientos ni permisos adicionales a los de esta pantalla.
+      const rows=purchaseMovements().map(row=>({...row}));
       if(!rows.length)throw new Error("No hay compras con estos filtros.");
-      const total=rows.reduce((sum,row)=>sum+Number(row.delta||0)*purchaseUnitCost(row),0);
-      const units=rows.reduce((sum,row)=>sum+Number(row.delta||0),0);
-      const grouped=new Map();
-      rows.forEach(row=>{const key=String(row.productId||row.product), old=grouped.get(key)||{name:row.product,units:0,total:0};old.units+=Number(row.delta||0);old.total+=Number(row.delta||0)*purchaseUnitCost(row);grouped.set(key,old);});
-      buildBusinessReportPdf({title:"Compras de inventario",subtitle:`${state.purchaseDateFrom||"Todo el historial"} a ${state.purchaseDateTo||"hoy"}`,
-        metrics:[["Total invertido",money(total)],["Unidades compradas",reportNumber(units)],["Registros",rows.length]],
-        note:`Producto: ${$("#purchaseProductFilter")?.selectedOptions?.[0]?.textContent||"Todos"}. Búsqueda: ${state.purchaseSearch||"ninguna"}. ${!navigator.onLine?"Sin conexión: copia disponible en este equipo. ":""}Las devoluciones no se cuentan como compras. Los importes usan el costo guardado; si faltaba, el costo actual del producto.`,
-        sections:[{title:"Resumen por producto",columns:[{label:"Producto",width:100},{label:"Unidades",width:35},{label:"Inversión",width:45}],rows:[...grouped.values()].map(row=>[row.name,reportNumber(row.units),money(row.total)])},
-        {title:"Detalle de compras",columns:[{label:"Fecha / responsable",width:50},{label:"Producto",width:55},{label:"Unidades",width:20},{label:"Costo / unidad",width:27},{label:"Total",width:28}],rows:rows.map(row=>[`${prettyDateTime(row.date)}\n${row.user||"Sistema"}`,`${row.product}\n${row.reference||""}`,reportNumber(row.delta),money(purchaseUnitCost(row)),money(Number(row.delta||0)*purchaseUnitCost(row))])}],
-        filename:`compras-${state.purchaseDateFrom||"historial"}-${state.purchaseDateTo||purchaseDateKey(new Date())}.pdf`});
-    }catch(error){toast(error.message,"error","purchase-pdf-failed");}finally{if(button)button.disabled=false;}
+      await buildPurchasesReportPdf(rows,{from:state.purchaseDateFrom,to:state.purchaseDateTo,
+        product:$("#purchaseProductFilter")?.selectedOptions?.[0]?.textContent||"Todos",
+        query:state.purchaseSearch,hasMore:state.movementHasMore,offline:!navigator.onLine});
+      if(feedback){feedback.textContent=`PDF generado con ${rows.length} compras de la selección visible.`;feedback.classList.remove("is-error");}
+    }catch(error){
+      if(feedback){feedback.textContent=error.message;feedback.classList.add("is-error");}
+      toast(error.message,"error","purchase-pdf-failed");
+    }finally{if(button)button.disabled=false;}
   };
+
 
   const renderConsumptionProductOptions = (searchValue = "") => {
     const options = $("#consumptionProductOptions");
@@ -6820,6 +7160,7 @@ const App = (() => {
     cash: "Efectivo",
     transfer: "Transferencia",
     breb: "Bre-B",
+    card: "Tarjeta",
     mixed: "Mixto"
   }[method] || "Otro");
 
@@ -6839,11 +7180,11 @@ const App = (() => {
       summary.cost += Number(record.cost || 0);
       summary.profit += Number(record.profit || 0);
       (record.payments || []).forEach((payment) => {
-        const method = ["cash", "transfer", "breb"].includes(payment.method) ? payment.method : "other";
+        const method = ["cash", "transfer", "breb", "card"].includes(payment.method) ? payment.method : "other";
         summary[method] += Number(payment.amount || 0);
       });
       return summary;
-    }, { income: 0, sales: 0, subtotal: 0, discount: 0, tax: 0, service: 0, cost: 0, profit: 0, cash: 0, transfer: 0, breb: 0, other: 0 });
+    }, { income: 0, sales: 0, subtotal: 0, discount: 0, tax: 0, service: 0, cost: 0, profit: 0, cash: 0, transfer: 0, breb: 0, card: 0, other: 0 });
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
     return totals;
   };
@@ -7055,7 +7396,8 @@ const App = (() => {
     payments.innerHTML = [
       ["cash", "banknote", "Efectivo"],
       ["transfer", "landmark", "Transferencia"],
-      ["breb", "scan-line", "Bre-B"]
+      ["breb", "scan-line", "Bre-B"],
+      ["card", "credit-card", "Tarjeta"]
     ].map(([key, iconName, label]) => `<article><span>${icon(iconName, 18)} ${label}</span><strong>${money(totals[key])}</strong><small><b>${Number(totals.income || 0) ? (Number(totals[key] || 0) / Number(totals.income) * 100).toLocaleString("es-CO", { maximumFractionDigits: 1 }) : "0"}% del total</b></small></article>`).join("");
     const filters = report.filters || incomeFiltersFromForm();
     if (summaryTarget) {
@@ -7503,13 +7845,14 @@ const App = (() => {
     const panel = $("#incomeEditPayments");
     if (!panel) return;
     panel.hidden = !mixed;
-    const methods = ["cash", "transfer", "breb"];
+    const methods = ["cash", "transfer", "breb", "card"];
     methods.forEach((method) => { form.elements.namedItem("edit_payment_" + method).disabled = !mixed; });
     const total = incomeEditTotal(form);
     if (mixed && initialize && methods.filter((method) => currencyInputNumber(form.elements.namedItem("edit_payment_" + method)) > 0).length < 2) {
       setCurrencyInputValue(form.elements.namedItem("edit_payment_cash"), Math.round(total / 2));
       setCurrencyInputValue(form.elements.namedItem("edit_payment_transfer"), total - Math.round(total / 2));
       setCurrencyInputValue(form.elements.namedItem("edit_payment_breb"), 0);
+      setCurrencyInputValue(form.elements.namedItem("edit_payment_card"), 0);
     }
     const paid = methods.reduce((sum, method) => sum + currencyInputNumber(form.elements.namedItem("edit_payment_" + method)), 0);
     const balance = $("#incomeEditPaymentBalance");
@@ -7532,7 +7875,7 @@ const App = (() => {
     form.waiter.value = record.waiter || state.currentUser?.full_name || "";
     form.date.value = dateTimeLocalValue(record.date);
     form.payment_method.value = record.isMixed || record.payments?.length > 1 ? "mixed" : (record.payments?.[0]?.method || "cash");
-    ["cash", "transfer", "breb"].forEach((method) => {
+    ["cash", "transfer", "breb", "card"].forEach((method) => {
       setCurrencyInputValue(form.elements.namedItem(`edit_payment_${method}`), (record.payments || []).filter((payment) => payment.method === method).reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
     });
     form.reference.value = record.reference || "";
@@ -7581,7 +7924,7 @@ const App = (() => {
     updatedTotals.cost = Math.max(0, Number(updatedTotals.cost || 0) - Number(record.cost || 0));
     updatedTotals.profit = Number(updatedTotals.profit || 0) - Number(record.profit || 0);
     (record.payments || []).forEach((payment) => {
-      const method = ["cash", "transfer", "breb"].includes(payment.method) ? payment.method : "other";
+      const method = ["cash", "transfer", "breb", "card"].includes(payment.method) ? payment.method : "other";
       updatedTotals[method] = Math.max(0, Number(updatedTotals[method] || 0) - Number(payment.amount || 0));
     });
     updatedTotals.averageTicket = updatedTotals.sales ? updatedTotals.income / updatedTotals.sales : 0;
@@ -7605,7 +7948,7 @@ const App = (() => {
       state.inventoryMeta[item.id] = { ...current, stock: current.stock + Number(line.quantity || 0), updatedAt: new Date().toISOString() };
     });
     const hadPendingSale = outboxBefore.some((job) => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId));
-    writeAppsScriptOutbox(outboxBefore.filter((job) => !(job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId))));
+    writeAppsScriptOutbox(outboxBefore.filter((job) => !(job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId))), outboxBefore.filter(job => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId)).map(job => job.id));
     persistInvoiceHistory();
     persistInventoryStore();
     $("#deleteIncomeDialog")?.close();
@@ -7680,7 +8023,7 @@ const App = (() => {
     const subtotal = items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0);
     const total = subtotal;
     const selectedPaymentMethod = form.payment_method.value;
-    const mixedAmounts = ["cash", "transfer", "breb"].map((method) => ({ method, amount: currencyInputNumber(form.elements.namedItem("edit_payment_" + method)) }));
+    const mixedAmounts = ["cash", "transfer", "breb", "card"].map((method) => ({ method, amount: currencyInputNumber(form.elements.namedItem("edit_payment_" + method)) }));
     const correctedPayments = selectedPaymentMethod === "mixed"
       ? mixedAmounts.filter((payment) => payment.amount > 0)
       : [{ method: selectedPaymentMethod, amount: total }];
@@ -7809,7 +8152,7 @@ const App = (() => {
       buildBusinessReportPdf({title: state.incomeRangePreset === "shift" ? "Ventas del turno" : "Reporte de ventas", subtitle:`${from} a ${to}`,
         metrics:[["Total vendido",money(totals.income)],["Ventas",records.length],["Ganancia estimada",money(totals.profit)]],
         note:`${!navigator.onLine ? "Sin conexión: copia disponible en este equipo. " : ""}${partial ? `Reporte parcial: ${records.length} de ${report.totalRecords} ventas. Conéctate para descargarlo completo. ` : ""}Tipo: ${incomeSaleTypeLabel(filters.saleType)||"Todas"}. Pago: ${filters.paymentMethod === "all" ? "Todos" : incomePaymentLabel(filters.paymentMethod)}. Búsqueda: ${filters.query||"ninguna"}. ${report.pendingCount ? `Incluye ${report.pendingCount} venta(s) guardada(s), pendientes de respaldo. ` : ""}Ganancia = venta menos costo de productos; no descuenta otros gastos del negocio.`,
-        sections:[{title:"Dinero recibido por medio de pago",columns:[{label:"Medio de pago",width:120},{label:"Total",width:60}],rows:[["Efectivo",money(totals.cash)],["Transferencia",money(totals.transfer)],["Bre-B",money(totals.breb)],...(totals.other?[["Otros",money(totals.other)]]:[])]},
+        sections:[{title:"Dinero recibido por medio de pago",columns:[{label:"Medio de pago",width:120},{label:"Total",width:60}],rows:[["Efectivo",money(totals.cash)],["Transferencia",money(totals.transfer)],["Bre-B",money(totals.breb)],["Tarjeta",money(totals.card)],...(totals.other?[["Otros",money(totals.other)]]:[])]},
         {title:"Productos vendidos",columns:[{label:"Producto",width:105},{label:"Unidades",width:30},{label:"Venta",width:45}],rows:[...grouped.values()].sort((a,b)=>b.quantity-a.quantity).map(row=>[row.name,reportNumber(row.quantity),money(row.total)])},
         {title:"Detalle de cada venta",columns:[{label:"Factura / fecha",width:45},{label:"Mesa / responsable",width:43},{label:"Pago",width:38},{label:"Total",width:27},{label:"Ganancia",width:27}],rows:records.map(record=>[`${record.invoice}\n${prettyDateTime(record.date)}`,`${record.table}\n${record.payer||record.waiter||"Sin nombre"}`,(record.payments||[]).map(payment=>`${incomePaymentLabel(payment.method)}: ${money(payment.amount)}`).join("\n"),money(record.total),money(record.profit)])}],
         filename:`ventas-${filters.dateFrom}-${filters.dateTo}.pdf`});
@@ -8455,14 +8798,14 @@ const App = (() => {
   };
 
   const closeSession = async (id, checkout = null) => {
-    const session = state.sessions.find((entry) => entry.id === id);
+    const session = state.sessions.find((entry) => entry.id === id) || checkout?.session;
     if (!session) return null;
     const totals = sessionTotals(session);
     if (checkout && (Number(checkout.totals.total) !== Number(totals.total) || checkout.paid !== sessionPaid(session))) {
       toast("La cuenta cambió durante el cobro. Actualiza y revisa el saldo.", "error", "close-session-changed"); return null;
     }
     if (isLocalWalkInSession(session)) {
-      const closedAt = new Date().toISOString();
+      const closedAt = checkout?.closedAt || new Date().toISOString();
       const saved = {
         ...session,
         status: "closed",
@@ -8487,21 +8830,21 @@ const App = (() => {
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
     state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
     renderAdminLive();
-    const closedAt = new Date().toISOString();
+    const closedAt = checkout?.closedAt || new Date().toISOString();
     const closure = { status: "closed", closed_at: closedAt, subtotal: totals.subtotal,
       discount: totals.discount, tax: totals.tax, service_fee: totals.serviceFee, total: totals.total };
     let saved;
     if (state.posFeatures?.abonos) {
-      const result = await retryQuiet(() => state.sb.rpc("replay_table_session_change", {
+      const result = await retryPosMutation(() => state.sb.rpc("replay_table_session_change", {
         auth_token: state.authToken, p_session_id: id, p_patch: closure,
         p_expected_status: "open", p_expected_paid: checkout?.paid ?? sessionPaid(session)
       }), 4);
       saved = result?.session || null;
     } else {
-      saved = await retryQuiet(() => state.sb.from("table_sessions").update(closure).eq("id",id).eq("status","open").select("*").single(), 4);
+      saved = await retryPosMutation(() => state.sb.from("table_sessions").update(closure).eq("id",id).eq("status","open").select("*").single(), 4);
     }
     if (!saved) {
-      const confirmed = await dbQuiet(state.sb.from("table_sessions").select("*").eq("id", id).maybeSingle(), null);
+      const confirmed = await readRealtimeData(state.sb.from("table_sessions").select("*").eq("id", id).maybeSingle(), 5000);
       if (confirmed?.status === "closed" && String(confirmed.closed_at || "") === closedAt) saved = confirmed;
     }
     if (!saved) {
@@ -8515,7 +8858,9 @@ const App = (() => {
       return null;
     }
     state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
-    await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq(session.table_id ? "table_id" : "session_id", session.table_id || id), null);
+    void retryPosMutation(() => state.sb.from("service_requests").update({ status: "resolved" }).eq(session.table_id ? "table_id" : "session_id", session.table_id || id).select("id")).then(result => {
+      if (!result) toast("Cuenta cerrada; falta actualizar sus solicitudes. Se verificarán en el próximo refresco.", "error", "checkout-requests-pending:" + id);
+    });
     state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
     rememberCompletedAdminRequests([...originalRequests, ...readPendingAdminRequests(), ...state.requests].filter(belongsToClosingTable).map((request) => request.id));
     persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !belongsToClosingTable(request)), ...state.requests]);
@@ -8608,7 +8953,13 @@ const App = (() => {
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();
     popup.requestAnimationFrame(() => {
-      if (!popup.closed) { popup.focus(); popup.print(); }
+      if (!popup.closed) {
+        try { popup.focus(); popup.print(); }
+        catch (error) {
+          console.error("Falló la impresión del comprobante", error);
+          toast(invoice ? "Cobro guardado. No se pudo imprimir; reimprime desde Ventas." : "No se pudo imprimir la pre-cuenta.", "error", "receipt-print-failed");
+        }
+      }
     });
     return true;
   };
@@ -8647,7 +8998,7 @@ const App = (() => {
     const form = $("#paymentForm");
     if (!form || form.mixed_method_one.value !== form.mixed_method_two.value) return;
     const other = changedName === "mixed_method_one" ? form.mixed_method_two : form.mixed_method_one;
-    other.value = ["cash", "transfer", "breb"].find((method) => method !== form[changedName].value) || "cash";
+    other.value = ["cash", "transfer", "breb", "card"].find((method) => method !== form[changedName].value) || "cash";
   };
 
   const updatePaymentTipChoice = () => {
@@ -8736,6 +9087,7 @@ const App = (() => {
   };
 
   const cancelPayment = () => {
+    if (state.paymentProcessing) { toast("El cobro se está guardando. Espera el resultado.", "error", "payment-busy"); return; }
     const sessionId = $("#paymentForm")?.session_id?.value || "";
     const session = state.sessions.find((entry) => entry.id === sessionId);
     $("#paymentDialog")?.close();
@@ -8778,8 +9130,9 @@ const App = (() => {
       if (!["CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(String(movement.type || "").toUpperCase())) return;
       legacyAdjusted.set(movement.productId, Number(legacyAdjusted.get(movement.productId) || 0) - Number(movement.delta || 0));
     });
+    const itemById = new Map(state.items.map(item => [item.id, item]));
     return Array.from(quantities.entries()).map(([productId, quantity]) => {
-      const item = state.items.find((entry) => entry.id === productId);
+      const item = itemById.get(productId);
       const alreadyAdjusted = Math.max(0, Number(legacyAdjusted.get(productId) || 0));
       return { item, quantity: Math.max(0, quantity - alreadyAdjusted) };
     }).filter((entry) => entry.item && entry.quantity > 0);
@@ -8794,15 +9147,14 @@ const App = (() => {
   };
 
   const applyPaidInventoryLocally = (invoice, plan) => {
+    const movementIds = new Set(state.inventoryMovements.map(row => row.movementId));
     plan.forEach(({ item, quantity }) => {
       const eventId = `SALE-${invoice.id}-${item.id}`;
-      if (state.inventoryMovements.some((movement) => movement.movementId === eventId)) return;
+      if (movementIds.has(eventId)) return;
       const current = inventoryFor(item);
       const nextStock = Math.max(0, current.stock - quantity);
       state.inventoryMeta[item.id] = { ...current, stock: nextStock, updatedAt: invoice.createdAt };
-      recordLocalInventoryMovement({ eventId, item, delta: -quantity, before: current.stock, after: nextStock, type: "SALIDA_VENTA", reference: invoice.number, occurredAt: invoice.createdAt });
-      const movement = state.inventoryMovements.find((entry) => entry.movementId === eventId);
-      if (movement) movement.sessionId = invoice.sessionId;
+      recordLocalInventoryMovement({ eventId, item, delta: -quantity, before: current.stock, after: nextStock, type: "SALIDA_VENTA", reference: invoice.number, occurredAt: invoice.createdAt, sessionId: invoice.sessionId, deferPersist: true, knownMovementIds: movementIds });
     });
     persistInventoryStore();
     persistInventoryMovements();
@@ -8906,7 +9258,135 @@ const App = (() => {
     }, { capture: true });
   };
 
+  const CHECKOUT_INTENTS_KEY = "napoles_checkout_intents_v1";
+  const saveCheckoutIntent = async (invoice, session, paid, stage) => {
+    const intents = readLocalJson(CHECKOUT_INTENTS_KEY, {});
+    intents[session.id] = { invoice, session, paid, stage, updatedAt: new Date().toISOString() };
+    await persistDurableJson(CHECKOUT_INTENTS_KEY, intents);
+    if (!await flushDurableWrites([CHECKOUT_INTENTS_KEY])) throw new Error("No se pudo proteger el cobro en IndexedDB.");
+  };
+
+  const commitCheckout = async (intent) => {
+    const { invoice, session } = intent;
+    const inventoryBefore = state.inventoryMeta;
+    const movementsBefore = state.inventoryMovements;
+    const invoicesBefore = state.invoiceHistory;
+    const reportBefore = state.incomeReport;
+    state.inventoryMeta = { ...inventoryBefore };
+    state.inventoryMovements = [...movementsBefore];
+    state.invoiceHistory = [...invoicesBefore];
+    let saved = false;
+    try {
+      saved = await persistCheckoutAtomically(() => {
+        const existing = state.invoiceHistory.find(row => String(row.sessionId) === String(session.id));
+        if (!existing) {
+          applyPaidInventoryLocally(invoice, paidInventoryPlan(session));
+          applyInvoiceToInventory(invoice);
+        }
+        invoice.checkoutAccepted = true;
+        persistInvoiceHistory();
+        // Preserve all existing queued operations and persist the same stable sale.
+        const jobs = readAppsScriptOutbox();
+        jobs.forEach(job => { if (job.action === "record_sale" && String(job.payload?.invoice?.sessionId) === String(session.id)) job.payload.invoice.checkoutAccepted = true; });
+        writeAppsScriptOutbox(jobs);
+        const intents = { ...readLocalJson(CHECKOUT_INTENTS_KEY, {}) };
+        delete intents[session.id];
+        void persistDurableJson(CHECKOUT_INTENTS_KEY, intents);
+      });
+      if (!saved) throw new Error("El cobro permanece protegido; no se pudo completar su guardado local.");
+      return true;
+    } finally {
+      if (!saved) {
+        state.inventoryMeta = inventoryBefore;
+        state.inventoryMovements = movementsBefore;
+        state.invoiceHistory = invoicesBefore;
+        state.incomeReport = reportBefore;
+      }
+    }
+  };
+
+  const finishCheckoutIntent = async (intent) => {
+    const { invoice, session, paid } = intent;
+    if (intent.stage !== "closed") {
+      const current = state.sessions.find(row => row.id === session.id);
+      if (current && (sessionPaid(current) !== paid || sessionTotals(current).total !== sessionTotals(session).total)) {
+        toast("La cuenta cambió durante el cobro. El intento sigue protegido para revisión.", "error", "checkout-changed");
+        return false;
+      }
+      const closed = await closeSession(session.id, { paid, totals: sessionTotals(session), session, closedAt: invoice.createdAt });
+      if (!closed) return false;
+      await saveCheckoutIntent(invoice, session, paid, "closed");
+    }
+    return commitCheckout(intent);
+  };
+
+  const withCheckoutLock = (work) => navigator.locks?.request
+    ? navigator.locks.request("napoles-financial-checkout", { ifAvailable: true }, lock => {
+      if (lock) return work();
+      toast("Hay un cobro en proceso en otra pestaña. Espera su resultado.", "error", "checkout-other-tab");
+      return false;
+    }) : work();
+
+  let checkoutRecoveryBusy = false;
+  const recoverPendingCheckouts = async () => {
+    if (checkoutRecoveryBusy || state.paymentProcessing || checkoutSubmissionBusy || !state.currentUser || !isManager()) return false;
+    checkoutRecoveryBusy = true;
+    try {
+      return await withCheckoutLock(async () => {
+        await hydrateDurableKey(CHECKOUT_INTENTS_KEY);
+        const intents = Object.values(readLocalJson(CHECKOUT_INTENTS_KEY, {}));
+        for (const intent of intents) {
+          if (!await finishCheckoutIntent(intent)) {
+            toast("Un cobro guardado necesita revisión; se conserva para reintentar sin duplicarlo.", "error", "checkout-recovery-pending");
+            return false;
+          }
+          toast("Se recuperó el cobro pendiente de " + intent.invoice.number + ".", "ok", "checkout-recovered:" + intent.session.id);
+        }
+        if (intents.length) { renderAdminLive(); void flushAppsScriptOutbox(); }
+        return true;
+      });
+    } catch (error) {
+      toast(String(error?.message || error), "error", "checkout-recovery-error");
+      return false;
+    } finally { checkoutRecoveryBusy = false; }
+  };
+
+  let checkoutSubmissionBusy = false;
   const processPayment = async (form, submitter) => {
+    if (state.paymentProcessing || checkoutRecoveryBusy || checkoutSubmissionBusy) return;
+    checkoutSubmissionBusy = true;
+    try { return await withCheckoutLock(async () => {
+      // Another tab may have completed this account while this form was open.
+      await Promise.all([INVENTORY_STORAGE_KEY, INVOICE_STORAGE_KEY, INVENTORY_MOVEMENTS_STORAGE_KEY,
+        APPS_SCRIPT_OUTBOX_KEY, CHECKOUT_INTENTS_KEY].map(hydrateDurableKey));
+      state.invoiceHistory = readLocalJson(INVOICE_STORAGE_KEY, state.invoiceHistory);
+      state.inventoryMeta = readLocalJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
+      state.inventoryMovements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements);
+      if (state.invoiceHistory.some(invoice => String(invoice.sessionId) === String(form.session_id.value))) {
+        state.sessions = state.sessions.filter(session => String(session.id) !== String(form.session_id.value));
+        $("#paymentDialog")?.close();
+        renderAdminLive();
+        toast("Esta cuenta ya fue cobrada. Puedes reimprimir su factura desde Ventas.", "ok", "checkout-already-complete");
+        return;
+      }
+      const intent = readLocalJson(CHECKOUT_INTENTS_KEY, {})[form.session_id.value];
+      if (intent) {
+        state.paymentProcessing = true;
+        try {
+          if (await finishCheckoutIntent(intent)) {
+            $("#paymentDialog")?.close();
+            toast("Cobro recuperado. Factura " + intent.invoice.number + ". Puedes reimprimirla desde Ventas.", "ok", "checkout-recovered");
+            void flushAppsScriptOutbox();
+          } else toast("El cobro sigue protegido y requiere revisión de la cuenta.", "error", "checkout-pending");
+        } catch (error) { toast(String(error?.message || error), "error", "checkout-resume-error"); }
+        finally { state.paymentProcessing = false; }
+        return;
+      }
+      return performPayment(form, submitter);
+    }); } finally { checkoutSubmissionBusy = false; }
+  };
+
+  const performPayment = async (form, submitter) => {
     if (state.paymentProcessing) return;
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
     if (!session) {
@@ -8954,26 +9434,14 @@ const App = (() => {
       state.paymentProcessing = false;
       return;
     }
-    const closed = await closeSession(session.id, { paid: checkoutPaid, totals: sessionTotals(session) });
-    buttons.forEach((button) => { button.disabled = false; });
-    if (!closed) {
-      receiptWindow?.close();
-      state.paymentProcessing = false;
-      return;
-    }
-
-    if (payment.payments.some((row) => row.method === "cash" && Number(row.amount) > 0)) void openCashDrawer({ localOnly: true });
-    const createdAt = closed.saved.closed_at || new Date().toISOString();
+    try {
+    const createdAt = new Date().toISOString();
+    const totals = sessionTotals(session);
     const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" ? Number(state.tipSettings.percentage) : 0;
-    const tipAmount = tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0;
-    const invoiceTotals = {
-      ...closed.totals,
-      baseTotal: integerMoney(closed.totals.total),
-      tip: tipAmount,
-      total: integerMoney(closed.totals.total) + tipAmount
-    };
+    const tipAmount = tipPercentage ? tipAmountFor(totals.total, tipPercentage) : 0;
+    const invoiceTotals = { ...totals, baseTotal: integerMoney(totals.total), tip: tipAmount, total: integerMoney(totals.total) + tipAmount };
     const invoice = {
-      id: uid(),
+      id: session.id,
       number: `TN-${new Date(createdAt).toISOString().slice(0, 10).replace(/-/g, "")}-${sessionReference(session)}`,
       sessionId: session.id,
       tableId: session.table_id,
@@ -8990,7 +9458,7 @@ const App = (() => {
       withTip: tipAmount > 0,
       tipPercentage,
       tipAmount,
-      baseTotal: integerMoney(closed.totals.total),
+      baseTotal: integerMoney(totals.total),
       reference: form.payment_reference.value.trim(),
       cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
       changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - integerMoney(state.activePaymentTotal) : 0,
@@ -9006,15 +9474,37 @@ const App = (() => {
         status: item.status
       }))
     };
-    applyPaidInventoryLocally(invoice, inventoryPlan);
-    applyInvoiceToInventory(invoice);
-    if (typeof protectCheckoutForFastSync === "function") await protectCheckoutForFastSync(invoice);
+
+    await saveCheckoutIntent(invoice, session, checkoutPaid, "prepared");
+    if (!await finishCheckoutIntent({ invoice, session, paid: checkoutPaid, stage: "prepared" })) {
+      receiptWindow?.close();
+      toast("El cobro está protegido, pero falta confirmar el cierre de la cuenta. Reintenta para recuperar la misma operación.", "error", "checkout-close-pending");
+      return;
+    }
+    if (payment.payments.some(row => row.method === "cash" && Number(row.amount) > 0)) void openCashDrawer({ localOnly: true });
     $("#paymentDialog")?.close();
-    renderInventory();
-    renderTips();
-    if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
-    toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
-    state.paymentProcessing = false;
+    // Rendering and printing happen after financial commit. Their errors never roll it back.
+    try {
+      if (state.activeAdminSection === "inventory") renderInventory();
+      if (state.activeAdminSection === "movements") renderInventoryMovements();
+      if (state.activeAdminSection === "income") renderIncomeReport();
+      if (state.activeAdminSection === "tips") renderTips();
+    } catch (error) { console.error("No se pudo actualizar la vista del cobro guardado", error); }
+    toast(
+      "Cobro registrado; respaldo de la factura en proceso. Factura " + invoice.number + ".",
+      "ok", "paid:" + session.id);
+    if (shouldPrint) {
+      try { printThermalReceipt(session, invoice, receiptWindow); }
+      catch (error) { toast("Cobro guardado. No se pudo imprimir; reimprime desde Ventas.", "error", "checkout-print-error"); }
+    }
+    } catch (error) {
+      receiptWindow?.close();
+      toast(String(error?.message || error), "error", "checkout-save-error");
+    } finally {
+      state.paymentProcessing = false;
+      buttons.forEach(button => { button.disabled = false; });
+      void flushAppsScriptOutbox();
+    }
   };
 
   const renderConsumptionSelection = () => {
@@ -9319,7 +9809,7 @@ const App = (() => {
     let savedSession = null;
     let persistedSessionId = optimisticSessionId;
     if (!originalSession) {
-      savedSession = await retryQuiet(
+      savedSession = await retryPosMutation(
         () => state.sb.from("table_sessions").insert({
           id: optimisticSessionId,
           table_id: session.table_id,
@@ -9383,13 +9873,14 @@ const App = (() => {
       created_by_user_id: state.currentUser?.id || null,
       updated_by_user_id: state.currentUser?.id || null
     }));
-    const sessionUpdatePromise = originalSession
-      ? retryQuiet(() => state.sb.from("table_sessions").update({
+    const sessionUpdatePromise = originalSession && (payerName !== (originalSession.payer_name || "")
+      || (state.currentUser?.id || originalSession.assigned_waiter_id || null) !== (originalSession.assigned_waiter_id || null))
+      ? retryPosMutation(() => state.sb.from("table_sessions").update({
           payer_name: payerName,
           assigned_waiter_id: state.currentUser?.id || originalSession.assigned_waiter_id || null
         }).eq("id", persistedSessionId).select("*").single(), 4)
       : Promise.resolve(savedSession);
-    const itemsPromise = retryQuiet(() => state.sb.from("session_items").insert(payloads).select("*"), 4);
+    const itemsPromise = retryPosMutation(() => state.sb.from("session_items").insert(payloads).select("*"), 4);
     const [sessionSaved, savedItems] = await Promise.all([sessionUpdatePromise, itemsPromise]);
     if (!Array.isArray(savedItems) || savedItems.length !== drafts.length) {
       state.optimisticSessionStates.delete(optimisticSessionId);
@@ -9501,7 +9992,8 @@ const App = (() => {
     const dialog = $("#consumptionDialog");
     const form = $("#consumptionForm");
     const submit = $("#consumptionSubmitButton");
-    if (!dialog || !form || !submit) return;
+    if (!dialog || !form || !submit || form.dataset?.confirmShortcutBound) return;
+    if (form.dataset) form.dataset.confirmShortcutBound = "1";
     let lastSpaceAt = 0;
     document.addEventListener("keydown", (event) => {
       if (event.key !== " " || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
@@ -11919,9 +12411,11 @@ const App = (() => {
     renderBusinessForm();
     showAdminSection(currentSection);
     renderTableFormQr();
+    void recoverPendingCheckouts();
     initRemoteStorage();
     void refreshBackgroundReports({ force: true });
     window.addEventListener("online", () => {
+      if (state.page === "admin") void recoverPendingCheckouts();
       if (!isWaiter()) void flushAppsScriptOutbox();
       void refreshBackgroundReports({ force: true });
     });
@@ -11952,6 +12446,7 @@ const App = (() => {
   };
 
   const init = async () => {
+    await hydrateDurableLocalState();
     document.addEventListener("wheel", (event) => {
       const input = event.target instanceof Element ? event.target.closest('input[type="number"]') : null;
       if (!input || document.activeElement !== input) return;
@@ -11991,6 +12486,11 @@ const App = (() => {
       });
       flushRequestOutbox();
     }
+    window.MenuCards?.init({
+      page:state.page,sb:SupabaseDb,getAuthToken:()=>state.authToken,
+      getCurrentTable:()=>state.currentTable,getTables:()=>state.tables,
+      canManage:()=>canAccessAdminSection("brand"),confirm:askForConfirmation
+    });
     if (state.page === "admin") await initAdmin();
     if (state.page === "client") await initClient();
     refreshIcons();

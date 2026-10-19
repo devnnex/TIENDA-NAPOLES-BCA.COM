@@ -16,9 +16,10 @@
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
     <script>
-      window.__APP_ASSET_VERSION__ = "20261013-mobile-sound-v4";
+      window.__APP_ASSET_VERSION__ = "20261019-carta-compras-v1";
       document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
     </script>
+    <link rel="stylesheet" href="menu-cards.css?v=20261019-carta-compras-v1">
     <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="client">
@@ -60,6 +61,8 @@
         </button>
       </section>
 
+      <section class="client-section" aria-label="Carta del negocio"><button class="ghost" type="button" id="openMenuCards"><i data-lucide="book-open"></i> Carta</button></section>
+
       <p class="song-turn-notice">🎵 Puedes pedir hasta 5 canciones por mesa. Respeta el orden: otras mesas también esperan. El chat no recibe más solicitudes cuando completas tus 5 canciones. Solo se atenderán solicitudes de mesas ocupadas, verificadas por cámaras.</p>
 
       <section id="clientQueueStatus" class="client-queue-status" aria-live="polite" hidden></section>
@@ -87,6 +90,7 @@
     </main>
 
     <script defer src="https://unpkg.com/lucide@latest"></script>
+    <script defer src="menu-cards.js?v=20261019-carta-compras-v1"></script>
     <script>document.write(`<script defer src="app.js?v=${window.__APP_ASSET_VERSION__}"><\/script>`);</script>
   </body>
 </html>

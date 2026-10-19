@@ -83,6 +83,8 @@ function harness(storage = new Map()) {
     localStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     dbQuiet: async query => (await query)?.data || null,
     readRealtimeData: async query => (await query)?.data || null,
+    retryPosMutation: async factory => (await factory())?.data || null,
+    readRealtimeData: async query => (await query)?.data || null,
     retryQuiet: async factory => (await factory())?.data || null,
     mergeOptimisticSessions: rows => rows, renderAdminLive() {}, renderAdmin() {},
     stopAlarm() {}, toast: message => toasts.push(message),
