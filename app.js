@@ -2486,7 +2486,15 @@ const App = (() => {
 
   const readAppsScriptOutbox = () => {
     const stored = readLocalJson(APPS_SCRIPT_OUTBOX_KEY, []);
-    return Array.isArray(stored) ? stored : [];
+    return (Array.isArray(stored) ? stored : []).map((job) => ({
+      ...job,
+      operationId: job.operationId || job.id,
+      destination: "apps-script",
+      status: job.status || "pending",
+      attempts: Number(job.attempts || 0),
+      nextAttemptAt: Number(job.nextAttemptAt || 0),
+      lastError: job.lastError || ""
+    }));
   };
 
   const mergeOutboxJobs = (stored, incoming, removed = {}) => {
@@ -2517,6 +2525,13 @@ const App = (() => {
   const persistAppsScriptOutbox = (incoming, removedIds = []) => {
     if (checkoutBatch) return persistDurableJson(APPS_SCRIPT_OUTBOX_KEY, incoming);
     const snapshot = JSON.parse(JSON.stringify(incoming));
+    // Publish the local projection synchronously so a second click sees the
+    // operation queued by the first click before its IndexedDB commit finishes.
+    const projected = mergeOutboxJobs(readLocalJson(APPS_SCRIPT_OUTBOX_KEY, []), snapshot,
+      Object.fromEntries(removedIds.map(id => [id, true])));
+    const projectionRevision = nextDurableRevision();
+    durableMemory.set(APPS_SCRIPT_OUTBOX_KEY, projected);
+    durableMemoryRevision.set(APPS_SCRIPT_OUTBOX_KEY, projectionRevision);
     const save = async () => {
       const database = await openLocalDataDb();
       if (!database) { durableIndexedStatus.set(APPS_SCRIPT_OUTBOX_KEY, false); return false; }
@@ -2542,7 +2557,7 @@ const App = (() => {
         } catch (_) { resolve(false); }
       });
       durableIndexedStatus.set(APPS_SCRIPT_OUTBOX_KEY, saved);
-      if (saved) {
+      if (saved && Number(durableMemoryRevision.get(APPS_SCRIPT_OUTBOX_KEY) || 0) <= projectionRevision) {
         durableMemory.set(APPS_SCRIPT_OUTBOX_KEY, jobs);
         durableMemoryRevision.set(APPS_SCRIPT_OUTBOX_KEY, revision);
         try {
@@ -2591,15 +2606,30 @@ const App = (() => {
       try { result = JSON.parse(text); } catch (error) {
         throw transientAppsScriptError("La respuesta del respaldo remoto todavía se está confirmando.");
       }
-      if (result?.ok && ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
-        window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
-      }
-      if (result?.ok && action !== "status" && !action.startsWith("get_")) notifyAdminPeers({
-        reports: true,
-        inventory: ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock",
-          "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(action)
-      });
-      if (typeof queueConfirmedReportChange === "function") await queueConfirmedReportChange(action, payload, result, operationId);
+      const batchRequest = action === "sync_sales_batch";
+      const acceptResult = async (action, payload, result, operationId) => {
+        if (result?.ok && ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements", "clear_income"].includes(action)) {
+          window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+        }
+        if (!batchRequest && result?.ok && action !== "status" && !action.startsWith("get_")) notifyAdminPeers({
+          reports: true,
+          inventory: ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock",
+            "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(action)
+        });
+        if (typeof queueConfirmedReportChange === "function") await queueConfirmedReportChange(action, payload, result, operationId);
+
+      };
+      if (action === "sync_sales_batch" && Array.isArray(result?.results)) {
+        for (const receipt of result.results) {
+          const operation = payload.operations.find(entry => entry.operationId === receipt.operationId);
+          if (operation) await acceptResult(operation.action, operation.payload, receipt.result, operation.operationId);
+        }
+        if (result.results.some(entry => entry.result?.ok)) {
+          if (typeof notifyAdminPeers === "function") notifyAdminPeers({ reports: true, inventory: true });
+          if (typeof appsScriptStatusAt !== "undefined") { appsScriptStatusAt = 0; appsScriptStatusEpoch += 1; appsScriptStatusPromise = null; }
+          window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+        }
+      } else await acceptResult(action, payload, result, operationId);
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
       if (error?.name === "AbortError") throw transientAppsScriptError("La sincronización remota continúa en segundo plano.");
@@ -2691,45 +2721,211 @@ const App = (() => {
     const existingIndex = jobs.findIndex((entry) => entry.dedupeKey === dedupeKey);
     if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock", "update_inventory_movement_cost"].includes(action)) jobs[existingIndex] = job;
     else if (existingIndex < 0) jobs.push(job);
-    writeAppsScriptOutbox(jobs);
+    const persisted = writeAppsScriptOutbox(jobs);
     window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
     if (isAppsScriptConfigured()) void flushAppsScriptOutbox();
     else setInventorySyncStatus(`${jobs.length} cambio${jobs.length === 1 ? "" : "s"} en cola local`, "local", "hard-drive");
+    return persisted;
   };
 
-  const scheduleAppsScriptRetry = () => {
+  const isSupabaseWriteBlockingJob = (job, counts) => {
+    const hasBlockingStatus = ["pending", "syncing", "failed", "conflict"]
+      .some((status) => Number(counts[status] || 0) > 0);
+    if (!hasBlockingStatus) return false;
+    const entities = job.action === "record_sale"
+      ? ["table_sessions", "session_items", "service_requests", "menu_items", "rpc:record_session_payment", "rpc:replay_table_session_change"]
+      : ["menu_items", "menu_categories"];
+    if (!Array.isArray(counts.blockingRecords)) {
+      return entities.some((entity) => (counts.blockingEntities || []).includes(entity))
+        || !Array.isArray(counts.blockingEntities) || !counts.blockingEntities.length;
+    }
+    const sessionId = String(job.payload?.invoice?.sessionId || "");
+    const productIds = new Set((job.payload?.invoice?.items || [])
+      .map((item) => String(item.menu_item_id || "")).filter(Boolean));
+    const inventoryProductId = String(job.payload?.item?.productId || job.payload?.adjustment?.productId || job.payload?.productId || "");
+    if (inventoryProductId) productIds.add(inventoryProductId);
+    return counts.blockingRecords.some((record) => {
+      if (!entities.includes(record.entity)) return false;
+      if (job.action !== "record_sale" && (record.entity !== "menu_items" || !inventoryProductId)) return true;
+      if (["table_sessions", "session_items", "service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change"].includes(record.entity)) {
+        const ids = record.entity === "table_sessions" ? record.recordIds : record.sessionIds;
+        return !sessionId || !Array.isArray(ids) || !ids.length || ids.map(String).includes(sessionId);
+      }
+      if (record.entity === "menu_items") {
+        return !Array.isArray(record.recordIds) || !record.recordIds.length
+          || record.recordIds.some((id) => productIds.has(String(id)));
+      }
+      return true;
+    });
+  };
+
+  const nextReadyAppsScriptJob = (jobs, counts, force, now = Date.now()) => {
+    let skippedSale = false;
+    for (const [index, job] of jobs.entries()) {
+      if (job.status !== "pending" || (!force && Number(job.nextAttemptAt || 0) > now)) continue;
+      const previous = jobs.slice(0, index);
+      const saleId = entry => String(entry.payload?.invoice?.id || entry.payload?.saleId || "");
+      if (previous.some(entry => entry.action === "clear_income"
+        || (job.action !== "record_sale" && !["synced"].includes(entry.status))
+        || (saleId(job) && saleId(entry) === saleId(job)))) continue;
+      if (state.localSupabaseWrites > 0 || isSupabaseWriteBlockingJob(job, counts)) {
+        if (job.action !== "record_sale") return null;
+        skippedSale = true;
+        continue;
+      }
+      if (skippedSale && job.action !== "record_sale") return null;
+      return job;
+    }
+    return null;
+  };
+
+  const isPendingInventoryJob = (job) => ["pending", "syncing"].includes(job.status)
+    && ["upsert_inventory", "set_inventory_stock", "adjust_inventory", "delete_inventory",
+      "sync_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(job.action);
+
+  const pendingInventoryProductIds = (jobs = readAppsScriptOutbox()) => {
+    const ids = new Set();
+    jobs.filter(isPendingInventoryJob).forEach((job) => {
+      if (["upsert_inventory", "set_inventory_stock", "delete_inventory"].includes(job.action)) {
+        ids.add(String(job.payload?.item?.productId || job.payload?.productId || ""));
+      }
+      if (job.action === "adjust_inventory") ids.add(String(job.payload?.adjustment?.productId || ""));
+      if (job.action === "sync_inventory") (job.payload?.items || []).forEach((item) => ids.add(String(item.productId || "")));
+      if (["record_sale", "edit_sale"].includes(job.action)) (job.payload?.invoice?.items || []).forEach((line) => ids.add(String(line.menu_item_id || "")));
+      (job.payload?.productIds || []).forEach(id => ids.add(String(id)));
+    });
+    ids.delete("");
+    return ids;
+  };
+
+  const getOfflineSyncStatus = async () => ({ pending: 0, syncing: 0, failed: 0, conflict: 0, blockingRecords: [] });
+  const recordSyncEvent = () => {};
+  const updateGlobalSyncStatus = async () => {};
+  const recoverInterruptedAppsScriptJobs = async (retryFailed = false) => {
+    const jobs = readAppsScriptOutbox();
+    let changed = false;
+    const recovered = jobs.map((job) => {
+      if (job.status !== "syncing" && !(retryFailed && ["failed", "conflict"].includes(job.status))) return job;
+      changed = true;
+      return { ...job, status: "pending", nextAttemptAt: 0, updatedAt: new Date().toISOString() };
+    });
+    if (changed) await writeAppsScriptOutbox(recovered);
+  };
+
+  const appsScriptRetryDelay = (attempts) => {
+    const base = Math.min(60_000, 1000 * Math.pow(2, Math.min(Number(attempts || 0), 6)));
+    return Math.round(base * (.75 + Math.random() * .5));
+  };
+
+  const scheduleAppsScriptRetry = (delayMs = 30_000) => {
     clearTimeout(state.appsScriptOutboxTimer);
-    state.appsScriptOutboxTimer = window.setTimeout(flushAppsScriptOutbox, 1500);
+    state.appsScriptOutboxTimer = window.setTimeout(flushAppsScriptOutbox, Math.max(500, delayMs));
   };
 
-  const flushAppsScriptOutbox = async () => {
-    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured() || !navigator.onLine) return false;
+  const runAppsScriptOutbox = async (force = false) => {
+    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured()) return false;
+    await flushDurableWrites();
+    if (state.appsScriptOutboxBusy) return false;
     state.appsScriptOutboxBusy = true;
+    let activeJob = null;
+    let batchSupported = true;
     try {
-      await flushDurableWrites();
       let jobs = readAppsScriptOutbox();
-      while (jobs.length) {
-        const job = jobs.find(entry => !["failed", "conflict"].includes(entry.status));
-        if (!job) { setInventorySyncStatus("Hay operaciones de respaldo que requieren revisión", "error", "triangle-alert"); return false; }
-        setInventorySyncStatus(`Sincronizando ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}`, "pending", "refresh-cw");
-        const result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.id);
+      while (true) {
+        const supabaseStatus = await getOfflineSyncStatus();
+        const now = Date.now();
+        const job = nextReadyAppsScriptJob(jobs, supabaseStatus, force, now);
+        if (!job) {
+          if (jobs.some((entry) => entry.status === "pending" && (force || Number(entry.nextAttemptAt || 0) <= now))) {
+            scheduleAppsScriptRetry(2500);
+            return false;
+          }
+          break;
+        }
+        activeJob = job;
+        const startedAt = performance.now();
+        job.status = "syncing";
+        job.updatedAt = new Date().toISOString();
+        await writeAppsScriptOutbox(jobs);
+        const pendingCount = jobs.filter((entry) => ["pending", "syncing"].includes(entry.status)).length;
+        setInventorySyncStatus(`Sincronizando ${pendingCount} pendiente${pendingCount === 1 ? "" : "s"}`, "pending", "refresh-cw");
+        recordSyncEvent("sending", job);
+        let result;
+        {
+          const batch = [job];
+          const salesActions = ["record_sale", "edit_sale", "delete_sale"];
+          let remaining = jobs.filter(entry => entry.id !== job.id);
+          while (batchSupported && salesActions.includes(job.action) && batch.length < 20) {
+            const next = nextReadyAppsScriptJob(remaining, supabaseStatus, force, now);
+            if (!next || !salesActions.includes(next.action)) break;
+            batch.push(next);
+            remaining = remaining.filter(entry => entry.id !== next.id);
+          }
+          if (batch.length > 1) {
+            const reply = await appsScriptRequest("sync_sales_batch", { operations: batch.map(entry => ({
+              operationId: entry.operationId || entry.id, action: entry.action, payload: entry.payload
+            })) }, Math.max(APPS_SCRIPT_TIMEOUT_MS, 90000));
+            if (/accion no permitida:\s*sync_sales_batch/i.test(normalizeText(reply?.error || ""))) {
+              // Compatibility until Code.gs has been deployed.
+              batchSupported = false;
+              result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.operationId || job.id);
+            } else {
+              const receipts = new Map((reply?.results || []).map(entry => [entry.operationId, entry.result]));
+              const confirmed = batch.filter(entry => receipts.get(entry.operationId || entry.id)?.ok === true);
+              const confirmedIds = new Set(confirmed.map(entry => entry.id));
+              const rejected = [];
+              await flushDurableWrites();
+              const latest = readAppsScriptOutbox();
+              const remainingJobs = latest.filter(entry => !confirmedIds.has(entry.id)).map(entry => {
+                const receipt = receipts.get(entry.operationId || entry.id);
+                if (!receipt || receipt.ok === true) return { ...entry, ...(entry.id === job.id ? { status: "pending" } : {}) };
+                const permanent = receipt.retryable === false;
+                const updated = { ...entry, status: permanent ? (receipt.conflict ? "conflict" : "failed") : "pending",
+                  attempts: Number(entry.attempts || 0) + 1, updatedAt: new Date().toISOString(),
+                  lastError: receipt.error || "Lote pendiente de confirmación.",
+                  nextAttemptAt: permanent ? 0 : Date.now() + appsScriptRetryDelay(Number(entry.attempts || 0) + 1) };
+                rejected.push(updated);
+                return updated;
+              });
+              // One durable commit removes exactly the IDs confirmed in this
+              // envelope and merges operations queued while it was in flight.
+              if (!await writeAppsScriptOutbox(remainingJobs, [...confirmedIds])) throw new Error("No se pudo proteger la confirmación local del lote.");
+              const pendingIds = new Set(remainingJobs.flatMap(entry => [
+                entry.payload?.item?.productId, entry.payload?.adjustment?.productId, entry.payload?.productId,
+                ...(entry.payload?.invoice?.items || []).map(line => line.menu_item_id), ...(entry.payload?.productIds || [])
+              ]).filter(Boolean).map(String));
+              const lastReceipt = (reply?.results || []).at(-1)?.result;
+              const freshItems = (lastReceipt?.items || []).filter(item => !pendingIds.has(String(item.productId)));
+              if (freshItems.length) applyRemoteInventoryItems(freshItems);
+              confirmed.forEach(entry => recordSyncEvent("confirmed", { ...entry, status: "synced", durationMs: performance.now() - startedAt }));
+              for (const entry of rejected) {
+                recordSyncEvent(entry.status === "pending" ? "retry" : entry.status, { ...entry, error: entry.lastError });
+                if (entry.status !== "pending") toast(entry.lastError, "error", "inventory-job-rejected:" + entry.id);
+              }
+              activeJob = null;
+              jobs = readAppsScriptOutbox();
+              if (confirmed.length < batch.length) {
+                scheduleAppsScriptRetry(rejected.some(entry => entry.status === "pending") || !confirmed.length ? 1500 : 500);
+                return false;
+              }
+              continue;
+
+            }
+          } else result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.operationId || job.id);
+        }
+        await flushDurableWrites();
         const queuedAfterRequest = readAppsScriptOutbox();
         const pendingAfterCurrent = queuedAfterRequest.filter((entry) => entry.id !== job.id);
-        const pendingProductIds = new Set(pendingAfterCurrent.map((entry) =>
-          entry.action === "upsert_inventory"
-            ? entry.payload?.item?.productId
-            : entry.action === "adjust_inventory"
-              ? entry.payload?.adjustment?.productId
-              : entry.action === "set_inventory_stock"
-                ? entry.payload?.productId
-              : ""
-        ).filter(Boolean));
+        const pendingProductIds = new Set(pendingAfterCurrent.flatMap(entry => [
+          entry.payload?.item?.productId, entry.payload?.adjustment?.productId, entry.payload?.productId,
+          ...(entry.payload?.invoice?.items || []).map(line => line.menu_item_id), ...(entry.payload?.productIds || [])
+        ]).filter(Boolean).map(String));
         const applyFreshRemoteInventory = () => {
           const remoteItems = job.action === "upsert_inventory" && result?.item
             ? [result.item]
             : result?.items || (result?.item ? [result.item] : []);
           const freshItems = remoteItems.filter((item) => !pendingProductIds.has(item.productId));
-          if (freshItems.length) applyRemoteInventoryItems(freshItems, null, job.id);
+          if (freshItems.length) applyRemoteInventoryItems(freshItems);
         };
         if (!result?.ok) {
           const legacyInventoryService = job.action === "adjust_inventory"
@@ -2739,12 +2935,16 @@ const App = (() => {
             job.status = result?.conflict ? "conflict" : "failed";
             job.lastError = result?.error || "Operacion rechazada";
             job.updatedAt = new Date().toISOString();
-            jobs = [...pendingAfterCurrent, job];
+            jobs = queuedAfterRequest.map(entry => entry.id === job.id ? job : entry);
             await writeAppsScriptOutbox(jobs);
-            jobs = readAppsScriptOutbox();
+            recordSyncEvent(job.status, {
+              ...job,
+              durationMs: performance.now() - startedAt,
+              error: result?.error || ""
+            });
             toast(
               legacyInventoryService
-                ? "El servicio remoto no acepta movimientos individuales; el inventario se conciliara al cerrar la mesa."
+                ? "Actualiza Apps Script para aceptar movimientos individuales. La operación se conserva para reintentar."
                 : (result.error || "No se pudo aplicar un movimiento de inventario."),
               "error",
               legacyInventoryService ? "inventory-service-update-required" : `inventory-job-rejected:${job.id}`
@@ -2759,27 +2959,74 @@ const App = (() => {
           job.attempts = Number(job.attempts || 0) + 1;
           job.lastError = result?.error || "El respaldo remoto no respondio";
           job.lastAttemptAt = new Date().toISOString();
+          job.updatedAt = job.lastAttemptAt;
+          job.status = "pending";
+          job.nextAttemptAt = Date.now() + appsScriptRetryDelay(job.attempts);
           jobs = queuedAfterRequest;
           jobs[currentIndex] = job;
           await writeAppsScriptOutbox(jobs);
+          recordSyncEvent("retry", { ...job, durationMs: performance.now() - startedAt, error: job.lastError });
           setInventorySyncStatus(`${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}; reintento automatico`, "error", "cloud-off");
-          scheduleAppsScriptRetry();
+          scheduleAppsScriptRetry(job.nextAttemptAt - Date.now());
           return false;
         }
         applyFreshRemoteInventory();
         jobs = pendingAfterCurrent;
         await writeAppsScriptOutbox(jobs, [job.id]);
+        recordSyncEvent("confirmed", { ...job, status: "synced", durationMs: performance.now() - startedAt });
+        activeJob = null;
         jobs = readAppsScriptOutbox();
+      }
+      const unresolved = jobs.filter((job) => ["failed", "conflict"].includes(job.status));
+      const delayed = jobs.filter((job) => job.status === "pending");
+      if (unresolved.length) {
+        setInventorySyncStatus(`${unresolved.length} cambio${unresolved.length === 1 ? "" : "s"} requiere${unresolved.length === 1 ? "" : "n"} revisión`, "error", "triangle-alert");
+        return false;
+      }
+      if (delayed.length) {
+        const nextAt = Math.min(...delayed.map((job) => Number(job.nextAttemptAt || Date.now())));
+        scheduleAppsScriptRetry(nextAt - Date.now());
+        return false;
       }
       setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
       return true;
     } catch (error) {
+      if (activeJob) {
+        const jobs = readAppsScriptOutbox();
+        const index = jobs.findIndex((job) => job.id === activeJob.id);
+        if (index >= 0) {
+          const attempts = Number(activeJob.attempts || 0) + 1;
+          activeJob = {
+            ...activeJob,
+            status: "pending",
+            attempts,
+            lastAttemptAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            lastError: String(error?.message || error || "Error de red"),
+            nextAttemptAt: Date.now() + appsScriptRetryDelay(attempts)
+          };
+          jobs[index] = activeJob;
+          await writeAppsScriptOutbox(jobs);
+          recordSyncEvent("retry", { ...activeJob, error: activeJob.lastError });
+          scheduleAppsScriptRetry(activeJob.nextAttemptAt - Date.now());
+        }
+      }
       setInventorySyncStatus("Sin conexion; cambios protegidos localmente", "error", "cloud-off");
-      scheduleAppsScriptRetry();
       return false;
     } finally {
       state.appsScriptOutboxBusy = false;
+      void updateGlobalSyncStatus();
     }
+  };
+
+  const flushAppsScriptOutbox = (force = false, retryFailed = false) => {
+    if (!navigator.locks?.request) return (async () => {
+      if (state.appsScriptOutboxBusy) return false;
+      await recoverInterruptedAppsScriptJobs(retryFailed);
+      return runAppsScriptOutbox(force);
+    })();
+    return navigator.locks.request("tienda-napoles-appscript-sync", { ifAvailable: true }, (lock) =>
+      lock ? (async () => { await recoverInterruptedAppsScriptJobs(retryFailed); return runAppsScriptOutbox(force); })() : false);
   };
 
   const bootstrapRemoteStorage = async () => {
@@ -7333,23 +7580,35 @@ const App = (() => {
   };
 
   const mergeIncomeReport = (remote, filters) => {
-    const remoteKeys = new Set((remote.recordRows || []).map((entry) => String(entry.saleId)));
-    const queuedKeys = new Set(readAppsScriptOutbox()
-      .filter((job) => job.action === "record_sale")
-      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || "")));
-    const pending = localIncomeRecords(filters).filter((record) => queuedKeys.has(String(record.saleId)) && !remoteKeys.has(String(record.saleId)));
+    const jobs = readAppsScriptOutbox();
+    const pendingSaleIds = new Set(jobs
+      .filter((job) => ["record_sale", "edit_sale"].includes(job.action))
+      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || ""))
+      .filter(Boolean));
+    const deletedSaleIds = new Set(jobs
+      .filter((job) => job.action === "delete_sale")
+      .map((job) => String(job.payload?.saleId || ""))
+      .filter(Boolean));
+    const excludedRemote = (remote.records || []).filter((record) => deletedSaleIds.has(String(record.saleId || "")) || pendingSaleIds.has(String(record.saleId || "")));
+    const visibleRemote = (remote.records || []).filter((record) => !deletedSaleIds.has(String(record.saleId || "")) && !pendingSaleIds.has(String(record.saleId || "")));
+    const pending = localIncomeRecords(filters)
+      .filter((record) => pendingSaleIds.has(String(record.saleId || "")));
     const pendingTotals = incomeTotalsFromRecords(pending);
+    const excludedTotals = incomeTotalsFromRecords(excludedRemote);
     const totals = { ...(remote.totals || {}) };
-    Object.keys(pendingTotals).forEach((key) => { totals[key] = Number(totals[key] || 0) + (key === "averageTicket" ? 0 : Number(pendingTotals[key] || 0)); });
+    Object.keys(pendingTotals).forEach((key) => {
+      if (key === "averageTicket") return;
+      totals[key] = Number(totals[key] || 0) - Number(excludedTotals[key] || 0) + Number(pendingTotals[key] || 0);
+    });
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
     const report = {
       ...remote,
       filters,
       totals,
-      records: [...pending, ...(remote.records || [])].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))),
-      nextIndex: (remote.records || []).length,
-      totalRecords: Number(remote.totalRecords || 0) + pending.length,
+      records: [...pending, ...visibleRemote].sort((left, right) => String(right.date).localeCompare(String(left.date))),
+      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - excludedRemote.length + pending.length),
       pendingCount: pending.length,
+      nextIndex: (remote.records || []).length,
       localOnly: false
     };
     const merged = typeof mergeConfirmedIncomeReport === "function" ? mergeConfirmedIncomeReport(report, filters) : report;
@@ -7506,7 +7765,6 @@ const App = (() => {
       : appendOnly ? "" : emptyState("Sin ventas en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
     if (appendOnly) recordsTarget.insertAdjacentHTML("beforeend", recordsMarkup);
     else recordsTarget.innerHTML = recordsMarkup;
-    const pendingText = report.pendingCount ? ` · ${report.pendingCount} pendiente${report.pendingCount === 1 ? "" : "s"} de respaldo` : "";
     const moreButton = $("#moreIncomeRecords");
     const hasMore = report.localOnly
       ? Number(report.nextIndex || 0) < (report.allLocalRecords || []).length
@@ -7517,7 +7775,7 @@ const App = (() => {
       moreButton.textContent = state.incomePageLoading ? "Cargando ventas..." : "Ver más ventas";
     }
     const limitedText = hasMore ? ` · mostrando ${report.records.length} ventas` : "";
-    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
     state.incomeRenderedReport = report;
     refreshIcons();
   };
@@ -7981,13 +8239,9 @@ const App = (() => {
     if (!record) return;
     state.incomeSaleTypeSnapshot = null;
     const reportBefore = state.incomeReport;
-    state.incomeRequestId += 1;
+    state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
+    state.incomeLoading = false;
     state.incomePageLoading = false;
-    const invoicesBefore = [...state.invoiceHistory];
-    const movementsBefore = [...state.inventoryMovements];
-    const mirrorBefore = JSON.parse(JSON.stringify(reportMirror()));
-    const inventoryBefore = JSON.parse(JSON.stringify(state.inventoryMeta));
-    const outboxBefore = readAppsScriptOutbox();
     const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
     const updatedTotals = { ...(reportBefore.totals || {}) };
     updatedTotals.income = Math.max(0, Number(updatedTotals.income || 0) - Number(record.total || 0));
@@ -8003,7 +8257,7 @@ const App = (() => {
       updatedTotals[method] = Math.max(0, Number(updatedTotals[method] || 0) - Number(payment.amount || 0));
     });
     updatedTotals.averageTicket = updatedTotals.sales ? updatedTotals.income / updatedTotals.sales : 0;
-    state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordRows: [], nextIndex: 0 };
+    state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordRows: (reportBefore.recordRows || []).filter(row => String(row.saleId) !== String(saleId)), nextIndex: Math.max(0, Number(reportBefore.nextIndex || 0) - 1) };
     const saleLink = { sessionId: record.sessionId, invoice: record.invoice };
     const mirror = reportMirror();
     mirror.deleted[String(saleId)] = new Date().toISOString();
@@ -8022,42 +8276,13 @@ const App = (() => {
       const current = inventoryFor(item);
       state.inventoryMeta[item.id] = { ...current, stock: current.stock + Number(line.quantity || 0), updatedAt: new Date().toISOString() };
     });
-    const hadPendingSale = outboxBefore.some((job) => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId));
-    writeAppsScriptOutbox(outboxBefore.filter((job) => !(job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId))), outboxBefore.filter(job => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId)).map(job => job.id));
     persistInvoiceHistory();
     persistInventoryStore();
     $("#deleteIncomeDialog")?.close();
     renderIncomeReport();
     renderInventory();
-    try {
-      if (!hadPendingSale || isAppsScriptConfigured()) {
-        const result = await appsScriptRequest("delete_sale", { saleId, saleLink }, 40000);
-        if (!result?.ok) throw new Error(result?.error || "No se pudo eliminar la venta.");
-        if (Array.isArray(result?.items)) applyRemoteInventoryItems(result.items);
-      }
-      await loadIncomeReport();
-      toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
-    } catch (error) {
-      state.incomeReport = reportBefore;
-      state.invoiceHistory = invoicesBefore;
-      delete mirror.deleted[String(saleId)];
-      delete mirror.deletedSaleLinks[String(saleId)];
-      if(mirrorBefore.deleted[String(saleId)]) mirror.deleted[String(saleId)] = mirrorBefore.deleted[String(saleId)];
-      if(mirrorBefore.sales[String(saleId)]) mirror.sales[String(saleId)] = mirrorBefore.sales[String(saleId)];
-      void saveReportSyncValue(reportMirrorKey(), mirror);
-      const kept = new Map(state.inventoryMovements.map(row => [row.movementId, row]));
-      movementsBefore.forEach(row => { if(movementBelongsToSale(row, { saleId, ...saleLink })) kept.set(row.movementId,row); });
-      state.inventoryMovements = [...kept.values()];
-      persistInventoryMovements();
-      renderInventoryMovements();
-      state.inventoryMeta = inventoryBefore;
-      writeAppsScriptOutbox(outboxBefore);
-      persistInvoiceHistory();
-      persistInventoryStore();
-      renderIncomeReport();
-      renderInventory();
-      toast(String(error?.message || error), "error", `income-delete-failed:${saleId}`);
-    }
+    enqueueAppsScriptJob("delete_sale", { saleId, saleLink, productIds: (record.items || []).map(line => line.menuItemId || line.menu_item_id).filter(Boolean) }, `sale-delete:${saleId}`);
+    toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
   };
 
   const replaceEditedIncomeRecord = (previous, next) => {
@@ -8128,15 +8353,12 @@ const App = (() => {
       totals: { subtotal, discount: 0, tax: 0, serviceFee: 0, total },
       items
     };
-    if (!(state.pendingIncomeEdits instanceof Set)) state.pendingIncomeEdits = new Set();
-    if (state.pendingIncomeEdits.has(String(record.saleId))) return;
-    state.pendingIncomeEdits.add(String(record.saleId));
     state.incomeRequestId += 1;
     state.incomeLoading = false;
     state.incomePageLoading = false;
+    enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}:${uid()}`);
     const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
-    const previousInvoice = localIndex >= 0 ? state.invoiceHistory[localIndex] : null;
-    if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...previousInvoice, ...corrected };
+    if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
     else state.invoiceHistory.push(corrected);
     persistInvoiceHistory();
     const correctedCost = items.reduce((sum, item) => sum + Number(item.unit_cost || 0) * Number(item.quantity || 0), 0);
@@ -8171,25 +8393,7 @@ const App = (() => {
     replaceEditedIncomeRecord(record, correctedRecord);
     $("#incomeEditDialog")?.close();
     renderIncomeReport();
-    toast("Venta actualizada. Guardando la correccion...", "ok", `income-saving:${record.saleId}`);
-    try {
-      const result = await appsScriptRequest("edit_sale", { invoice: corrected }, 40000);
-      if (!result?.ok) throw new Error(result?.error || "No se pudo corregir la venta.");
-      toast("Venta corregida. El cambio quedo registrado en auditoria.", "ok", `income-edited:${record.saleId}`);
-    } catch (error) {
-      const currentIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
-      if (currentIndex >= 0) {
-        if (previousInvoice) state.invoiceHistory[currentIndex] = previousInvoice;
-        else state.invoiceHistory.splice(currentIndex, 1);
-        persistInvoiceHistory();
-      }
-      replaceEditedIncomeRecord(correctedRecord, record);
-      renderIncomeReport();
-      toast(String(error?.message || error), "error", `income-edit-failed:${record.saleId}`);
-    } finally {
-      state.pendingIncomeEdits.delete(String(record.saleId));
-      if (!state.pendingIncomeEdits.size) void loadIncomeReport({ background: true });
-    }
+    toast("Venta corregida. Se sincronizara automaticamente.", "ok", `income-edited:${record.saleId}`);
   };
 
   const exportIncomeCsv = async () => {

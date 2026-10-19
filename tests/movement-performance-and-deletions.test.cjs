@@ -82,14 +82,18 @@ test('eliminar desde Ventas quita su movimiento de inmediato y conserva la resta
  assert.equal(h.state.incomeReport.records.length,0);assert.ok(h.mirror.deleted['sale-a']);
  if(offline)assert.ok(h.jobs.some(job=>job.action==='delete_sale'&&job.payload.saleLink.sessionId==='session-a'));
 });
-if(!offline)test('si el backend rechaza borrar una venta se restauran también sus movimientos y KPI',async()=>{
+test('borrar durante un envío conserva el alta y encola el borrado sin esperar ni avisar de ocupación',async()=>{
  const h=fixture();h.state.items=[{id:'p'}];h.state.inventoryMeta={p:{stock:10}};
  h.state.inventoryMovements=[movement('consume')];h.state.incomeReport={records:[{...sale,total:500,payments:[]}],totals:{sales:1,income:500},totalRecords:1};
- h.state.invoiceHistory=[sale];h.setResponse({ok:false,error:'No autorizado'});
+ h.state.invoiceHistory=[sale];h.setResponse({ok:false,error:'El sistema esta procesando otra venta.'});
+ const create={id:'create',action:'record_sale',status:'syncing',payload:{invoice:{id:'sale-a'}}};h.jobs.push(create);
  await h.api.deleteIncomeSale({sale_id:{value:'sale-a'}});
- assert.equal(h.state.inventoryMeta.p.stock,10);assert.equal(h.state.incomeReport.records.length,1);
- assert.equal(h.state.inventoryMovements.length,1);assert.equal(h.mirror.deleted['sale-a'],undefined);
+ assert.equal(h.state.inventoryMeta.p.stock,15);assert.equal(h.state.incomeReport.records.length,0);
+ assert.equal(h.state.inventoryMovements.length,0);assert.ok(h.mirror.deleted['sale-a']);
+ assert.equal(h.jobs[0],create);assert.equal(h.jobs[1].action,'delete_sale');assert.equal(h.jobs[1].payload.saleId,'sale-a');
+ assert.deepEqual(h.calls,[],'El borrado sale por la cola, detrás del alta, sin otra petición concurrente.');
 });
+
 test('entrar y filtrar no inicia consultas completas de ventas o movimientos y mantiene tres KPI',()=>{
  assert.doesNotMatch(block('showAdminSection','ensureOpenSession'),/loadMovementSalesTotals\(|ensureCompleteMovementHistory\(/);
  const a=source.indexOf('    $("#movementProductFilter")?.addEventListener'),b=source.indexOf('    $("#exportPurchasesPdf")',a);
