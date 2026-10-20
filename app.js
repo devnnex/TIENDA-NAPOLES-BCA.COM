@@ -138,6 +138,7 @@ const App = (() => {
   const INVENTORY_MOVEMENTS_STORAGE_KEY = "tienda_napoles_inventory_movements_v1";
   const PURCHASE_HISTORY_CUTOFF_KEY = "tienda_napoles_purchase_history_cutoff_v1";
   const HIDDEN_PURCHASE_MOVEMENTS_KEY = "tienda_napoles_hidden_purchase_movements_v1";
+  const INCOME_REPORT_CACHE_KEY = "tienda_napoles_income_report_cache_v1";
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
@@ -307,7 +308,7 @@ const App = (() => {
   const LOCAL_DATA_STORE = "records";
   const DURABLE_LOCAL_KEYS = [INVENTORY_STORAGE_KEY, INVOICE_STORAGE_KEY,
     INVENTORY_MOVEMENTS_STORAGE_KEY, APPS_SCRIPT_OUTBOX_KEY, WALK_IN_DRAFTS_STORAGE_KEY,
-    "napoles_checkout_intents_v1"];
+    "napoles_checkout_intents_v1", INCOME_REPORT_CACHE_KEY];
   let localDataDbPromise = null;
   let durableWriteChain = Promise.resolve();
   let durableRevisionOffset = 0;
@@ -565,6 +566,7 @@ const App = (() => {
     purchaseDateFrom: "",
     purchaseDateTo: "",
     incomeReport: null,
+    incomeAwaitingRemote: true,
     incomeRevision: "",
     incomeLoading: false,
     incomeRequestId: 0,
@@ -2620,9 +2622,15 @@ const App = (() => {
 
       };
       if (action === "sync_sales_batch" && Array.isArray(result?.results)) {
-        for (const receipt of result.results) {
-          const operation = payload.operations.find(entry => entry.operationId === receipt.operationId);
-          if (operation) await acceptResult(operation.action, operation.payload, receipt.result, operation.operationId);
+        reportChangeBatchDepth += 1;
+        try {
+          for (const receipt of result.results) {
+            const operation = payload.operations.find(entry => entry.operationId === receipt.operationId);
+            if (operation) await acceptResult(operation.action, operation.payload, receipt.result, operation.operationId);
+          }
+        } finally {
+          reportChangeBatchDepth -= 1;
+          if (!reportChangeBatchDepth) void flushConfirmedReportChanges();
         }
         if (result.results.some(entry => entry.result?.ok)) {
           if (typeof notifyAdminPeers === "function") notifyAdminPeers({ reports: true, inventory: true });
@@ -5870,6 +5878,7 @@ const App = (() => {
     }
     return state.reportMirror;
   };
+  let reportChangeBatchDepth = 0;
   const queueConfirmedReportChange = async (action, payload, result, operationId = "") => {
     const supported = ["record_sale","edit_sale","delete_sale","clear_income","adjust_inventory","upsert_inventory","set_inventory_stock","delete_inventory","clear_inventory","update_inventory_movement_cost","clear_inventory_movements"];
     if (!result?.ok || !supported.includes(action)) return;
@@ -5888,7 +5897,7 @@ const App = (() => {
     if (!queued.some(entry => entry.operationId === change.operationId)) {
       if (!await saveReportSyncValue(reportChangeOutboxKey, [...queued, change])) throw transientAppsScriptError("El cambio quedó guardado; falta proteger su aviso de sincronización.");
     }
-    void flushConfirmedReportChanges();
+    if (!reportChangeBatchDepth) void flushConfirmedReportChanges();
   };
   const protectCheckoutForFastSync = async (invoice) => {
     invoice.checkoutAccepted = true;
@@ -5902,6 +5911,7 @@ const App = (() => {
   const queueReadyCheckoutReports = async () => {
     if (checkoutReportPreparing || !navigator.onLine || !state.authToken || !isManager()) return;
     checkoutReportPreparing = true;
+    reportChangeBatchDepth += 1;
     try {
       const status = typeof getOfflineSyncStatus === "function" ? await getOfflineSyncStatus() : null;
       for (const job of readAppsScriptOutbox()) {
@@ -5910,32 +5920,50 @@ const App = (() => {
         if (state.localSupabaseWrites > 0 || (typeof isSupabaseWriteBlockingJob === "function" && isSupabaseWriteBlockingJob(job,status))) continue;
         await queueConfirmedReportChange("record_sale", { invoice: { ...job.payload.invoice, googlePending: true } }, { ok: true }, `checkout:${job.payload.invoice.id}`);
       }
-    } catch (_) { return false; } finally { checkoutReportPreparing = false; }
+    } catch (_) { return false; } finally { checkoutReportPreparing = false; reportChangeBatchDepth -= 1; if (!reportChangeBatchDepth) void flushConfirmedReportChanges(); }
   };
   let confirmedReportSending = false;
   const flushConfirmedReportChanges = async () => {
-    if (confirmedReportSending || !navigator.onLine || !state.authToken || !isManager()) return false;
+    if (confirmedReportSending || reportChangeBatchDepth || !navigator.onLine || !state.authToken || !isManager()) return false;
     confirmedReportSending = true;
     try {
       while (true) {
-        const change = readLocalJson(reportChangeOutboxKey, [])[0];
-        if (!change) return true;
-        const { data, error } = await state.sb.rpc("publish_report_change", {
-          auth_token: state.authToken, p_operation_id: change.operationId, p_action: change.action, p_payload: change.payload
-        });
-        if (error || !data?.ok) return false;
-        if (change.operationId.startsWith("checkout:")) {
+        const batch = readLocalJson(reportChangeOutboxKey, []).slice(0, 20);
+        if (!batch.length) return true;
+        let confirmedIds = new Set();
+        if (batch.length > 1 && Date.now() >= Number(state.reportBatchUnavailableUntil || 0)) {
+          const { data, error } = await state.sb.rpc("publish_report_changes_batch", { auth_token: state.authToken, p_changes: batch });
+          if (error && (error.code === "PGRST202" || /could not find.*publish_report_changes_batch|function.*publish_report_changes_batch.*does not exist/i.test(error.message || ""))) {
+            state.reportBatchUnavailableUntil = Date.now() + 60000;
+          } else {
+            if (error || !data?.ok || !Array.isArray(data.results)) return false;
+            const requested = new Set(batch.map(change => change.operationId));
+            confirmedIds = new Set(data.results.map(receipt => receipt.operationId).filter(id => requested.has(id)));
+          }
+        }
+        if (batch.length === 1 || Date.now() < Number(state.reportBatchUnavailableUntil || 0)) {
+          const change = batch[0];
+          const { data, error } = await state.sb.rpc("publish_report_change", {
+            auth_token: state.authToken, p_operation_id: change.operationId, p_action: change.action, p_payload: change.payload
+          });
+          if (error || !data?.ok) return false;
+          confirmedIds.add(change.operationId);
+        }
+        if (!confirmedIds.size) return false;
+        const checkoutIds = batch.filter(change => confirmedIds.has(change.operationId) && change.operationId.startsWith("checkout:"));
+        if (checkoutIds.length) {
           const ids = new Set(readLocalJson(publishedCheckoutKey, []));
-          ids.add(String(change.payload.invoice.id));
+          checkoutIds.forEach(change => ids.add(String(change.payload.invoice.id)));
           if (!await saveReportSyncValue(publishedCheckoutKey, [...ids])) return false;
         }
-        const remaining = readLocalJson(reportChangeOutboxKey, []).filter(entry => entry.operationId !== change.operationId);
+        const remaining = readLocalJson(reportChangeOutboxKey, []).filter(entry => !confirmedIds.has(entry.operationId));
         if (!await saveReportSyncValue(reportChangeOutboxKey, remaining)) return false;
         void syncConfirmedReports();
       }
     } catch (_) { return false; } finally { confirmedReportSending = false; }
   };
-  const applyConfirmedReportChanges = (mirror, changes) => {
+  const applyConfirmedReportChanges = (mirror, changes, { applyInventory = true } = {}) => {
+    const inventory = new Map();
     for (const change of changes) {
       if (Number(change.sequence) <= Number(mirror.cursor)) continue;
       const payload = change.payload || {};
@@ -5949,9 +5977,12 @@ const App = (() => {
       }
       if (change.action === "clear_inventory_movements") { mirror.movements = {}; mirror.movementsClearAt = change.confirmedAt || payload.occurredAt; }
       (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, googlePending: Boolean(payload.invoice?.googlePending), reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
-      if (payload.items?.length) applyRemoteInventoryItems(payload.items);
+      (payload.items || []).forEach(item => inventory.set(String(item.productId), item));
       mirror.cursor = Number(change.sequence);
     }
+    const items = [...inventory.values()];
+    if (applyInventory && items.length) applyRemoteInventoryItems(items);
+    return items;
   };
   let confirmedReportReading = false;
   let confirmedReportReadPending = false;
@@ -5970,24 +6001,32 @@ const App = (() => {
       }
       const mirror = reportMirror();
       let changed = false;
+      let cursor = Number(mirror.cursor || 0);
+      const changes = [];
       while (true) {
-        const { data, error } = await state.sb.rpc("get_report_changes", { auth_token: state.authToken, p_after: mirror.cursor });
+        const { data, error } = await state.sb.rpc("get_report_changes", { auth_token: state.authToken, p_after: cursor });
         if (error || !data?.ok || !Array.isArray(data.changes) || state.currentUser?.id !== userId) {
           state.readBudget?.settled("reports",false,readScope);
           return false;
         }
         state.readBudget?.settled("reports",true,readScope);
-        if (data.changes.some(change => !Number.isSafeInteger(Number(change.sequence)) || Number(change.sequence) <= Number(mirror.cursor))) return false;
+        if (data.changes.some((change, index) => !Number.isSafeInteger(Number(change.sequence))
+          || Number(change.sequence) <= (index ? Number(data.changes[index - 1].sequence) : cursor))) return false;
         if (!data.changes.length) break;
-        const nextMirror = JSON.parse(JSON.stringify(mirror));
-        applyConfirmedReportChanges(nextMirror, data.changes);
-        if (!await saveReportSyncValue(reportMirrorKey(), nextMirror)) return false;
-        Object.assign(mirror, nextMirror);
+        changes.push(...data.changes);
+        cursor = Number(data.changes.at(-1).sequence);
         changed = true;
         if (!data.hasMore) break;
       }
       state.fastReportsAvailable = true;
       if (changed) {
+        // A failed later page must not commit an incomplete report cursor or
+        // repaint only the beginning of the received transaction history.
+        const nextMirror = JSON.parse(JSON.stringify(mirror));
+        const items = applyConfirmedReportChanges(nextMirror, changes, { applyInventory: false });
+        if (!await saveReportSyncValue(reportMirrorKey(), nextMirror)) return false;
+        Object.assign(mirror, nextMirror);
+        if (items.length) applyRemoteInventoryItems(items);
         const invoiceMap = new Map((state.invoiceHistory || []).filter(invoice => !mirror.salesClearAt || String(invoice.createdAt) > mirror.salesClearAt).map(invoice => [String(invoice.id || invoice.sessionId), invoice]));
         Object.keys(mirror.deleted).forEach(id => invoiceMap.delete(id));
         Object.entries(mirror.sales).forEach(([id, invoice]) => invoiceMap.set(id, invoice));
@@ -7570,6 +7609,7 @@ const App = (() => {
       filters,
       totals: incomeTotalsFromRecords(allLocalRecords),
       records: allLocalRecords.slice(0, 300),
+      recordKeys: allLocalRecords.map((record) => record.saleId),
       allLocalRecords,
       nextIndex: Math.min(300, allLocalRecords.length),
       totalRecords: allLocalRecords.length,
@@ -7712,10 +7752,22 @@ const App = (() => {
     const summaryTarget = $("#incomeFilterSummary");
     if (!kpis || !payments || !recordsTarget) return;
     const report = state.incomeReport;
-    if (!report) {
+    const shiftSignature = report && !(state.incomeAwaitingRemote && navigator.onLine) ? JSON.stringify({
+      filters: report.filters, totals: report.totals, records: report.records,
+      recordRows: report.recordRows, recordKeys: report.recordKeys, totalRecords: report.totalRecords,
+      nextIndex: report.nextIndex, pendingCount: report.pendingCount, localOnly: report.localOnly,
+      truncated: report.truncated, visibleCount: state.incomeVisibleCount
+    }) : "";
+    if (shiftSignature && state.incomeRenderedShiftSignature === shiftSignature) {
+      state.incomeRenderedReport = report;
+      return;
+    }
+    if (!report || (state.incomeAwaitingRemote && navigator.onLine)) {
+      state.incomeRenderedShiftSignature = "";
       if ($("#moreIncomeRecords")) $("#moreIncomeRecords").hidden = true;
       kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
       payments.innerHTML = "";
+      if (summaryTarget) summaryTarget.innerHTML = "";
       recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
       setIncomeReportStatus("Consultando ventas", "loading", "loader-circle");
       return;
@@ -7777,6 +7829,7 @@ const App = (() => {
     const limitedText = hasMore ? ` · mostrando ${report.records.length} ventas` : "";
     setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
     state.incomeRenderedReport = report;
+    state.incomeRenderedShiftSignature = shiftSignature;
     refreshIcons();
   };
 
@@ -7799,18 +7852,42 @@ const App = (() => {
     }
     const requestId = ++state.incomeRequestId;
     const previousReport = state.incomeReport;
+    const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
+    const matchesCache = cached?.filters && (JSON.stringify(cached.filters) === JSON.stringify(filters)
+      || ((cached.report?.records || []).length >= Number(cached.report?.totalRecords || 0)
+        && JSON.stringify({ ...cached.filters, saleType: "all" }) === JSON.stringify({ ...filters, saleType: "all" })))
+      && Array.isArray(cached?.report?.records);
+    const filtersChanged = JSON.stringify(previousReport?.filters || null) !== JSON.stringify(filters);
     state.incomeLoading = true;
     state.incomePageLoading = false;
-    if (!background || !previousReport) {
-      state.incomeReport = localIncomeReport(filters);
+    if (!background || !previousReport || filtersChanged) {
+      state.incomeAwaitingRemote = navigator.onLine;
+      if (!navigator.onLine) state.incomeReport = matchesCache
+        ? { ...mergeIncomeReport(cached.report, filters), localOnly: true } : localIncomeReport(filters);
       renderIncomeReport();
       setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
     } else if (manual) {
       setIncomeReportStatus("Actualizando informe desde el respaldo", "loading", "loader-circle");
     }
+    if (!navigator.onLine) {
+      state.incomeLoading = false;
+      state.incomeAwaitingRemote = false;
+      state.incomeReport = matchesCache ? { ...mergeIncomeReport(cached.report, filters), localOnly: true } : localIncomeReport(filters);
+      renderIncomeReport();
+      setIncomeReportStatus("Última copia disponible", "warning", "hard-drive");
+      return true;
+    }
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
-      let result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      let result = null;
+      if (!force && matchesCache && typeof cached.report.revision === "string") {
+        try {
+          const status = await appsScriptRequest("status", {}, 12000);
+          if (requestId !== state.incomeRequestId) return false;
+          if (status?.ok && typeof status.historyRevision === "string" && status.historyRevision === cached.report.revision) result = { ...cached.report, ok: true };
+        } catch (_) { /* Sin revision verificable, consultar el informe completo. */ }
+      }
+      if (!result) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (requestId !== state.incomeRequestId) return false;
       if (result?.stale) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
@@ -7826,27 +7903,33 @@ const App = (() => {
       } else {
         state.incomeSaleTypeSnapshot = null;
       }
+      const wasAwaitingRemote = state.incomeAwaitingRemote;
+      state.incomeAwaitingRemote = false;
       const nextReport = mergeIncomeReport(result, filters);
-      const unchangedShift = background && state.incomeRangePreset === "shift" && previousReport
+      const unchangedShift = !wasAwaitingRemote && background && state.incomeRangePreset === "shift" && previousReport
         && incomeReportVisibleSignature(previousReport) === incomeReportVisibleSignature(nextReport);
       state.incomeReport = nextReport;
       state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
+      void persistDurableJson(INCOME_REPORT_CACHE_KEY, { filters, report: result, fetchedAt: new Date().toISOString() });
       if (unchangedShift) state.incomeRenderedReport = nextReport;
       else if (state.activeAdminSection === "income") renderIncomeReport();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
-      if (background && previousReport) {
-        state.incomeReport = previousReport;
+      state.incomeAwaitingRemote = false;
+      if (background && previousReport && !filtersChanged) {
+        state.incomeReport = { ...previousReport, localOnly: true };
+        if (state.activeAdminSection === "income") { renderIncomeReport(); setIncomeReportStatus("Última copia disponible", "warning", "hard-drive"); }
         if (manual) {
           setIncomeReportStatus("No se pudo actualizar desde el respaldo", "warning", "hard-drive");
           toast(String(error?.message || error), "error", "manual-income-refresh-failed");
         }
         return false;
       }
-      state.incomeReport = localIncomeReport(filters, String(error?.message || error));
+      state.incomeReport = matchesCache ? { ...mergeIncomeReport(cached.report, filters), localOnly: true, error: String(error?.message || error) }
+        : localIncomeReport(filters, String(error?.message || error));
       state.incomeFetchedAt = Date.now();
       renderIncomeReport();
       setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
@@ -12721,6 +12804,27 @@ const App = (() => {
     void refreshAdminNow();
   };
 
+  let salesResumeAt = -Infinity;
+  let salesResumePromise = null;
+  const refreshSalesAfterResume = () => {
+    if (state.page !== "admin" || !state.currentUser || !state.authToken || !navigator.onLine
+      || !canAccessAdminSection("income") || !isAppsScriptConfigured()) return Promise.resolve(false);
+    if (salesResumePromise) return salesResumePromise;
+    if (Date.now() - salesResumeAt < 1000) return Promise.resolve(false);
+    salesResumeAt = Date.now();
+    // Invalidate pre-suspension reads so a late response cannot paint old KPIs.
+    state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
+    state.incomeLoading = false;
+    state.incomeAwaitingRemote = true;
+    state.incomeRenderedShiftSignature = "";
+    if (state.activeAdminSection === "income") renderIncomeReport();
+    void flushAppsScriptOutbox(true);
+    void syncConfirmedReports();
+    salesResumePromise = loadIncomeReport({ background: true, force: true })
+      .finally(() => { salesResumePromise = null; });
+    return salesResumePromise;
+  };
+
   const resumeRealtimeReception = () => {
     if (document.hidden) return;
     void flushPeerRefreshes();
@@ -12733,6 +12837,7 @@ const App = (() => {
       subscribeAdmin();
       startAdminPolling();
       void refreshAdminNow();
+      void refreshSalesAfterResume();
       state.adminChats.forEach((chat) => void loadChatMessages(chat.sessionId, chat.table));
     }
   };

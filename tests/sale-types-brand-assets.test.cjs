@@ -103,7 +103,7 @@ if (source.includes('INCOME_REPORT_CACHE_KEY')) test('Sin conexion permite cambi
     readAppsScriptOutbox: () => [], navigator: { onLine: false }, INCOME_REPORT_CACHE_KEY: 'cache',
     readLocalJson: () => cached, readAppsScriptStatus: async () => ({ ok: false }),
     mergeIncomeReport: (report, next) => f.api.filterIncomeReportBySaleType(report, next),
-    renderIncomeReport() {}, localIncomeReport() { throw Error('Debe usar las ventas guardadas del respaldo.'); } });
+      clearTimeout() {}, setIncomeReportStatus() {}, renderIncomeReport() {}, localIncomeReport() { throw Error('Debe usar las ventas guardadas del respaldo.'); } });
   f.state.syncFresh = {};
   vm.runInContext(section('loadIncomeReport', 'refreshBackgroundReports') + ';globalThis.load = loadIncomeReport;', f);
   assert.equal(await f.load(), true);
