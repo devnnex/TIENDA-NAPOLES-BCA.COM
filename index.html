@@ -16,10 +16,10 @@
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
     <script>
-      window.__APP_ASSET_VERSION__ = "20261019-inventory-burst-v1";
+      window.__APP_ASSET_VERSION__ = "20261019-visual-details-v1";
       document.write(`<link rel="stylesheet" href="style.css?v=${window.__APP_ASSET_VERSION__}">`);
     </script>
-    <link rel="stylesheet" href="menu-cards.css?v=20261019-dos-cartas-v3">
+    <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   </head>
   <body data-page="client">
@@ -55,13 +55,13 @@
           <i data-lucide="receipt-text"></i>
           <span>Ver cuenta</span>
         </button>
+        <button class="request-btn" id="openMenuCards" type="button" aria-haspopup="dialog" aria-controls="menuCardsViewer"><i data-lucide="book-open"></i><span>Carta</span></button>
         <button class="request-btn" id="songModeToggle" type="button" data-song-request>
           <i data-lucide="music-2"></i>
           <span>Pedir canción</span>
         </button>
       </section>
 
-      <section class="client-section" aria-label="Carta del negocio"><button class="ghost" type="button" id="openMenuCards"><i data-lucide="book-open"></i> Carta</button></section>
 
       <p class="song-turn-notice">🎵 Puedes pedir hasta 5 canciones por mesa. Respeta el orden: otras mesas también esperan. El chat no recibe más solicitudes cuando completas tus 5 canciones. Solo se atenderán solicitudes de mesas ocupadas, verificadas por cámaras.</p>
 
@@ -90,7 +90,7 @@
     </main>
 
     <script defer src="https://unpkg.com/lucide@latest"></script>
-    <script defer src="menu-cards.js?v=20261019-consumo-v1"></script>
+    <script defer src="menu-cards.js?v=20261019-visual-details-v1"></script>
     <script>document.write(`<script defer src="app.js?v=${window.__APP_ASSET_VERSION__}"><\/script>`);</script>
   </body>
 </html>
