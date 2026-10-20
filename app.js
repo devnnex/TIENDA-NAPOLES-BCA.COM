@@ -678,11 +678,11 @@ const App = (() => {
   const icon = (name, size = 18) => `<i data-lucide="${name}" style="width:${size}px;height:${size}px"></i>`;
 
   const money = (value, currency = DEFAULT_CURRENCY) =>
-    new Intl.NumberFormat("es-CO", {
+    (money.formatter ||= new Intl.NumberFormat("es-CO", {
       style: "currency",
       currency: DEFAULT_CURRENCY,
       maximumFractionDigits: 0
-    }).format(Number(value || 0));
+    })).format(Number(value || 0));
 
   const currencyInputNumber = (fieldOrValue) => {
     if (typeof fieldOrValue === "number") return Number.isFinite(fieldOrValue) ? Math.max(0, Math.round(fieldOrValue)) : 0;
@@ -786,6 +786,39 @@ const App = (() => {
     if (window.lucide) window.lucide.createIcons({
       root: { querySelectorAll: (selector) => document.querySelectorAll(`${selector}:not(svg)`) }
     });
+  };
+
+  const paintRowsProgressively = (target, renderers, { append = false } = {}) => {
+    const revision = (target.rowPaintRevision || 0) + 1;
+    target.rowPaintRevision = revision;
+    const pending = paintRowsProgressively.pending ||= new Map();
+    pending.delete(target);
+    paintRowsProgressively.resume = () => {
+      for (const [list, next] of pending) {
+        if (list.closest("[data-admin-section]")?.classList.contains("section-active")) {
+          pending.delete(list); window.setTimeout(next, 0);
+        }
+      }
+    };
+    let offset = 0;
+    if (!append) target.innerHTML = "";
+    const paint = () => {
+      if (target.rowPaintRevision !== revision || !target.isConnected) return;
+      const section = target.closest("[data-admin-section]");
+      if (section && !section.classList.contains("section-active")) { pending.set(target, paint); return; }
+      const shiftDialog = document.querySelector("#salesShiftDialog[open]");
+      if (shiftDialog) { shiftDialog.addEventListener("close", () => window.setTimeout(paint, 0), { once: true }); return; }
+      const started = performance.now(), parts = [];
+      do { parts.push(renderers[offset++]()); }
+      while (offset < renderers.length && parts.length < 20 && performance.now() - started < 4);
+      target.insertAdjacentHTML("beforeend", parts.join(""));
+      refreshIcons();
+      if (offset < renderers.length) {
+        if (window.scheduler?.postTask) void window.scheduler.postTask(paint, { priority: "background" });
+        else window.setTimeout(paint, 0);
+      }
+    };
+    if (renderers.length) paint();
   };
 
   const setLoading = (isLoading) => {
@@ -1072,6 +1105,7 @@ const App = (() => {
     }
     if (section === "users") renderUsers();
     if (section === "assistant") renderAdminAi();
+    if (typeof paintRowsProgressively === "function") paintRowsProgressively.resume?.();
   };
 
   const findTableFromUrl = () => {
@@ -2690,6 +2724,7 @@ const App = (() => {
     items.forEach((remote) => {
       const item = itemById.get(remote.productId);
       if (!item) return;
+      if (Number(remote.version || 0) > 0 && Number(remote.version) < Number(state.inventoryMeta[item.id]?.version || 0)) return;
       if (pendingIds.has(String(item.id))) return;
       if (baseline && baseline.get(item.id) !== state.inventoryMeta[item.id]?.updatedAt) return;
       const nextMeta = {
@@ -3343,14 +3378,14 @@ const App = (() => {
     window.requestAnimationFrame(() => $("#assistantInput")?.focus({ preventScroll: true }));
   };
 
-  const prettyDateTime = (value) => new Date(value || Date.now()).toLocaleString("es-CO", {
+  const prettyDateTime = (value) => (prettyDateTime.formatter ||= new Intl.DateTimeFormat("es-CO", {
     day: "2-digit",
     month: "short",
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit"
-  }).replace(".", "");
+  })).format(new Date(value || Date.now())).replace(".", "");
 
   const REQUEST_OUTBOX_KEY = "la_licorera_17_request_outbox_v2";
 
@@ -6249,7 +6284,7 @@ const App = (() => {
     finally { input.disabled = false; }
   };
 
-  const reportNumber = value => Number(value || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 });
+  const reportNumber = value => (reportNumber.formatter ||= new Intl.NumberFormat("es-CO", { maximumFractionDigits: 2 })).format(Number(value || 0));
   const filteredMovementRows = () => movementViewRows()
     .filter(row => !state.movementProductFilter || state.movementProductFilter === "all" || String(row.productId) === state.movementProductFilter)
     .sort((a,b) => String(b.date || "").localeCompare(String(a.date || "")));
@@ -6714,6 +6749,7 @@ const App = (() => {
   };
 
   const renderInventory = () => {
+    if (state.activeAdminSection && state.activeAdminSection !== "inventory") return;
     const metrics = $("#inventoryMetrics");
     const list = $("#inventoryList");
     if (!metrics || !list) return;
@@ -6730,8 +6766,7 @@ const App = (() => {
       .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter)
       .filter((item) => state.inventoryCategoryFilter === "all"
         || (state.inventoryCategoryFilter === "uncategorized" ? !item.category_id : String(item.category_id || "") === String(state.inventoryCategoryFilter)));
-    list.innerHTML = products.length
-      ? products.map((item) => {
+    const rowRenderers = products.length ? products.map((item) => () => {
           const inventory = inventoryFor(item);
           const status = inventoryStatus(item);
           const statusLabel = status === "out" ? "Agotado" : status === "low" ? "Stock bajo" : "Disponible";
@@ -6759,8 +6794,9 @@ const App = (() => {
                 <button class="icon-btn danger" type="button" data-delete-item="${escapeHTML(item.id)}" data-boss-only aria-label="Eliminar ${escapeHTML(item.name)}">${icon("trash-2", 17)}</button>
               </div>
             </article>`;
-        }).join("")
-      : emptyState("Sin coincidencias", query ? `No encontramos productos para “${escapeHTML(query)}”. Prueba el nombre o sus iniciales.` : "Agrega el primer producto al inventario.", "search-x");
+        }) : [() => emptyState("Sin coincidencias", query ? `No encontramos productos para “${escapeHTML(query)}”. Prueba el nombre o sus iniciales.` : "Agrega el primer producto al inventario.", "search-x")];
+    if (typeof paintRowsProgressively === "function") paintRowsProgressively(list, rowRenderers);
+    else list.innerHTML = rowRenderers.map(render => render()).join("");
     renderInventoryLiveCalculation();
     refreshIcons();
   };
@@ -6948,11 +6984,13 @@ const App = (() => {
     const query = normalizeText(state.movementSearch);
     const movements = filteredMovementRows();
     renderMovementTotals(movements);
-    list.innerHTML = movements.length ? movements.map((movement) => {
+    const rowRenderers = movements.length ? movements.map((movement) => () => {
       const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
       const kind = delta >= 0 ? "entry" : "exit";
-      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${Math.abs(delta).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
-    }).join("") : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
+      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${reportNumber(Number(movement.before || 0))} → ${reportNumber(Number(movement.after || 0))}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${reportNumber(Math.abs(delta))}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
+    }) : [() => emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right")];
+    if (typeof paintRowsProgressively === "function") paintRowsProgressively(list, rowRenderers);
+    else list.innerHTML = rowRenderers.map(render => render()).join("");
     refreshIcons();
   };
 
@@ -7376,10 +7414,27 @@ const App = (() => {
     }
     $("#salesShiftError").textContent = "";
   };
+  const bindSalesShiftDismissal = (dialog) => {
+    if (dialog.dataset.dismissBound) return;
+    dialog.dataset.dismissBound = "1";
+    dialog.addEventListener("click", (event) => {
+      if (event.target !== dialog && !event.target.closest("[data-close-dialog]")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dialog.close("cancel");
+    }, true);
+    dialog.addEventListener("close", () => {
+      if (!state.incomeRenderAfterShift) return;
+      state.incomeRenderAfterShift = false;
+      window.requestAnimationFrame(() => { if (state.activeAdminSection === "income") renderIncomeReport(); });
+    });
+  };
+
   const openSalesShift = (shiftId = "") => {
     if (!canAccessAdminSection("income")) return;
     const dialog = $("#salesShiftDialog"), form = $("#salesShiftForm");
     if (!dialog || !form || dialog.open) return;
+    bindSalesShiftDismissal(dialog);
     const chosen = shiftId ? (state.salesShiftHistory || []).find((item) => item.id === shiftId) : state.salesShift;
     state.salesShiftFormSnapshot = chosen ? { ...chosen } : null;
     const interval = SalesShift.bounds(state.salesShift);
@@ -7739,6 +7794,7 @@ const App = (() => {
     const report = {
       ...remote,
       filters,
+      appliedReportMutations: { ...(remote.appliedReportMutations || {}), ...Object.fromEntries(excludedRemote.map(record => [String(record.saleId), deletedSaleIds.has(String(record.saleId)) ? "deleted" : "edited"])) },
       totals,
       records: [...pending, ...visibleRemote].sort((left, right) => String(right.date).localeCompare(String(left.date))),
       totalRecords: Math.max(0, Number(remote.totalRecords || 0) - excludedRemote.length + pending.length),
@@ -7836,10 +7892,16 @@ const App = (() => {
   const formatIncomeDate = (value) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value || "Sin fecha");
-    return new Intl.DateTimeFormat("es-CO", { dateStyle: "medium", timeStyle: "short", timeZone: state.businessTimeZone }).format(date);
+    if (formatIncomeDate.zone !== state.businessTimeZone || !formatIncomeDate.formatter) {
+      formatIncomeDate.zone = state.businessTimeZone;
+      formatIncomeDate.formatter = new Intl.DateTimeFormat("es-CO", { dateStyle: "medium", timeStyle: "short", timeZone: state.businessTimeZone });
+    }
+    return formatIncomeDate.formatter.format(date);
   };
 
   const renderIncomeReport = (appendFrom = 0) => {
+    if (state.activeAdminSection && state.activeAdminSection !== "income") return;
+    if ($("#salesShiftDialog")?.open) { state.incomeRenderAfterShift = true; return; }
     renderSalesShift();
     const kpis = $("#incomeKpis");
     const payments = $("#incomePaymentBreakdown");
@@ -7859,6 +7921,7 @@ const App = (() => {
     }
     if (!report || (state.incomeAwaitingRemote && navigator.onLine)) {
       state.incomeRenderedShiftSignature = "";
+      recordsTarget.rowPaintRevision = (recordsTarget.rowPaintRevision || 0) + 1;
       if ($("#moreIncomeRecords")) $("#moreIncomeRecords").hidden = true;
       kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
       payments.innerHTML = "";
@@ -7888,8 +7951,8 @@ const App = (() => {
     }
     const appendOnly = appendFrom > 0 && recordsTarget.querySelectorAll(".income-record").length === appendFrom;
     const visibleRecords = appendOnly ? report.records.slice(appendFrom) : report.records;
-    const recordsMarkup = visibleRecords?.length
-      ? visibleRecords.map((record) => {
+    const rowRenderers = visibleRecords?.length
+      ? visibleRecords.map((record) => () => {
           const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
@@ -7908,10 +7971,11 @@ const App = (() => {
               </div>
             </details>
           </article>`;
-        }).join("")
-      : appendOnly ? "" : emptyState("Sin ventas en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
-    if (appendOnly) recordsTarget.insertAdjacentHTML("beforeend", recordsMarkup);
-    else recordsTarget.innerHTML = recordsMarkup;
+        })
+      : appendOnly ? [] : [() => emptyState("Sin ventas en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text")];
+    if (typeof paintRowsProgressively === "function") paintRowsProgressively(recordsTarget, rowRenderers, { append: appendOnly });
+    else if (appendOnly) recordsTarget.insertAdjacentHTML("beforeend", rowRenderers.map(render => render()).join(""));
+    else recordsTarget.innerHTML = rowRenderers.map(render => render()).join("");
     const moreButton = $("#moreIncomeRecords");
     const hasMore = report.localOnly
       ? Number(report.nextIndex || 0) < (report.allLocalRecords || []).length
@@ -8436,6 +8500,10 @@ const App = (() => {
     });
     updatedTotals.averageTicket = updatedTotals.sales ? updatedTotals.income / updatedTotals.sales : 0;
     state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordRows: (reportBefore.recordRows || []).filter(row => String(row.saleId) !== String(saleId)), nextIndex: Math.max(0, Number(reportBefore.nextIndex || 0) - 1) };
+    state.incomeReport = { ...state.incomeReport,
+      recordRows: (reportBefore.recordRows || []).filter(row => String(row.saleId) !== String(saleId)),
+      ...(reportBefore.allLocalRecords ? { allLocalRecords: reportBefore.allLocalRecords.filter(row => String(row.saleId) !== String(saleId)) } : {}),
+      appliedReportMutations: { ...(reportBefore.appliedReportMutations || {}), [String(saleId)]: "deleted" } };
     const saleLink = { sessionId: record.sessionId, invoice: record.invoice };
     const mirror = reportMirror();
     mirror.deleted[String(saleId)] = new Date().toISOString();
