@@ -2258,7 +2258,8 @@ const App = (() => {
       stock: Math.max(0, Number(meta.stock || 0)),
       minStock: Math.max(0, Number(meta.minStock ?? 5)),
       unit: meta.unit || "unidad",
-      updatedAt: meta.updatedAt || ""
+      updatedAt: meta.updatedAt || "",
+      version: meta.version == null ? null : Math.max(0, Number(meta.version || 0))
     };
   };
 
@@ -2981,7 +2982,7 @@ const App = (() => {
             ? [result.item]
             : result?.items || (result?.item ? [result.item] : []);
           const freshItems = remoteItems.filter((item) => !pendingProductIds.has(item.productId));
-          if (freshItems.length) applyRemoteInventoryItems(freshItems);
+          if (freshItems.length) applyRemoteInventoryItems(freshItems, null, job.id);
         };
         if (!result?.ok) {
           const legacyInventoryService = job.action === "adjust_inventory"
@@ -5966,6 +5967,13 @@ const App = (() => {
       Object.entries(mirror.inventoryEffects[rejected] || {}).forEach(([id, delta]) => { mirror.inventoryProjected[id] = Number(mirror.inventoryProjected[id] || 0) - Number(delta); });
       delete mirror.inventoryEffects[rejected]; mirror.inventorySettled[rejected] = true;
     }
+    const stockChange = payload.inventoryStockChange;
+    if (stockChange && !mirror.inventorySettled[stockChange.operationId]) {
+      const id = String(stockChange.productId);
+      if (Object.values(mirror.inventoryEffects).some(effect => Object.prototype.hasOwnProperty.call(effect, id)))
+        mirror.inventoryProjected[id] = Number(mirror.inventoryProjected[id] ?? mirror.inventoryBase[id]?.stock ?? 0) + Number(stockChange.delta || 0);
+      mirror.inventorySettled[stockChange.operationId] = true;
+    }
     const effect = payload.inventoryEffect;
     if (effect && !mirror.inventorySettled[effect.operationId] && !mirror.inventoryEffects[effect.operationId]) {
       const ownJobs = readAppsScriptOutbox().filter(job => ["record_sale", "edit_sale", "delete_sale"].includes(job.action));
@@ -6029,9 +6037,23 @@ const App = (() => {
     const eventId = String(payload.adjustment?.eventId || payload.item?.movementEventId || payload.movementId || "");
     const movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
       : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));
+    const stockDelta = action === "adjust_inventory" ? payload.adjustment?.delta
+      : action === "set_inventory_stock" ? payload.inventoryDelta
+      : action === "upsert_inventory" ? payload.item?.inventoryDelta : undefined;
+    const inventoryStockChange = stockDelta !== undefined && productId && operationId
+      ? { operationId, productId, delta: Number(stockDelta || 0) } : null;
+    const stockItems = result.items || (result.item ? [result.item] : []);
+    // Reconcile the durable receipt locally before removing its outbox job,
+    // even if publishing the notification to the other devices is interrupted.
+    if (inventoryStockChange) {
+      const mirror = reportMirror();
+      reconcileReportInventory(mirror, { inventoryStockChange, items: stockItems }, action);
+      if (!await saveReportSyncValue(reportMirrorKey(), mirror)) throw transientAppsScriptError("Falta proteger la reposicion confirmada.");
+    }
     const change = { operationId: operationId || `${action}:${eventId || saleId || uid()}:${action === "record_sale" ? "saved" : uid()}`, action,
       payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(payload.saleLink ? { saleLink: payload.saleLink } : {}), ...(productId ? { productId } : {}),
         ...(["edit_sale", "delete_sale"].includes(action) ? { mutationId: payload.mutationId || operationId } : {}),
+        ...(inventoryStockChange ? { inventoryStockChange } : {}),
         ...(invoice?.reportRejected ? { inventoryRejectedOperation: payload.mutationId } : {}),
         ...(invoice?.googlePending ? { inventoryEffect: { operationId: payload.mutationId || operationId, deltas: saleInventoryDeltas(action, payload) } } : {}),
         ...(Array.isArray(result.items) ? { inventorySettledOperations: result.reportInventorySettled || [operationId] } : {}),
@@ -7295,6 +7317,7 @@ const App = (() => {
     persistBootstrapCache();
     queueInventoryUpsert(hydrated, movementEventId ? {
       movementEventId,
+      inventoryDelta: stockDelta,
       movementType: id ? (stockDelta > 0 ? "ENTRADA_EDICION" : "SALIDA_EDICION") : "NUEVO_PRODUCTO",
       movementReference: id ? "Edicion de producto" : "Registro inicial"
     } : {});
