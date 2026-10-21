@@ -2760,6 +2760,7 @@ const App = (() => {
     persistBootstrapCache();
     if (state.activeAdminSection === "inventory") renderInventory();
     if (state.activeAdminSection === "menu") renderMenuManager();
+    if ($("#consumptionDialog")?.open) renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
   };
 
   const enqueueAppsScriptJob = (action, payload, dedupeKey = uid()) => {
@@ -3193,6 +3194,11 @@ const App = (() => {
     enqueueAppsScriptJob("upsert_inventory", {
       item: { ...inventoryPayload(item), ...movement }
     }, `inventory:${item.id}`);
+  };
+
+  const refreshConsumptionInventory = () => {
+    if (!navigator.onLine || !state.currentUser || !isAppsScriptConfigured()) return Promise.resolve(false);
+    return refreshInventoryFromPeer().catch(() => false);
   };
 
   const applyConsumptionInventoryDelta = (item, delta, context = {}) => {
@@ -9717,6 +9723,7 @@ const App = (() => {
     $("#cashReceivedFields").hidden = false;
     updatePaymentTipChoice();
     dialog.showModal();
+    void refreshConsumptionInventory();
     refreshIcons();
   };
 
@@ -10070,7 +10077,12 @@ const App = (() => {
     const buttons = $$('button[type="submit"]', form);
     buttons.forEach((button) => { button.disabled = true; });
     state.paymentProcessing = true;
-    const inventoryPlan = paidInventoryPlan(session);
+    let inventoryPlan = paidInventoryPlan(session);
+    if (inventoryPlan.some(entry => inventoryFor(entry.item).stock < entry.quantity)
+      && typeof refreshConsumptionInventory === "function" && navigator.onLine) {
+      await refreshConsumptionInventory();
+      inventoryPlan = paidInventoryPlan(session);
+    }
     if (!validatePaidInventory(inventoryPlan)) {
       receiptWindow?.close();
       buttons.forEach((button) => { button.disabled = false; });
@@ -10700,6 +10712,7 @@ const App = (() => {
     renderLastConsumptionTime(session);
     closeConsumptionProductOptions();
     dialog.showModal();
+    void refreshConsumptionInventory();
     window.setTimeout(() => {
       productSearch?.focus({ preventScroll: true });
     }, 0);
@@ -10767,6 +10780,7 @@ const App = (() => {
     if (keepPreview) renderTableConsumptionPreview(session);
     if ($("#tableSessionActions")) $("#tableSessionActions").hidden = true;
     if (!dialog.open) dialog.showModal();
+    void refreshConsumptionInventory();
     form.quantity.focus({ preventScroll: true });
     form.quantity.select();
     refreshIcons();
