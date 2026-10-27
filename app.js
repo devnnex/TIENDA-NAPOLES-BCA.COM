@@ -368,7 +368,8 @@ const App = (() => {
 
   const persistDurableJson = (key, value) => {
     if (checkoutBatch) {
-      checkoutBatch.set(key, value);
+      const snapshot = JSON.parse(JSON.stringify(value));
+      checkoutBatch.set(key, snapshot);
       return Promise.resolve(true);
     }
     const revision = nextDurableRevision();
@@ -446,12 +447,7 @@ const App = (() => {
     if (checkoutBatch) throw new Error("Ya hay un cobro en procesamiento.");
     const values = new Map();
     checkoutBatch = values;
-    try {
-      project();
-      for (const [key, value] of values) {
-        values.set(key, JSON.parse(JSON.stringify(value)));
-      }
-    } finally { checkoutBatch = null; }
+    try { project(); } finally { checkoutBatch = null; }
     let committed = false;
     const commit = async () => {
       const database = await openLocalDataDb();
@@ -6354,11 +6350,7 @@ const App = (() => {
           delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true;
         }
       }
-      if (change.action === "clear_inventory_movements") {
-        mirror.movements = {};
-        Object.values(mirror.sales || {}).forEach(invoice => { if (invoice.reportMutation) invoice.reportMovementSettled = true; });
-        mirror.movementsClearAt = change.confirmedAt || payload.occurredAt;
-      }
+      if (change.action === "clear_inventory_movements") { mirror.movements = {}; mirror.movementsClearAt = change.confirmedAt || payload.occurredAt; }
       (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, googlePending: Boolean(payload.invoice?.googlePending), reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
       (payload.items || []).forEach(item => inventory.set(String(item.productId), item));
       mirror.cursor = Number(change.sequence);
@@ -6645,109 +6637,8 @@ const App = (() => {
     window.addEventListener("resize",close);
   };
 
-  // Product summaries use line identities and amounts; invoices remain intact for editing/printing.
-  const incomeProductSummary = (report, productId) => {
-    const summary = { quantity: 0, income: 0, cost: 0, profit: 0, sales: 0,
-      complete: (report.records || []).length >= Number(report.totalRecords || 0) && !report.truncated };
-    for (const record of report.records || []) {
-      let matched = false;
-      for (const line of record.items || []) {
-        if (String(line.menuItemId || line.menu_item_id || "") !== String(productId)) continue;
-        matched = true;
-        const quantity = Number(line.quantity || 0);
-        const amount = Number(line.total ?? quantity * Number(line.unitPrice ?? line.unit_price ?? 0));
-        const cost = Number(line.cost ?? quantity * Number(line.unitCost ?? line.unit_cost ?? 0));
-        summary.quantity += quantity;
-        summary.income += amount;
-        summary.cost += cost;
-        summary.profit += amount - cost;
-      }
-      if (matched) summary.sales += 1;
-    }
-    return summary;
-  };
-  const renderIncomeProductOptions = () => {
-    const select = $("#incomeProductFilter");
-    if (!select) return;
-    const products = new Map(state.items.map(item => [String(item.id), String(item.name || "Producto")]));
-    for (const invoice of state.invoiceHistory || []) for (const line of invoice.items || []) {
-      const id = String(line.menu_item_id || line.menuItemId || "");
-      if (id && !products.has(id)) products.set(id, String(line.item_name || line.name || "Producto"));
-    }
-    for (const record of state.incomeReport?.records || []) for (const line of record.items || []) {
-      const id = String(line.menuItemId || line.menu_item_id || "");
-      if (id && !products.has(id)) products.set(id, String(line.name || line.item_name || "Producto"));
-    }
-    const chosen = state.incomeProductFilter || "all";
-    if (chosen !== "all" && !products.has(chosen)) products.set(chosen, select.selectedOptions[0]?.textContent || "Producto seleccionado");
-    const markup = '<option value="all">Todos los productos</option>' + [...products].sort((a,b) => a[1].localeCompare(b[1],"es"))
-      .map(([id,name]) => '<option value="' + escapeHTML(id) + '">' + escapeHTML(name) + '</option>').join("");
-    if (select.innerHTML !== markup) select.innerHTML = markup;
-    select.value = chosen;
-    $("#clearIncomeProduct").hidden = chosen === "all";
-    syncIncomeProductPicker();
-  };
-  const syncIncomeProductPicker = () => {
-    const select=$("#incomeProductFilter"),toggle=$("#incomeProductToggle"),list=$("#incomeProductOptions");
-    if(!select || !toggle || !list) return;
-    const label=select.selectedOptions[0]?.textContent || "Todos los productos";
-    if(!toggle.dataset.searching) toggle.value=label;
-    toggle.placeholder=label;
-    const terms=normalizeText(toggle.dataset.searching ? toggle.value : "").split(/\s+/).filter(Boolean);
-    const options=[...select.options].filter(option=>{
-      const words=option.textContent.split(/\s+/).map(word=>word[0] || "").join("");
-      const text=normalizeText(option.textContent+" "+(state.inventoryMeta?.[option.value]?.code || "")+" "+words);
-      return option.value==="all" || terms.every(term=>text.includes(term));
-    });
-    const markup=options.map(option=>'<button type="button" role="option" id="income-product-option-'+option.index+'" data-income-product="'+escapeHTML(option.value)+'" aria-selected="'+String(option.selected)+'">'+escapeHTML(option.textContent)+'</button>').join("")
-      +(terms.length && options.length===1 && options[0].value==="all" ? '<span class="income-product-empty" role="status">Sin coincidencias</span>' : '');
-    if(list.innerHTML!==markup)list.innerHTML=markup;
-  };
-  const bindIncomeProductPicker = () => {
-    const select=$("#incomeProductFilter"),toggle=$("#incomeProductToggle"),list=$("#incomeProductOptions"),picker=$("#incomeProductPicker");
-    if(!select || !toggle || !list || !picker || toggle.dataset.bound) return;
-    toggle.dataset.bound="1";
-    const close=()=>{if(list.hidden&&!toggle.dataset.searching)return;list.hidden=true;toggle.setAttribute("aria-expanded","false");toggle.removeAttribute("aria-activedescendant");delete toggle.dataset.searching;toggle.value=select.selectedOptions[0]?.textContent || "Todos los productos";};
-    const choose=option=>{if(!option)return;select.value=option.dataset.incomeProduct;select.dispatchEvent(new Event("change",{bubbles:true}));close();};
-    const open=()=>{
-      syncIncomeProductPicker();
-      if(toggle.getBoundingClientRect().bottom>window.innerHeight-180)toggle.scrollIntoView({block:"center",behavior:"instant"});
-      list.style.maxHeight=Math.max(96,Math.min(280,window.innerHeight-toggle.getBoundingClientRect().bottom-12))+"px";
-      list.hidden=false;toggle.setAttribute("aria-expanded","true");
-    };
-    toggle.addEventListener("focus",()=>{toggle.dataset.searching="1";toggle.value="";open();});
-    toggle.addEventListener("click",()=>{if(list.hidden){toggle.dataset.searching="1";toggle.value="";open();}});
-    toggle.addEventListener("input",()=>{toggle.dataset.searching="1";toggle.removeAttribute("aria-activedescendant");open();});
-    list.addEventListener("pointerdown",event=>{if(event.target.closest("[data-income-product]"))event.preventDefault();});
-    list.addEventListener("click",event=>{const option=event.target.closest("[data-income-product]");if(option)choose(option);});
-    toggle.addEventListener("keydown",event=>{
-      if(event.key==="Escape"||event.key==="Tab"){close();return;}
-      if(!["ArrowDown","ArrowUp","Enter"].includes(event.key))return;
-      event.preventDefault();if(list.hidden)open();
-      const options=[...list.querySelectorAll('[role="option"]')];if(!options.length)return;
-      let index=options.findIndex(option=>option.id===toggle.getAttribute("aria-activedescendant"));
-      if(event.key==="Enter"){choose(options[index<0 ? (options.length>1 ? 1 : 0) : index]);return;}
-      index=Math.max(0,Math.min(options.length-1,index+(event.key==="ArrowDown"?1:-1)));
-      toggle.setAttribute("aria-activedescendant",options[index].id);options[index].scrollIntoView({block:"nearest"});
-    });
-    document.addEventListener("click",event=>{if(!picker.contains(event.target))close();});
-    document.addEventListener("keydown",event=>{if(event.key==="Escape")close();});
-    window.addEventListener("resize",close);
-  };
-
-
-  const applyIncomeProductFilter = () => {
-    state.incomeProductFilter = $("#incomeProductFilter")?.value || "all";
-    state.incomeRenderedShiftSignature = "";
-    renderIncomeReport();
-    if (state.incomeProductFilter !== "all" && state.incomeReport
-      && !incomeProductSummary(state.incomeReport, state.incomeProductFilter).complete) {
-      void loadIncomeReport({ background: true, force: true });
-    }
-  };
-
   let completeMovementsPromise = null;
-  const ensureCompleteMovementHistory = ({ force = false } = {}) => {
+  const ensureCompleteMovementHistory = () => {
     if (completeMovementsPromise) return completeMovementsPromise;
     completeMovementsPromise = (async () => {
       if (!navigator.onLine) return false;
@@ -6759,10 +6650,6 @@ const App = (() => {
         const result = await appsScriptRequest("get_inventory_movements", { limit: 800, cursor, revision });
         if (!result?.ok || result.stale || !Array.isArray(result.movements)) throw new Error("El historial cambió. Vuelve a intentar la consulta.");
         if (cursor && String(result.revision || "") !== revision) throw new Error("El historial cambió durante la consulta.");
-        if (!force && !cursor && result.revision && state.completeMovementRevision === result.revision && state.movementLoaded) {
-          state.movementFetchedAt = Date.now();
-          return true;
-        }
         result.movements.forEach(row => collected.set(String(row.movementId), row));
         revision = String(result.revision || "");
         const next = result.hasMore ? result.nextCursor : null;
@@ -6792,40 +6679,17 @@ const App = (() => {
     })().finally(() => { completeMovementsPromise = null; });
     return completeMovementsPromise;
   };
-  const loadSelectedMovementHistory = async (options = {}) => {
-    if (state.movementCompleting) return false;
-    state.movementCompleting = true;
-    try { return await ensureCompleteMovementHistory(options); }
-    catch (error) {
-      state.movementHasMore = true;
-      const feedback = $("#movementTotalsFeedback");
-      if (feedback) feedback.textContent = "Historial parcial. No se pudo completar el conteo: " + String(error?.message || error);
-      return false;
-    } finally { state.movementCompleting = false; }
-  };
   const movementViewRows = () => removeDeletedSaleMovements(state.inventoryMovements);
 
-  const movementSoldUnits = (movements) => {
-    const open = new Set((state.sessions || []).filter(session => session.status === "open").map(session => String(session.id)));
-    return movements.reduce((sum, row) => {
-      const type = String(row.type || "").toUpperCase();
-      if (!["SALIDA_VENTA", "CORRECCION_VENTA", "CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(type)) return sum;
-      if (["CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(type) && open.has(String(row.sessionId))) return sum;
-      return sum - Number(row.delta ?? row.quantityChange ?? 0);
-    }, 0);
-  };
   const renderMovementTotals = (movements) => {
     const entries = movements.filter(row => movementKind(row) === "entry").reduce((sum,row) => sum + Number(row.delta ?? row.quantityChange ?? 0),0);
     const exits = movements.filter(row => movementKind(row) === "exit").reduce((sum,row) => sum + Math.abs(Number(row.delta ?? row.quantityChange ?? 0)),0);
-    const selectedProduct = state.movementProductFilter && state.movementProductFilter !== "all";
-    const sold = selectedProduct ? movementSoldUnits(movements) : exits;
     const summary = $("#movementSummary");
     if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>Unidades ingresadas</small><strong>+${reportNumber(entries)}</strong></span></article>
-      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${state.movementProductFilter && state.movementProductFilter !== "all" ? "De este producto has vendido" : "Unidades retiradas"}</small><strong>${reportNumber(sold)}</strong></span></article>
+      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${state.movementProductFilter && state.movementProductFilter !== "all" ? "De este producto has vendido" : "Unidades retiradas"}</small><strong>${reportNumber(exits)}</strong></span></article>
       <article class="movement-kpi">${icon("list-checks",19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
     const feedback = $("#movementTotalsFeedback");
-    if (feedback) feedback.textContent = (state.movementHasMore ? "Historial parcial: faltan movimientos por cargar. " : "")
-      + "Vendidas: salidas por venta menos devoluciones y correcciones; no incluye retiros manuales ni cuentas abiertas. Ventas usa su periodo seleccionado; Movimientos conserva el historial desde su último borrado.";
+    if (feedback) feedback.textContent = "Cantidades de los movimientos cargados para el producto seleccionado.";
   };
 
   const buildBusinessReportPdf = ({ title, subtitle, metrics = [], sections = [], note = "", filename }) => {
@@ -7433,7 +7297,6 @@ const App = (() => {
 
   let movementRefreshPending = false;
   const loadInventoryMovements = async ({ more = false, background = false, force = false } = {}) => {
-    if (state.movementProductFilter && state.movementProductFilter !== "all" && navigator.onLine) return loadSelectedMovementHistory({ force });
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
     if (state.movementLoading) { if (force) movementRefreshPending = true; return false; }
     if (more && !state.movementHasMore) return false;
@@ -8062,14 +7925,13 @@ const App = (() => {
       const page = await appsScriptRequest("get_income_report", { filters: { ...filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
       if (requestId !== state.incomeRequestId) return report;
       if (!page?.ok || page.stale || !Array.isArray(page.records)
-        || (typeof page.revision === "string" && page.revision !== report.revision)
         || (filters.startAt && page.intervalApplied !== true)) throw new Error(page?.error || "El historial cambio. Actualiza el filtro de ventas.");
       const pageIds = new Set(page.records.map((record) => String(record.saleId)));
       if (pageRows.some((row) => !pageIds.has(String(row.saleId)))) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
       page.records.forEach((record) => records.set(String(record.saleId), record));
     }
     if (Number(report.totalRecords || 0) > records.size) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
-    return { ...report, truncated: false, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
+    return { ...report, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
   };
 
   const incomeSaleTypeFiltersKey = (filters) => JSON.stringify({ ...filters, saleType: "all" });
@@ -8348,12 +8210,9 @@ const App = (() => {
     const recordsTarget = $("#incomeRecords");
     const summaryTarget = $("#incomeFilterSummary");
     if (!kpis || !payments || !recordsTarget) return;
-    if (typeof renderIncomeProductOptions === "function") renderIncomeProductOptions();
-    const productId = state.incomeProductFilter || "all";
-    const productFiltered = productId !== "all";
     const report = state.incomeReport;
     const shiftSignature = report && !(state.incomeAwaitingRemote && navigator.onLine) ? JSON.stringify({
-      productId, filters: report.filters, totals: report.totals, records: report.records,
+      filters: report.filters, totals: report.totals, records: report.records,
       recordRows: report.recordRows, recordKeys: report.recordKeys, totalRecords: report.totalRecords,
       nextIndex: report.nextIndex, pendingCount: report.pendingCount, localOnly: report.localOnly,
       truncated: report.truncated, visibleCount: state.incomeVisibleCount
@@ -8380,18 +8239,6 @@ const App = (() => {
         <article class="income-kpi is-primary">${infoButton("Dinero vendido", "Todo el dinero cobrado en las ventas de este periodo.")}<span>${icon("circle-dollar-sign", 19)} Dinero vendido</span><strong>${money(totals.income)}</strong><small>Total vendido en el periodo seleccionado</small></article>
         <article class="income-kpi is-profit">${infoButton("Ganancia aproximada", "Lo que queda al restar del dinero vendido el costo de los productos.")}<span>${icon("trending-up", 19)} Ganancia aproximada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% del dinero vendido</small></article>
         <article class="income-kpi">${infoButton("Costo de los productos", "Lo que el negocio pagó por los productos que ya vendió.")}<span>${icon("package-search", 19)} Costo de los productos</span><strong>${money(totals.cost)}</strong><small>Valor de compra de lo que se vendió</small></article>`;
-    if (productFiltered) {
-      const selected = incomeProductSummary(report, productId);
-      const name = $("#incomeProductFilter")?.selectedOptions[0]?.textContent || "Producto seleccionado";
-      const pending = !selected.complete && state.incomeLoading && navigator.onLine;
-      const value = number => pending ? "…" : reportNumber(number);
-      const amount = number => pending ? "…" : money(number);
-      const scope = pending ? "Completando todas las facturas del periodo…" : selected.complete ? name : name + (navigator.onLine ? " · historial parcial; actualiza para completar" : " · copia parcial sin conexión");
-      kpis.innerHTML = '<article class="income-kpi is-product"><span>' + icon("package",19) + ' Unidades vendidas</span><strong>' + value(selected.quantity) + '</strong><small>' + escapeHTML(scope) + '</small></article>'
-        + '<article class="income-kpi is-product"><span>' + icon("circle-dollar-sign",19) + ' Vendido del producto</span><strong>' + amount(selected.income) + '</strong><small>Solo sus líneas; sin propinas ni otros productos</small></article>'
-        + '<article class="income-kpi is-product"><span>' + icon("trending-up",19) + ' Ganancia del producto</span><strong>' + amount(selected.profit) + '</strong><small>Costo: ' + amount(selected.cost) + '</small></article>';
-    }
-    payments.hidden = productFiltered;
     payments.innerHTML = [
       ["cash", "banknote", "Efectivo"],
       ["transfer", "landmark", "Transferencia"],
@@ -8406,7 +8253,6 @@ const App = (() => {
     }
     const appendOnly = appendFrom > 0 && recordsTarget.querySelectorAll(".income-record").length === appendFrom;
     const visibleRecords = appendOnly ? report.records.slice(appendFrom) : report.records;
-    if (summaryTarget && productFiltered) summaryTarget.innerHTML += ' · <strong>Producto: ' + escapeHTML($("#incomeProductFilter")?.selectedOptions[0]?.textContent || productId) + '</strong> · Las facturas conservan su desglose completo.';
     const rowRenderers = visibleRecords?.length
       ? visibleRecords.map((record) => () => {
           const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
@@ -8510,7 +8356,7 @@ const App = (() => {
       if (result.stale) throw new Error("El historial cambió mientras se calculaba. Actualiza el informe.");
       if (!Array.isArray(result.recordRows) || typeof result.revision !== "string") throw new Error("El respaldo remoto no devolvió los datos necesarios para paginar ventas.");
       if (requestId !== state.incomeRequestId) return false;
-      if ((filters.saleType && filters.saleType !== "all") || (state.incomeProductFilter && state.incomeProductFilter !== "all")) result = await completeIncomeSaleTypeReport(result, { ...filters, complete: true }, requestId);
+      if (filters.saleType && filters.saleType !== "all") result = await completeIncomeSaleTypeReport(result, filters, requestId);
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       if ((result.records || []).length >= Number(result.totalRecords || 0)) {
@@ -8750,8 +8596,6 @@ const App = (() => {
       lastPaidReceipt: state.lastPaidReceipt
     };
 
-    const movementMirrorBefore = section === "movements" ? JSON.parse(JSON.stringify(reportMirror())) : null;
-
     try {
       if (section === "inventory") {
         state.items = [];
@@ -8777,14 +8621,6 @@ const App = (() => {
         state.movementRevision = "";
         state.movementHasMore = false;
         state.movementLoaded = true;
-        state.movementHasMore = false;
-        state.movementCursor = null;
-        state.completeMovementRevision = "";
-        const mirror = reportMirror();
-        mirror.movements = {};
-        Object.values(mirror.sales || {}).forEach(invoice => { if (invoice.reportMutation) invoice.reportMovementSettled = true; });
-        mirror.movementsClearAt = new Date().toISOString();
-        if (!await saveReportSyncValue(reportMirrorKey(), mirror)) throw new Error("No se pudo proteger el reinicio de movimientos. Intenta de nuevo.");
         state.inventoryMovements = [];
         state.movementSearch = "";
         state.movementTypeFilter = "all";
@@ -8845,8 +8681,6 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
-        state.reportMirror = movementMirrorBefore;
-        await saveReportSyncValue(reportMirrorKey(), movementMirrorBefore);
         state.inventoryMovements = snapshot.inventoryMovements;
         state.movementCursor = snapshot.movementCursor;
         state.movementRevision = snapshot.movementRevision;
@@ -12013,17 +11847,10 @@ const App = (() => {
       state.inventoryCategoryFilter = event.currentTarget.value || "all";
       renderInventory();
     });
-    bindIncomeProductPicker();
-    $("#incomeProductFilter")?.addEventListener("change", applyIncomeProductFilter);
-    $("#clearIncomeProduct")?.addEventListener("click", () => {
-      $("#incomeProductFilter").value = "all";
-      applyIncomeProductFilter();
-    });
     bindMovementProductPicker();
     $("#movementProductFilter")?.addEventListener("change", event => {
       state.movementProductFilter = event.currentTarget.value || "all";
       renderInventoryMovements();
-      if (state.movementProductFilter !== "all" && navigator.onLine) void loadSelectedMovementHistory();
     });
     $("#exportPurchasesPdf")?.addEventListener("click", () => void exportPurchasesPdf());
     $("#movementSearch")?.addEventListener("input", (event) => {

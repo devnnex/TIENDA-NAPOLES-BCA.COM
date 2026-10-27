@@ -94,10 +94,10 @@ test('borrar durante un envío conserva el alta y encola el borrado sin esperar 
  assert.deepEqual(h.calls,[],'El borrado sale por la cola, detrás del alta, sin otra petición concurrente.');
 });
 
-test('entrar conserva la carga habitual; seleccionar un producto completa su historial y mantiene tres KPI',()=>{
+test('entrar y filtrar no inicia consultas completas de ventas o movimientos y mantiene tres KPI',()=>{
  assert.doesNotMatch(block('showAdminSection','ensureOpenSession'),/loadMovementSalesTotals\(|ensureCompleteMovementHistory\(/);
  const a=source.indexOf('    $("#movementProductFilter")?.addEventListener'),b=source.indexOf('    $("#exportPurchasesPdf")',a);
- assert.match(source.slice(a,b),/loadSelectedMovementHistory\(/);
+ assert.doesNotMatch(source.slice(a,b),/appsScriptRequest\(|ensureCompleteMovementHistory\(|loadIncomeReport\(/);
  assert.equal((block('renderMovementTotals','buildBusinessReportPdf').match(/<article /g)||[]).length,3);
  assert.ok(!fs.readFileSync(path.join(__dirname,'../admin.html'),'utf8').includes('id="completeMovementHistory"'));
 });
