@@ -6474,7 +6474,6 @@ const App = (() => {
     });
     for (const invoice of Object.values(mirror.sales)) {
       if (!invoice.reportMutation || invoice.reportMovementSettled) continue;
-      if (mirror.movementsClearAt && !(Date.parse(invoice.reportConfirmedAt || invoice.createdAt || "") > Date.parse(mirror.movementsClearAt))) continue;
       if (!invoice.googlePending && authoritative && readStartedAt >= Date.parse(invoice.reportConfirmedAt || "")) {
         invoice.reportMovementSettled = true; retired = true; continue;
       }
@@ -8545,7 +8544,7 @@ const App = (() => {
       movements: {
         eyebrow: "Reiniciar movimientos",
         title: "¿Eliminar todos los movimientos?",
-        message: "Se eliminarán todos los movimientos de entradas y salidas. No se devolverán productos al inventario ni se modificarán las existencias actuales. Las ventas se conservarán.",
+        message: "Se borrará todo el historial de entradas y salidas. Las existencias actuales no cambiarán.",
         action: "clear_inventory_movements",
         success: "Movimientos eliminados. El historial quedó en cero."
       },
@@ -8597,8 +8596,6 @@ const App = (() => {
       lastPaidReceipt: state.lastPaidReceipt
     };
 
-    const movementMirrorBefore = section === "movements" ? JSON.parse(JSON.stringify(reportMirror())) : null;
-
     try {
       if (section === "inventory") {
         state.items = [];
@@ -8624,10 +8621,6 @@ const App = (() => {
         state.movementRevision = "";
         state.movementHasMore = false;
         state.movementLoaded = true;
-        const mirror = reportMirror();
-        mirror.movements = {};
-        mirror.movementsClearAt = new Date().toISOString();
-        if (!await saveReportSyncValue(reportMirrorKey(), mirror)) throw new Error("No se pudo guardar el reinicio de movimientos. Intenta de nuevo.");
         state.inventoryMovements = [];
         state.movementSearch = "";
         state.movementTypeFilter = "all";
@@ -8688,8 +8681,6 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
-        state.reportMirror = movementMirrorBefore;
-        await saveReportSyncValue(reportMirrorKey(), movementMirrorBefore);
         state.inventoryMovements = snapshot.inventoryMovements;
         state.movementCursor = snapshot.movementCursor;
         state.movementRevision = snapshot.movementRevision;
