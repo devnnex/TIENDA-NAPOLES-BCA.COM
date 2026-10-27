@@ -69,19 +69,24 @@ vm.runInContext(`let movementRefreshPending = false; ${section("  const loadInve
 
 const salesState = {
   incomeRequestId: 0, incomeSearchTimer: null, incomeLoading: false,
-  incomeReport: { records: [{ saleId: "deleted-sale" }] }, activeAdminSection: "income"
+  incomeReport: { filters: { dateFrom: "2026-10-05", dateTo: "2026-10-05" }, records: [{ saleId: "deleted-sale" }] }, activeAdminSection: "income"
 };
 let saleReads = 0;
 let saleFails = false;
 const saleMessages = [];
 const saleContext = vm.createContext({
   state: salesState,
+  readLocalJson: () => null,
+  INCOME_REPORT_CACHE_KEY: "income-test",
+  navigator: { onLine: true },
+  persistDurableJson: async () => true,
   $: () => ({}),
   clearTimeout: () => undefined,
   canAccessAdminSection: () => true,
   incomeFiltersFromForm: () => ({ dateFrom: "2026-10-05", dateTo: "2026-10-05" }),
   localIncomeReport: () => ({ records: [{ saleId: "deleted-sale" }] }),
   renderIncomeReport: () => undefined,
+  readAppsScriptOutbox: () => [],
   setIncomeReportStatus: (message) => saleMessages.push(message),
   isAppsScriptConfigured: () => true,
   appsScriptRequest: async () => {
@@ -89,7 +94,7 @@ const saleContext = vm.createContext({
     if (saleFails) throw new Error("Sin conexión al respaldo");
     return { ok: true, records: [], recordRows: [], totals: { sales: 0 }, totalRecords: 0, revision: "same-revision" };
   },
-  mergeIncomeReport: (remote) => remote,
+  mergeIncomeReport: (remote, filters) => ({ ...remote, filters }),
   toast: (message) => saleMessages.push(message),
   Date,
   APPS_SCRIPT_TIMEOUT_MS: 45000

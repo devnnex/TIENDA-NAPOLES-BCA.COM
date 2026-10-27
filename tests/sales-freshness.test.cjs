@@ -27,22 +27,22 @@ function fixture({cached=null,initial=null,online=true}={}) {
   +';globalThis.api={render:renderIncomeReport,load:loadIncomeReport};',context);
  return {state,context,histories,nodes,requests,status,statusReads,saved};
 }
-test('al abrir con red no pinta cifras del historial local ni de una copia sin verificar',async()=>{
+test('al abrir con red muestra la última copia guardada mientras comprueba las ventas sin vaciar los KPI',async()=>{
  const f=fixture({cached:{filters,report:report(999,'old')}});
  const reading=f.context.api.load({force:true});
- assert.equal(f.state.incomeAwaitingRemote,true);
- assert.match(f.nodes.get('#incomeKpis').markup,/is-loading/);
- assert.ok(f.histories.every(([,markup])=>!markup.includes('999')&&!markup.includes('111')));
+ assert.equal(f.state.incomeAwaitingRemote,false);
+ assert.match(f.nodes.get('#incomeKpis').markup,/999/);
+ assert.doesNotMatch(f.nodes.get('#incomeKpis').markup,/is-loading/);
  f.requests[0].resolve(report(54321));assert.equal(await reading,true);
  assert.equal(f.state.incomeAwaitingRemote,false);
  assert.match(f.nodes.get('#incomeKpis').markup,/54321/);
  assert.equal(f.saved.at(-1).report.totals.income,54321);
 });
-test('una copia con la misma revisión solo aparece después de comprobar la revisión remota',async()=>{
+test('una copia con la misma revisión permanece visible mientras se comprueba la revisión remota',async()=>{
  const f=fixture({cached:{filters,report:report(4321,'same')}});
  const reading=f.context.api.load({background:true});
- assert.match(f.nodes.get('#incomeKpis').markup,/is-loading/);
- assert.doesNotMatch(f.nodes.get('#incomeKpis').markup,/4321/);
+ assert.match(f.nodes.get('#incomeKpis').markup,/4321/);
+ assert.doesNotMatch(f.nodes.get('#incomeKpis').markup,/is-loading/);
  f.status.resolve({ok:true,historyRevision:'same'});assert.equal(await reading,true);
  assert.equal(f.requests.length,0);
  assert.match(f.nodes.get('#incomeKpis').markup,/4321/);
@@ -63,16 +63,14 @@ test('si la consulta inicial falla, muestra la copia como local sin dejar la pan
  assert.equal(f.state.incomeAwaitingRemote,false);assert.equal(f.state.incomeReport.localOnly,true);
  assert.match(f.nodes.get('#incomeKpis').markup,/999/);
 });
-if(source.includes('  const refreshSalesAfterResume ='))test('al volver a PWA invalida la lectura anterior y agrupa eventos de foco y visibilidad',async()=>{
- const f=fixture({initial:report(100,'old')});
+if(source.includes('  const refreshSalesAfterResume ='))test('volver a PWA agrupa foco y visibilidad y conserva los KPI y la lectura en curso',async()=>{
+ const f=fixture({initial:report(100,'old')});f.state.incomeAwaitingRemote=false;f.context.api.render();
+ const old=f.context.api.load({background:true,force:true});f.context.refreshBackgroundReports=()=>old;
  vm.runInContext(section('  let salesResumeAt =','  const resumeRealtimeReception =')+';globalThis.resume=refreshSalesAfterResume;',f.context);
- const old=f.context.api.load({background:true,force:true});
  const resumed=f.context.resume();assert.equal(f.context.resume(),resumed);
- assert.match(f.nodes.get('#incomeKpis').markup,/is-loading/);
- f.requests[0].resolve(report(200,'stale'));assert.equal(await old,false);
- assert.doesNotMatch(f.nodes.get('#incomeKpis').markup,/200/);
- f.requests[1].resolve(report(700,'fresh'));assert.equal(await resumed,true);
- assert.match(f.nodes.get('#incomeKpis').markup,/700/);
+ assert.match(f.nodes.get('#incomeKpis').markup,/100/);assert.doesNotMatch(f.nodes.get('#incomeKpis').markup,/is-loading/);
+ f.requests[0].resolve(report(700,'fresh'));assert.equal(await old,true);assert.equal(await resumed,true);
+ assert.match(f.nodes.get('#incomeKpis').markup,/700/);assert.equal(f.requests.length,1);
 });
 
  test('si falla la comprobacion ligera intenta el informe remoto completo',async()=>{
