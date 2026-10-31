@@ -7840,8 +7840,7 @@ const App = (() => {
     for (const event of ["online", "focus"]) window.addEventListener(event, () => { refreshSalesShiftRange(); void syncSalesShift(); });
   };
 
-  const incomeRangeDates = (preset = "today") => preset === "all"
-    ? { dateFrom: "1900-01-01", dateTo: "9999-12-31" } : preset === "shift"
+  const incomeRangeDates = (preset = "today") => preset === "shift"
     ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", state.salesShift, new Date(), state.salesShiftHistory)
     : SalesShift.range(preset, state.salesShift, new Date(), state.salesShiftHistory);
 
@@ -7857,12 +7856,7 @@ const App = (() => {
     const from = $("#incomeDateFrom");
     const to = $("#incomeDateTo");
     if (!from || !to) return;
-    if (state.incomeRangePreset === "all") {
-      state.incomeAppliedRange = incomeRangeDates("all");
-      markIncomeRangePreset();
-      return;
-    }
-    if (!state.incomeAppliedRange && (!from.value || !to.value)) {
+    if (!from.value || !to.value) {
       const range = incomeRangeDates(state.incomeRangePreset);
       from.value = range.dateFrom;
       to.value = range.dateTo;
@@ -7877,12 +7871,12 @@ const App = (() => {
     const to = $("#incomeDateTo");
     if (!from || !to) return;
     state.incomeRangePreset = preset;
-    from.value = preset === "all" ? "" : range.dateFrom;
-    to.value = preset === "all" ? "" : range.dateTo;
+    from.value = range.dateFrom;
+    to.value = range.dateTo;
     state.incomeAppliedRange = range;
     state.salesShiftRangeSignature = JSON.stringify(range);
     window.clearTimeout(state.salesShiftBoundaryTimer);
-    if (preset !== "shift" && preset !== "all") {
+    if (preset !== "shift") {
       const now = Date.now();
       const starts = preset === "today" ? [...(state.salesShiftHistory || []), state.salesShift]
         .map(shift => SalesShift.bounds(shift)?.start).filter(start => start > now) : [];
@@ -7898,8 +7892,8 @@ const App = (() => {
     initializeIncomeFilters();
     const current = state.incomeRangePreset && state.incomeRangePreset !== "custom" ? incomeRangeDates(state.incomeRangePreset) : null;
     if (current) {
-      $("#incomeDateFrom").value = state.incomeRangePreset === "all" ? "" : current.dateFrom;
-      $("#incomeDateTo").value = state.incomeRangePreset === "all" ? "" : current.dateTo;
+      $("#incomeDateFrom").value = current.dateFrom;
+      $("#incomeDateTo").value = current.dateTo;
       state.incomeAppliedRange = current;
     }
     return {
@@ -8303,7 +8297,7 @@ const App = (() => {
     if (summaryTarget) {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
       const typeText = incomeSaleTypeLabel(filters.saleType);
-      summaryTarget.innerHTML = `${icon("calendar-range", 15)} ${filters.dateFrom === "1900-01-01" && filters.dateTo === "9999-12-31" ? "<strong>Todo el historial</strong>" : `<strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong>`} · ${escapeHTML(methodText)} · ${escapeHTML(typeText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
+      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)} · ${escapeHTML(typeText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
     }
     const appendOnly = appendFrom > 0 && recordsTarget.querySelectorAll(".income-record").length === appendFrom;
     const analysisRecords = product ? product.records : report.records;
@@ -11959,12 +11953,11 @@ const App = (() => {
       event.preventDefault();
       const dateFrom = $("#incomeDateFrom")?.value || "";
       const dateTo = $("#incomeDateTo")?.value || "";
-      if (dateFrom && dateTo && dateFrom > dateTo) {
+      if (dateFrom > dateTo) {
         toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
         return;
       }
-      if (!dateFrom && !dateTo) { setIncomeRange("all"); return; }
-      state.incomeAppliedRange = { dateFrom: dateFrom || "1900-01-01", dateTo: dateTo || "9999-12-31" };
+      state.incomeAppliedRange = { dateFrom, dateTo };
       markIncomeRangePreset();
       void loadIncomeReport();
     });
@@ -11996,7 +11989,6 @@ const App = (() => {
     $("#incomeSaleType")?.addEventListener("change", applyIncomeSaleTypeFilter);
     [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
       state.incomeRangePreset = "custom";
-      if (!$("#incomeDateFrom")?.value && !$("#incomeDateTo")?.value) { setIncomeRange("all"); return; }
       markIncomeRangePreset();
     }));
     $("#inventorySearch")?.addEventListener("input", (event) => {
