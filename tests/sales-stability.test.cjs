@@ -20,6 +20,20 @@ function harness(initialCache=null){
  vm.runInContext(part('incomeTotalsFromRecords','setIncomeReportStatus')+part('renderIncomeReport','refreshBackgroundReports')+';globalThis.api={load:loadIncomeReport,merge:mergeIncomeReport,render:renderIncomeReport};',context);
  return {state,jobs,responses,calls,nodes,context,api:context.api,setFilters:value=>{current={...value};},clearCache:()=>{cached=null;},cache:()=>cached};
 }
+
+test('SODA/GINGER: una revisión vieja del estado remoto no valida el año después de haber leído ventas más recientes en el mes',async()=>{
+ const h=harness();h.state.items=[{id:'soda',name:'SODA/GINGER'}];
+ const year={...filters,dateFrom:'2026-01-01',dateTo:'2026-10-27',query:'soda/ginger'},month={...year,dateFrom:'2026-10-01'};
+ const productSale=(id,quantity,date)=>({...sale(id,date,quantity*100),items:[{menuItemId:'soda',name:'SODA/GINGER',quantity,total:quantity*100,cost:quantity*20}]});
+ const old=productSale('old',26,'2026-06-20T12:00:00-05:00'),fresh=productSale('fresh',32,'2026-10-20T12:00:00-05:00');
+ h.setFilters(year);h.responses.push({...report([old],year),revision:'old'});await h.api.load({force:true});
+ h.setFilters(month);h.responses.push({...report([fresh],month),revision:'new'});await h.api.load({force:true});
+ assert.equal(vm.runInContext('incomeProductSummary(state.incomeReport).quantity',h.context),32);
+ h.context.readAppsScriptStatus=async()=>({ok:true,historyRevision:'old'});
+ h.setFilters(year);h.responses.push({...report([old,fresh],year),revision:'new'});await h.api.load();
+ assert.equal(vm.runInContext('incomeProductSummary(state.incomeReport).quantity',h.context),58);
+ assert.equal(h.state.incomeRevision,'new');assert.equal(h.responses.length,0);
+});
 test('un turno futuro conserva el día disponible en Hoy; el turno explícito mantiene sus horas',()=>{
  const state={salesShift:{id:'shift',date:'2026-10-27',startMinutes:1140,endMinutes:60},salesShiftHistory:[],selectedSalesShiftId:'shift'};state.salesShiftHistory=[state.salesShift];
  const context=vm.createContext({state,SalesShift,Date:Clock});vm.runInContext(part('incomeRangeDates','markIncomeRangePreset')+';globalThis.range=incomeRangeDates;',context);
