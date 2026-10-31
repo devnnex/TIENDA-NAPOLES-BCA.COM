@@ -40,7 +40,7 @@ test('Navegacion muestra contenido durante el clic y conserva el control de perm
   assert.equal(calls.at(-1), 'service');
 });
 
-test('Teclear filtra todas las ventas disponibles sin perder filas al borrar la busqueda', () => {
+test('una búsqueda consulta el backend y borrar el texto restaura las ventas disponibles', () => {
   let query = 'cafe';
   const filters = { dateFrom: '2026-10-10', dateTo: '2026-10-10', saleType: 'all', query: '' };
   const records = [
@@ -55,15 +55,14 @@ test('Teclear filtra todas las ventas disponibles sin perder filas al borrar la 
     incomeTotalsFromRecords: rows => ({ income: rows.reduce((sum, row) => sum + row.total, 0) }),
     mergeIncomeReport: (report, applied) => ({ ...report, filters: applied }), renderIncomeReport: () => renders++ });
   vm.runInContext(section('previewIncomeSearch', 'incomePaymentLabel') + ';globalThis.preview = previewIncomeSearch;', context);
-  assert.equal(context.preview(), true);
-  assert.equal(state.incomeReport.records[0].saleId, 'a');
-  assert.equal(state.incomeReport.totals.income, 10);
-  assert.equal(state.incomeReport.recordRows.length, 1);
+  assert.equal(context.preview(), false);
+  assert.equal(state.incomeReport, undefined);
+  assert.equal(renders, 0);
   query = '';
   assert.equal(context.preview(), true);
   assert.equal(state.incomeReport.records.length, 2);
   assert.equal(state.incomeReport.totals.income, 30);
-  assert.equal(renders, 2);
+  assert.equal(renders, 1);
   state.incomeSaleTypeSnapshot.report.totalRecords = 3;
   assert.equal(context.preview(), false, 'Una pagina incompleta requiere consultar el servidor');
   state.incomeSaleTypeSnapshot.report.totalRecords = 2;
