@@ -1,6 +1,6 @@
 // DEVNEX connection ed0d278a-57ef-45ef-a4af-ed7f7f67b734: refresh the cached client shell.
 const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
-const APP_ASSET_CACHE = "tienda-napoles-assets-20261112-payment-buttons-v2";
+const APP_ASSET_CACHE = "tienda-napoles-assets-20261030-balance-eye-v1";
 const DYNAMIC_PWA_ASSETS = new Set([
   "pwa-manifest.webmanifest",
   "pwa-icon-192.png",
