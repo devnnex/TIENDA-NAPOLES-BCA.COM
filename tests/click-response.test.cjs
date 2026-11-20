@@ -22,7 +22,8 @@ test('Actualizar iconos procesa los nuevos y conserva los SVG ya dibujados', () 
 test('Navegacion muestra contenido durante el clic y conserva el control de permisos', () => {
   const calls = [];
   const state = { activeAdminSection: 'dashboard' };
-  const context = vm.createContext({ state, $$: () => [],
+  const context = vm.createContext({ state, $$: () => [], $: () => null,
+    openPermanentIndividualSale: () => calls.push('service'),
     syncAdminSectionAccess() {}, tipsEnabled: () => false,
     canAccessAdminSection: name => name !== 'users', firstAllowedAdminSection: () => 'service', allowedAdminSections: () => ['service', 'accounts', 'menu'],
     renderAccounts: () => calls.push('accounts'), renderServiceTables: () => calls.push('service'),

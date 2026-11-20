@@ -1045,6 +1045,13 @@ const App = (() => {
     syncAdminSectionAccess();
     if (section === "tips" && !tipsEnabled()) section = canAccessAdminSection("accounts") ? "accounts" : firstAllowedAdminSection();
     if (!canAccessAdminSection(section)) section = firstAllowedAdminSection();
+    if (section !== "service" && $("#paymentDialog")?.dataset.inlineCheckout === "1") {
+      const dialog = $("#paymentDialog");
+      dialog.dataset.inlineCheckout = "0";
+      dialog.close();
+      dialog.classList.remove("payment-inline");
+      document.body.append(dialog);
+    }
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -1063,8 +1070,7 @@ const App = (() => {
     if (section === "accounts") renderAccounts();
     if (section === "tips") renderTips();
     if (section === "service") {
-      renderServiceTables();
-      renderWaiterTableSelect();
+      void openPermanentIndividualSale();
     }
     if (section === "menu") {
       renderMenuManager();
@@ -2284,15 +2290,19 @@ const App = (() => {
 
   const renderWalkInDraftBadge = () => {
     renderServiceWalkInSales();
-    const button = $("#newWalkInSale");
-    const badge = button?.querySelector("[data-walk-in-draft-count]");
-    if (!badge) return;
-    const count = pendingWalkInSaleCount();
-    badge.hidden = count === 0;
-    badge.textContent = String(count);
-    const label = count ? `Venta individual: ${count} venta${count === 1 ? "" : "s"} pendiente${count === 1 ? "" : "s"}` : "Nueva venta individual";
-    button.setAttribute("aria-label", label);
-    button.title = label;
+    const sessions = serviceWalkInSessions();
+    $$("[data-dashboard-walk-in]").forEach(button => {
+      const slot = Number(button.dataset.dashboardWalkIn);
+      const session = sessions.find(entry => entry.service_slot === slot && !entry.checkout_surface);
+      const draft = session?.consumption_draft;
+      const pending = Boolean(session && ((session.session_items || []).some(item => item.status !== "cancelled")
+        || draft && (draft.drafts?.length || draft.fields?.menu_item_id || draft.fields?.item_name?.trim() || draft.fields?.quantity || draft.search?.trim())));
+      const badge = button.querySelector("[data-walk-in-draft-count]");
+      if (badge) { badge.hidden = !pending; badge.textContent = pending ? "1" : "0"; }
+      const label = "Venta individual " + slot + (pending ? ": venta pendiente" : ": libre");
+      button.setAttribute("aria-label", label);
+      button.title = label;
+    });
   };
 
   const persistInventoryStore = () => persistDurableJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
@@ -4634,6 +4644,16 @@ const App = (() => {
         merged.set(sessionId,pending);
       }
     });
+    // A stale payment relation must not occupy an account whose last product
+    // was just removed. Keep this scoped to the pending cancellation overlay.
+    merged.forEach((session, id) => {
+      const overlay = state.optimisticSessionStates.get(id);
+      const expected = overlay?.expectedItems || (overlay?.expectedItem ? [overlay.expectedItem] : []);
+      if (expected.some(item => item.status === "cancelled") && Array.isArray(session.session_items)
+        && !session.session_items.some(item => item.status !== "cancelled")) {
+        merged.set(id, { ...session, session_payments: [] });
+      }
+    });
     // Rebuild the removal from the durable checkout receipt after reload/PWA restart.
     // A different account on the same table, or changed consumption, remains visible.
     Object.entries(state.checkoutClosures || {}).forEach(([id, receipt]) => {
@@ -5652,7 +5672,7 @@ const App = (() => {
     const emptyText = normalTables().some((table) => table.is_active !== false)
       ? "No hay mesas que coincidan con este filtro."
       : "Crea las mesas del negocio para comenzar.";
-    box.innerHTML = `<button class="compact-table-tile walk-in-table" id="newWalkInSale" type="button" data-manager-only aria-label="Nueva venta individual"><span class="table-furniture-icon">${icon("plus", 23)}</span><small>Venta individual</small><em data-walk-in-draft-count hidden></em></button>` + (compactTableTiles(state.dashboardTableGroupFilter, $("#dashboardTableSearch")?.value || "") || emptyState("Sin mesas", emptyText, "layout-grid"));
+    box.innerHTML = [1, 2, 3].map(slot => `<button class="compact-table-tile walk-in-table" id="${slot === 1 ? "newWalkInSale" : "newWalkInSale" + slot}" type="button" data-manager-only data-dashboard-walk-in="${slot}" aria-label="Venta individual ${slot}"><span class="table-furniture-icon">${icon("plus", 23)}</span><small>Venta individual ${slot}</small><em data-walk-in-draft-count hidden></em></button>`).join("") + (compactTableTiles(state.dashboardTableGroupFilter, $("#dashboardTableSearch")?.value || "") || emptyState("Sin mesas", emptyText, "layout-grid"));
     renderWalkInDraftBadge();
     refreshIcons();
   };
@@ -6055,14 +6075,87 @@ const App = (() => {
     await openScannedTable(tableId);
   };
 
-  const createWalkInSale = async ({ slot = null } = {}) => {
+
+  // The permanent checkout and the dashboard use the existing payment form.
+  const presentIndividualPayment = (dialog, session) => {
+    const inline = state.activeAdminSection === "service" && session.checkout_surface === "service";
+    const host = inline ? $("#individualSaleCheckout") : document.body;
+    if (dialog.parentElement !== host) {
+      if (dialog.open) dialog.close();
+      host.append(dialog);
+    }
+    dialog.classList.toggle("payment-inline", inline);
+    dialog.dataset.inlineCheckout = inline ? "1" : "0";
+    if (!dialog.open) inline ? dialog.show() : dialog.showModal();
+    const scanner = $("#barcodeSaleEntry");
+    if (scanner) scanner.hidden = session.checkout_surface !== "barcode";
+    if (session.checkout_surface === "barcode") {
+      $("#barcodeSaleStatus").textContent = "Escanea un producto para agregarlo a esta venta.";
+      window.setTimeout(() => $("#barcodeSaleInput")?.focus({ preventScroll: true }), 0);
+    }
+  };
+
+  const openPermanentIndividualSale = () => {
+    const sessions = serviceWalkInSessions().filter(session => session.checkout_surface === "service"
+      || (!session.checkout_surface && session.service_slot > 3));
+    const control = $("#individualSaleDraftControl");
+    const select = $("#individualSaleDraft");
+    if (control) control.hidden = sessions.length < 2;
+    if (select) {
+      const selected = select.value;
+      select.innerHTML = sessions.map(session => '<option value="' + escapeHTML(session.id) + '">Venta guardada '
+        + session.service_slot + ' · ' + escapeHTML(money(sessionTotal(session))) + '</option>').join("");
+      if (sessions.some(session => session.id === selected)) select.value = selected;
+    }
+    return createWalkInSale({ surface: "service", sessionId: select?.value || "", paymentOnly: true });
+  };
+
+  let barcodeScanChain = Promise.resolve();
+  const addBarcodeToSale = async (sessionId, rawCode) => {
+    const code = String(rawCode || "").trim();
+    const status = $("#barcodeSaleStatus");
+    const fail = message => { if (status) status.textContent = message; toast(message, "error", "barcode-sale"); return false; };
+    const session = state.sessions.find(entry => entry.id === sessionId);
+    if (!code || state.paymentProcessing || !isLocalWalkInSession(session) || session.status !== "open"
+      || $("#paymentForm")?.session_id.value !== sessionId) return false;
+    const matches = state.items.filter(item => item.is_active !== false && String(item.barcode || "").trim() === code);
+    if (matches.length !== 1) return fail(matches.length ? "Hay más de un producto con este código. Revisa Inventario." : "Código no registrado. Agrégalo al producto en Inventario.");
+    const item = matches[0];
+    if (item.is_available === false) return fail("Este producto no está disponible para vender.");
+    const reserved = (session.session_items || []).filter(line => line.status !== "cancelled" && line.menu_item_id === item.id)
+      .reduce((sum, line) => sum + Number(line.quantity || 0), 0);
+    if (reserved + 1 > inventoryFor(item).stock) return fail("No hay existencias suficientes de " + item.name + ".");
+    // Reuse the same local consumption and checkout path; stock changes on payment.
+    const result = await addConsumptionBatch({ session_id: { value: sessionId }, pending_table_id: { value: "" },
+      payer_name: { value: session.payer_name || "" } }, [{ menuItemId: item.id, itemName: item.name,
+      unitPrice: Number(item.price || 0), quantity: 1, notes: "", payerName: session.payer_name || "" }]);
+    if (!result) return fail("No se pudo agregar el producto. Escanéalo de nuevo.");
+    if (state.activeAdminSection === "dashboard" && $("#paymentForm")?.session_id.value === sessionId) {
+      // Update totals without resetting the selected payment method or cash input.
+      const updated = state.sessions.find(entry => entry.id === sessionId);
+      $("#paymentForm").dataset.hasItems = "1";
+      state.activePaymentBase = sessionTotal(updated);
+      renderPaymentSaleLines(updated);
+      updatePaymentTipChoice();
+      refreshIcons();
+    }
+    if (status) status.textContent = item.name + " agregado.";
+    return true;
+  };
+
+  const createWalkInSale = async ({ slot = null, surface = "", sessionId = "", paymentOnly = false } = {}) => {
     const button = $("#newWalkInSale");
     if (button) button.disabled = true;
     try {
       const sessions = serviceWalkInSessions();
-      const existing = sessions.find(session => slot === null || session.service_slot === slot);
+      const existing = sessions.find(session => surface
+        ? surface === "service"
+          ? (sessionId ? session.id === sessionId : session.checkout_surface === surface || (!session.checkout_surface && session.service_slot > 3))
+          : session.checkout_surface === surface
+        : !session.checkout_surface && (slot === null || session.service_slot === slot));
       if (existing) {
-        if (existing.consumption_draft) openConsumptionDialog(existing.id, { quickCheckout: true });
+        if (surface) { existing.checkout_surface = surface; persistWalkInDrafts(); }
+        if (existing.consumption_draft && !paymentOnly) openConsumptionDialog(existing.id, { quickCheckout: true });
         else openPaymentDialog(existing.id);
         return;
       }
@@ -6070,10 +6163,11 @@ const App = (() => {
       const session = {
         id: uid(),
         local_only: true,
+        checkout_surface: surface,
         table_id: null,
         status: "open",
         sale_channel: "walk_in",
-        service_slot: slot || Array.from({ length: sessions.length + 1 }, (_, index) => index + 1).find(value => !sessions.some(entry => entry.service_slot === value)),
+        service_slot: slot || Array.from({ length: sessions.length + 4 }, (_, index) => index + (surface ? 4 : 1)).find(value => !sessions.some(entry => entry.service_slot === value)),
         payer_name: "Cliente individual",
         assigned_waiter_id: state.currentUser?.id || null,
         assigned_waiter: state.currentUser,
@@ -7522,7 +7616,7 @@ const App = (() => {
     renderInventoryLiveCalculation();
     if (open) {
       $("#inventoryDialog")?.showModal();
-      window.setTimeout(() => form.product_name.focus({ preventScroll: true }), 0);
+      window.setTimeout(() => (form.barcode || form.product_name).focus({ preventScroll: true }), 0);
     }
   };
 
@@ -7535,6 +7629,7 @@ const App = (() => {
     form.product_id.value = item.id;
     form.product_name.value = item.name || "";
     form.product_code.value = inventory.code;
+    form.barcode.value = item.barcode || "";
     const assignedCategory = state.categories.find((category) => String(category.id) === String(item.category_id || ""));
     if (assignedCategory && !Array.from(form.category_id.options).some((option) => option.value === String(assignedCategory.id))) {
       form.category_id.add(new Option(assignedCategory.name || "Categoría actual", assignedCategory.id));
@@ -7564,6 +7659,11 @@ const App = (() => {
       return;
     }
     const id = form.product_id.value;
+    const barcode = form.barcode.value.trim();
+    if (barcode && state.items.some(item => item.id !== id && String(item.barcode || "").trim() === barcode)) {
+      toast("Este código de barras ya pertenece a otro producto.", "error", "duplicate-product-barcode");
+      form.barcode.focus(); return;
+    }
     if (!id && costPrice === salePrice) {
       const dialog = $("#zeroProfitDialog");
       if (!dialog) return;
@@ -7591,6 +7691,8 @@ const App = (() => {
       is_available: form.is_available.checked,
       sort_order: state.items.find((item) => item.id === id)?.sort_order || 0
     };
+    // Keep products without barcodes compatible until the additive SQL migration is applied.
+    if (barcode || Object.prototype.hasOwnProperty.call(state.items.find(item => item.id === id) || {}, "barcode")) payload.barcode = barcode || null;
     const saved = await db(id
       ? state.sb.from("menu_items").update(payload).eq("id", id).select("*").single()
       : state.sb.from("menu_items").insert(payload).select("*").single(), null);
@@ -10162,12 +10264,16 @@ const App = (() => {
     }
     if (!saved) {
       state.optimisticSessionStates.delete(id);
-      state.sessions = originalSessions;
+      // Only restore this account. Other accounts may have changed while
+      // the close request was in flight (new consumption, payments or deletion).
+      if (!state.sessions.some(entry => entry.id === id)) {
+        state.sessions = [...state.sessions, originalSessions.find(entry => entry.id === id) || session];
+      }
       const originalMap = new Map(originalRequests.map((request) => [request.id, request]));
       state.requests = state.requests.map((request) => belongsToClosingTable(request) && originalMap.has(request.id) ? originalMap.get(request.id) : request);
       persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
       renderAdmin();
-      toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
+      if (!checkout?.silent) toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
       return null;
     }
     state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
@@ -10395,7 +10501,7 @@ const App = (() => {
     $("#mixedPaymentFields").hidden = true;
     $("#cashReceivedFields").hidden = false;
     updatePaymentTipChoice();
-    dialog.showModal();
+    presentIndividualPayment(dialog, session);
     void refreshConsumptionInventory();
     refreshIcons();
   };
@@ -10436,7 +10542,12 @@ const App = (() => {
     if (state.paymentProcessing) { toast("El cobro se está guardando. Espera el resultado.", "error", "payment-busy"); return; }
     const sessionId = $("#paymentForm")?.session_id?.value || "";
     const session = state.sessions.find((entry) => entry.id === sessionId);
+    const inline = $("#paymentDialog")?.dataset?.inlineCheckout === "1";
     $("#paymentDialog")?.close();
+    if (inline) {
+      const section = canAccessAdminSection("dashboard") ? "dashboard" : "service";
+      if (section !== "service") { history.replaceState(null, "", "#" + section); showAdminSection(section); }
+    }
     if (isLocalWalkInSession(session)) {
       if (session.consumption_draft || (session.session_items || []).some((item) => item.status !== "cancelled")) persistWalkInDrafts();
       else discardLocalWalkInSession(sessionId);
@@ -10597,6 +10708,7 @@ const App = (() => {
     dialog.addEventListener("keydown", (event) => {
       if (!dialog.open || event.isComposing || event.ctrlKey || event.altKey || event.metaKey
         || (event.key !== "Enter" && event.code !== "NumpadEnter")) return;
+      if (event.target.id === "barcodeSaleInput") return;
       // Evita que Enter active Imprimir si ese boton conserva el foco.
       event.preventDefault();
       if (event.repeat || state.paymentProcessing || save.disabled) return;
@@ -10647,10 +10759,18 @@ const App = (() => {
       && item.created_at && !billedIds.has(String(item.id || "")) && Date.parse(item.created_at) > Date.parse(invoice.createdAt));
   };
 
-  const reconcileRecordedCheckout = async (invoice, session) => {
+  const reconcileRecordedCheckout = async (invoice, session, { silent = false } = {}) => {
     if (!checkoutInvoiceMatches(invoice, session)) {
       toast("Hay una factura anterior para esta cuenta, pero su consumo o sus abonos no coinciden. La cuenta se conserva para revisión; no se ha cobrado otra vez.", "error", "checkout-invoice-mismatch:" + session.id);
       return false;
+    }
+    // A durable closure already confirmed this exact account. Stale snapshots
+    // must neither reopen it nor trigger another remote verification or charge.
+    const receipt = state.checkoutClosures?.[session.id];
+    if (receipt?.signature === checkoutSessionSignature(session)) {
+      state.sessions = state.sessions.filter(row => String(row.id) !== String(session.id));
+      state.checkoutReconciliationCandidates?.delete(String(session.id));
+      return true;
     }
     // Verify the current account before repairing an older build's stale snapshot.
     // In particular, equal totals do not prove that the same products were billed.
@@ -10661,9 +10781,28 @@ const App = (() => {
       if (query.abortSignal) query.abortSignal(AbortSignal.timeout(5000));
       let result;
       try { result = await query; } catch (_) { result = null; }
-      if (!result || result.error) {
-        toast("No se pudo verificar el cierre de la factura. Se conserva la cuenta para reintentar sin otro cobro.", "error", "checkout-verification-pending:" + session.id);
-        return false;
+      if (!result || result.error || !result.data) {
+        // REST relations can be unavailable or filtered by RLS. Use the existing
+        // authenticated snapshot, which also includes the current payment ledger.
+        // An empty REST response alone never proves that an account was deleted.
+        try {
+          const snapshotQuery = state.sb.rpc("get_admin_snapshot", { auth_token: state.authToken });
+          if (snapshotQuery.abortSignal) snapshotQuery.abortSignal(AbortSignal.timeout(5000));
+          const snapshot = await snapshotQuery;
+          if (snapshot.error || !Array.isArray(snapshot.data?.sessions)) return false;
+          const current = snapshot.data.sessions.find(row => String(row.id) === String(session.id));
+          if (current) {
+            if (!Array.isArray(current.session_items)
+              || (state.posFeatures?.abonos && !Array.isArray(current.session_payments))) return false;
+            result = { data: current };
+          } else {
+            const statusQuery = state.sb.rpc("get_table_session_for_sync", { auth_token: state.authToken, p_session_id: session.id });
+            if (statusQuery.abortSignal) statusQuery.abortSignal(AbortSignal.timeout(5000));
+            const status = await statusQuery;
+            if (status.error || !(status.data?.exists === false || status.data?.session?.status === "closed")) return false;
+            result = { data: status.data.session || null };
+          }
+        } catch (_) { return false; }
       }
       alreadyClosed = !result.data || result.data.status === "closed";
       if (result.data && !alreadyClosed) {
@@ -10683,7 +10822,7 @@ const App = (() => {
     session = JSON.parse(JSON.stringify(session));
     await saveCheckoutIntent(invoice, session, sessionPaid(session), "prepared");
     const closed = alreadyClosed || await closeSession(session.id, { paid: sessionPaid(session), totals: sessionTotals(session),
-      session, closedAt: invoice.createdAt, allowAlreadyClosed: true });
+      session, closedAt: invoice.createdAt, allowAlreadyClosed: true, silent });
     if (!closed) return false;
     await saveCheckoutIntent(invoice, session, sessionPaid(session), "closed");
     if ((!invoice.reportConfirmedAt || invoice.googlePending) && !state.reportMirror?.deleted?.[String(invoice.id || invoice.sessionId)]
@@ -10748,15 +10887,15 @@ const App = (() => {
     }
   };
 
-  const finishCheckoutIntent = async (intent) => {
+  const finishCheckoutIntent = async (intent, { silent = false } = {}) => {
     const { invoice, session, paid } = intent;
     if (intent.stage !== "closed") {
       const current = state.sessions.find(row => row.id === session.id);
       if (current && (Number(sessionPaid(current)) !== Number(paid) || checkoutSessionSignature(current) !== checkoutSessionSignature(session))) {
-        toast("La cuenta cambió durante el cobro. El intento sigue protegido para revisión.", "error", "checkout-changed");
+        if (!silent) toast("La cuenta cambió durante el cobro. El intento sigue protegido para revisión.", "error", "checkout-changed");
         return false;
       }
-      const closed = await closeSession(session.id, { paid, totals: sessionTotals(session), session, closedAt: invoice.createdAt });
+      const closed = await closeSession(session.id, { paid, totals: sessionTotals(session), session, closedAt: invoice.createdAt, silent });
       if (!closed) return false;
       await saveCheckoutIntent(invoice, session, paid, "closed");
     }
@@ -10771,9 +10910,12 @@ const App = (() => {
     }) : work();
 
   let checkoutRecoveryBusy = false;
+  let checkoutRecoveryDone = Promise.resolve();
   const recoverPendingCheckouts = async () => {
     if (checkoutRecoveryBusy || state.paymentProcessing || checkoutSubmissionBusy || !state.currentUser || !isManager()) return false;
     checkoutRecoveryBusy = true;
+    let completeRecovery;
+    checkoutRecoveryDone = new Promise(resolve => { completeRecovery = resolve; });
     try {
       return await withCheckoutLock(async () => {
         await Promise.all([CHECKOUT_INTENTS_KEY, CHECKOUT_CLOSURES_KEY, INVOICE_STORAGE_KEY,
@@ -10784,10 +10926,7 @@ const App = (() => {
         state.checkoutClosures = readLocalJson(CHECKOUT_CLOSURES_KEY, state.checkoutClosures || {});
         const intents = Object.values(readLocalJson(CHECKOUT_INTENTS_KEY, {}));
         for (const intent of intents) {
-          if (!await finishCheckoutIntent(intent)) {
-            toast("Un cobro guardado necesita revisión; se conserva para reintentar sin duplicarlo.", "error", "checkout-recovery-pending");
-            return false;
-          }
+          if (!await finishCheckoutIntent(intent, { silent: true })) continue;
           toast("Se recuperó el cobro pendiente de " + intent.invoice.number + ".", "ok", "checkout-recovered:" + intent.session.id);
         }
         let repaired = false;
@@ -10797,9 +10936,13 @@ const App = (() => {
         for (const [id, session] of candidates) {
           const invoice = state.invoiceHistory.find(row => String(row.sessionId) === id);
           if (!invoice || !checkoutInvoiceMatches(invoice, session)) continue;
+          if (state.checkoutClosures?.[id]?.signature === checkoutSessionSignature(session)) {
+            state.checkoutReconciliationCandidates?.delete(id);
+            continue;
+          }
           if (Date.now() - (state.checkoutReconciliationAttempts.get(id) || 0) < 30_000) continue;
           state.checkoutReconciliationAttempts.set(id, Date.now());
-          if (await reconcileRecordedCheckout(invoice, session)) {
+          if (await reconcileRecordedCheckout(invoice, session, { silent: true })) {
             state.checkoutReconciliationCandidates?.delete(id);
             repaired = true;
           }
@@ -10808,15 +10951,18 @@ const App = (() => {
         return true;
       });
     } catch (error) {
-      toast(String(error?.message || error), "error", "checkout-recovery-error");
+      console.warn("Recuperación de cobros pendiente; se reintentará automáticamente", error);
       return false;
-    } finally { checkoutRecoveryBusy = false; }
+    } finally { checkoutRecoveryBusy = false; completeRecovery(); }
   };
 
   let checkoutSubmissionBusy = false;
   const processPayment = async (form, submitter) => {
-    if (state.paymentProcessing || checkoutRecoveryBusy || checkoutSubmissionBusy) return;
+    if (state.paymentProcessing || checkoutSubmissionBusy) return;
     checkoutSubmissionBusy = true;
+    // A click during automatic recovery keeps its requested action instead of
+    // being silently discarded. Recovery cannot restart while this is queued.
+    if (checkoutRecoveryBusy) await checkoutRecoveryDone;
     try { return await withCheckoutLock(async () => {
       // Another tab may have completed this account while this form was open.
       await Promise.all([INVENTORY_STORAGE_KEY, INVOICE_STORAGE_KEY, INVENTORY_MOVEMENTS_STORAGE_KEY,
@@ -11653,8 +11799,8 @@ const App = (() => {
 
   const deleteConsumption = async (sessionId, itemId) => {
     if (!canDeleteRecords()) return;
-    const session = state.sessions.find((entry) => entry.id === sessionId);
-    const item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
+    let session = state.sessions.find((entry) => entry.id === sessionId);
+    let item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
     if (!session || !item) return;
     if (!await askForConfirmation({
       eyebrow: "Cuenta abierta",
@@ -11663,14 +11809,28 @@ const App = (() => {
       accept: "Sí, quitar producto",
       cancel: "Conservar producto"
     })) return;
+    // Confirmation can stay open while another device updates this account.
+    session = state.sessions.find(entry => entry.id === sessionId);
+    item = session?.session_items?.find(entry => entry.id === itemId && entry.status !== "cancelled");
+    if (!session || !item) return;
     if (!consumptionChangeAllowed(session, itemId, { status: "cancelled" })) {
       toast("No puedes quitar este producto: el consumo restante quedaría por debajo de los abonos.", "error", "consumption-below-payments");
       return;
     }
     const originalSession = session;
+    const originalOverlay = state.optimisticSessionStates.get(sessionId);
+    const cancelledItem = { ...item, status: "cancelled", updated_at: new Date().toISOString() };
+    const protectItem = (line) => {
+      const current = state.optimisticSessionStates.get(sessionId) || {};
+      const expected = current.expectedItems || (current.expectedItem ? [current.expectedItem] : []);
+      state.optimisticSessionStates.set(sessionId, { ...current, mode: "upsert",
+        session: state.sessions.find(entry => entry.id === sessionId), mutationStartedAt: Date.now(),
+        expectedItems: [...expected.filter(entry => entry.id !== itemId), line] });
+    };
     state.sessions = state.sessions.map((entry) => entry.id === sessionId
-      ? clearPaymentsWithoutConsumption({ ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) })
+      ? clearPaymentsWithoutConsumption({ ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? cancelledItem : line) })
       : entry);
+    protectItem(cancelledItem);
     state.accountsRenderSignature = "";
     renderAdminLive();
     if (isLocalWalkInSession(session)) {
@@ -11682,12 +11842,25 @@ const App = (() => {
     }
     const saved = await retryQuiet(() => state.sb.from("session_items").update({ status: "cancelled", updated_by_user_id: state.currentUser?.id || null }).eq("id", itemId).select("*").single(), 4);
     if (!saved) {
-      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? originalSession : entry);
+      state.sessions = state.sessions.map(entry => entry.id === sessionId
+        ? { ...entry, session_items: (entry.session_items || []).map(line => line.id === itemId ? item : line),
+            session_payments: entry.session_payments?.length ? entry.session_payments : originalSession.session_payments } : entry);
+      const current = state.optimisticSessionStates.get(sessionId);
+      const previous = originalOverlay?.expectedItems || (originalOverlay?.expectedItem ? [originalOverlay.expectedItem] : []);
+      const expectedItems = [...(current?.expectedItems || []).filter(line => line.id !== itemId), ...previous.filter(line => line.id === itemId)];
+      if (expectedItems.length || current?.expectedSession) {
+        state.optimisticSessionStates.set(sessionId, { ...current, expectedItems, session: state.sessions.find(entry => entry.id === sessionId) });
+      } else state.optimisticSessionStates.delete(sessionId);
       state.accountsRenderSignature = "";
       renderAdminLive();
       toast("No se pudo eliminar el consumo. La cuenta fue restaurada.", "error", `delete-consumption:${itemId}`);
       return;
     }
+    const confirmedItem = { ...cancelledItem, ...saved };
+    state.sessions = state.sessions.map(entry => entry.id === sessionId
+      ? clearPaymentsWithoutConsumption({ ...entry, session_items: (entry.session_items || []).map(line => line.id === itemId ? confirmedItem : line) }) : entry);
+    protectItem(confirmedItem);
+    renderAdminLive();
     toast("Consumo eliminado. El inventario permanece sin cambios.", "ok", `consumption-deleted:${itemId}`);
   };
 
@@ -12455,6 +12628,35 @@ const App = (() => {
       await saveInventoryProduct(event.currentTarget);
     });
     $("#inventoryForm")?.addEventListener("input", renderInventoryLiveCalculation);
+    $("#inventoryForm")?.elements.barcode?.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        const form = event.currentTarget.form;
+        form.barcode.value = form.barcode.value.trim();
+        form.product_name.focus({ preventScroll: true });
+      }
+    });
+    $("#individualSaleDraft")?.addEventListener("change", () => void openPermanentIndividualSale());
+    $("#paymentDialog")?.addEventListener("close", () => {
+      window.setTimeout(() => {
+        if (state.activeAdminSection === "service" && !state.paymentProcessing
+          && !$("#consumptionDialog")?.open && !$("#paymentDialog")?.open) void openPermanentIndividualSale();
+      }, 0);
+    });
+    $("#consumptionDialog")?.addEventListener("close", () => {
+      window.setTimeout(() => {
+        if (state.activeAdminSection === "service" && !$("#consumptionDialog")?.open && !$("#paymentDialog")?.open) void openPermanentIndividualSale();
+      }, 0);
+    });
+    $("#barcodeSaleInput")?.addEventListener("keydown", event => {
+      if (event.key !== "Enter" && event.key !== "Tab") return;
+      event.preventDefault(); event.stopPropagation();
+      const input = event.currentTarget, code = input.value.trim();
+      const sessionId = $("#paymentForm")?.session_id.value;
+      input.value = "";
+      if (code) barcodeScanChain = barcodeScanChain.then(() => addBarcodeToSale(sessionId, code))
+        .catch(error => toast(String(error?.message || error), "error", "barcode-scan-error"));
+    });
     $("#downloadInventoryPdf")?.addEventListener("click", downloadInventoryPdf);
     $("#inventoryAdjustForm")?.addEventListener("input", renderInventoryAdjustmentPreview);
     $("#inventoryAdjustForm")?.addEventListener("change", renderInventoryAdjustmentPreview);
@@ -12608,7 +12810,11 @@ const App = (() => {
     });
     $("#paymentForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
-      await processPayment(event.currentTarget, event.submitter);
+      const form = event.currentTarget, submitter = event.submitter;
+      const scanner = $("#barcodeSaleInput");
+      if (scanner) scanner.disabled = true;
+      try { await barcodeScanChain; await processPayment(form, submitter); }
+      finally { if (scanner) scanner.disabled = false; }
     });
     bindPaymentConfirmShortcut();
     $("#paymentForm")?.addEventListener("change", (event) => {
@@ -13011,7 +13217,8 @@ const App = (() => {
         renderConsumptionSelection();
       }
       if (target.dataset.minimizeAdminChat) setAdminChatMinimized(target.dataset.minimizeAdminChat, !state.adminChats.get(String(target.dataset.minimizeAdminChat))?.minimized);
-      if (target.id === "newWalkInSale") await createWalkInSale();
+      if (target.dataset.dashboardWalkIn) await createWalkInSale({ slot: Number(target.dataset.dashboardWalkIn) });
+      if (target.id === "openBarcodeSale") await createWalkInSale({ surface: "barcode", paymentOnly: true });
       if (target.dataset.serviceWalkIn) await createWalkInSale({ slot: Number(target.dataset.serviceWalkIn) });
       if (target.id === "addServiceWalkIn") addServiceWalkInSlot();
       if (target.dataset.deleteServiceWalkIn) {
